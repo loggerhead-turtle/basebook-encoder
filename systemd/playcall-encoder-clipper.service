@@ -1,0 +1,26 @@
+[Unit]
+Description=PlayCall Encoder - auto-clip cutter/uploader
+After=playcall-encoder-mediamtx.service network-online.target
+Wants=playcall-encoder-mediamtx.service network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 -m encoder.clipper
+WorkingDirectory=/opt/playcall-encoder
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=0
+# Reads /etc/playcall-encoder/config.json (root:playcall 640), cuts from
+# MediaMTX's loopback playback server, and writes clips + status under
+# /var/lib/playcall-encoder and /run/playcall-encoder.
+User=playcall
+Group=playcall
+RuntimeDirectory=playcall-encoder
+RuntimeDirectoryPreserve=yes
+# Clip uploads are rate-capped in the daemon so they never starve the live
+# push; de-prioritise its CPU/IO too — the stream always wins.
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target
