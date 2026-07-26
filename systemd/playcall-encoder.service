@@ -1,0 +1,17 @@
+[Unit]
+Description=PlayCall Encoder - scorebug + provisioning + settings + cloud link
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Root: the entrypoint may need to raise the setup hotspot (hostapd,
+# iptables, nmcli) and restart sibling services.
+ExecStart=/usr/bin/python3 -m encoder
+WorkingDirectory=/opt/playcall-encoder
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=3
+StartLimitIntervalSec=0
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,12 @@
+{
+  "networks": [
+    {"ssid": "Home-WiFi", "psk": "change-me", "priority": 100, "label": "home"},
+    {"ssid": "Field-Router", "psk": "change-me-too", "priority": 90, "label": "gameday"}
+  ],
+  "youtube_key": "xxxx-xxxx-xxxx-xxxx",
+  "cloud": {
+    "base_url": "https://playsigns.net",
+    "api_key": ""
+  },
+  "device_name": "PlayCall Encoder"
+}
