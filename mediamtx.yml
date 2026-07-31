@@ -1,0 +1,57 @@
+# PlayCall Encoder — MediaMTX configuration (template).
+#
+# encoder/config.py write_mediamtx_config() copies this to
+# /etc/playcall-encoder/mediamtx.yml, replacing __INGEST_KEY__ with the
+# device's local ingest key (generated once at provisioning, rotatable from
+# the settings page). MediaMTX does exactly one job: ingest the camera feed,
+# keep a rolling local recording, and let the YouTube push leg read the
+# stream back. Everything is copy-mode — MediaMTX never transcodes.
+#
+# Ingest (Mevo / Larix / OBS → custom RTMP destination, HEVC or H.264):
+#     rtmp://playcall-encoder.local:1935/live/<INGEST_KEY>
+# SRT is also open for cameras that speak it directly (e.g. Mevo Core):
+#     srt://<pi-address>:8890?streamid=publish:live/<INGEST_KEY>
+
+logLevel: info
+
+# Ingest protocols
+rtmp: yes
+rtmpAddress: :1935
+srt: yes
+srtAddress: :8890
+
+# Loopback-only read leg: the YouTube push probes (and, for Opus-audio
+# phone streams, reads) the feed over RTSP because classic RTMP cannot
+# carry Opus at all. Never exposed off-box.
+rtsp: yes
+rtspAddress: 127.0.0.1:8554
+rtspTransports: [tcp]
+
+# Off — this box is not a viewing server (viewers watch on YouTube)
+hls: no
+
+# Control plane — encoder/cloud_link.py polls /v3/paths/list on this for
+# ingest connected/kbps telemetry. Loopback only, never exposed off-box.
+api: yes
+apiAddress: 127.0.0.1:9997
+
+# Playback server: how encoder/clipper.py cuts clips — it asks for an exact
+# time range (GET /get?path=…&start=…&duration=…&format=mp4) out of the
+# rolling recording below. Loopback-only; never exposed off the box.
+playback: yes
+playbackAddress: 127.0.0.1:9996
+
+pathDefaults:
+  record: no
+
+paths:
+  live/__INGEST_KEY__:
+    # Rolling local recording — survives uplink drops and is the source of
+    # every clip. Short segments keep clip boundaries tight;
+    # recordDeleteAfter prunes the disk (3 Mbps × 12 h ≈ 16 GB worst case).
+    record: yes
+    recordPath: /var/lib/playcall-encoder/segments/%path/%Y-%m-%d_%H-%M-%S-%f
+    recordFormat: fmp4
+    recordPartDuration: 1s
+    recordSegmentDuration: 4s
+    recordDeleteAfter: 12h
