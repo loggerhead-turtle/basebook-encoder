@@ -73,6 +73,12 @@ def main():
     link = cloud_link.CloudLink(on_feed_change=sender.set_feed)
     link.start_threads()
 
+    # Stalker radar capture: idles silently until a USB-RS232 adapter (and
+    # pyserial) is present, then streams velo/spin to the cloud. See
+    # encoder/radar.py — display-only data, never the scorebook.
+    from . import radar
+    radar.RadarService(link, cfg_load=config.load).start_thread()
+
     threading.Thread(target=web.serve,
                      kwargs={'cloud': link, 'sender': sender},
                      daemon=True).start()

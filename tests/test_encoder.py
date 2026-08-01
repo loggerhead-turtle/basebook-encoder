@@ -490,7 +490,7 @@ def test_heartbeat_payload_shape():
     hb = link.heartbeat_payload()
     assert hb['state'] == 'pushing'
     assert set(hb) == {'state', 'ingest', 'push', 'cpu', 'temp',
-                       'version', 'log_tail'}
+                       'version', 'log_tail', 'hostname', 'ip', 'clips'}
     assert set(hb['ingest']) == {'connected', 'kbps'}
     assert set(hb['push']) == {'connected', 'kbps', 'reconnects_5m'}
     assert hb['push']['reconnects_5m'] == 1          # only the recent one

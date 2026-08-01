@@ -45,7 +45,7 @@ fi
 # only used for the first-boot setup hotspot.
 apt-get update -qq
 apt-get install -y -qq ffmpeg curl git avahi-daemon hostapd dnsmasq \
-  python3 python3-pil python3-flask python3-numpy >/dev/null
+  python3 python3-pil python3-flask python3-numpy python3-serial >/dev/null
 # hostapd/dnsmasq must NOT run as daemons — provisioning spawns them ad hoc.
 # On an ADOPTED box we leave existing services strictly alone: this Pi's
 # network stack (possibly Speedify-bonded) is not ours to manage.
