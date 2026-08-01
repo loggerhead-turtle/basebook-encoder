@@ -83,7 +83,7 @@ DEFAULT_THEME = {
                'accent2': '#f5b301', 'text': '#ffffff'},
     'font': 'system',
     'show': {'pitchcount': True, 'outs': True, 'count': True,
-             'bases': True, 'inning': True},
+             'bases': True, 'inning': True, 'rpm': False},
     'name': '',
 }
 
@@ -398,8 +398,10 @@ def _render_tv(bug, theme):
                font=f_big, fill=pal['text'], anchor='lm')
     if show['bases']:
         on = bug.get('bases') or [False, False, False]
-        bx, by, sz = TV_W - 64, my0 + 26, 13
-        spots = [(bx + 24, by + 10), (bx, by - 8), (bx - 24, by + 10)]
+        # Centres exactly 24px apart on both diagonals — a true 45° diamond.
+        # (Was 24 across but 18 down, the same skew the CSS overlay had.)
+        bx, by, sz = TV_W - 64, my0 + 28, 13
+        spots = [(bx + 24, by + 12), (bx, by - 12), (bx - 24, by + 12)]
         for i, (px, py) in enumerate(spots):
             pts = [(px, py - sz), (px + sz, py), (px, py + sz), (px - sz, py)]
             if i < len(on) and on[i]:
@@ -412,10 +414,17 @@ def _render_tv(bug, theme):
             d.ellipse((sx + i * 20, my0 + TV_MAIN - 36,
                        sx + 14 + i * 20, my0 + TV_MAIN - 22),
                       fill=red if onq else pal['off'])
-    velo = bug.get('velo')
+    velo, rpm = bug.get('velo'), bug.get('rpm')
+    with_rpm = bool(show.get('rpm')) and rpm is not None
+    # With spin shown the speed rides a little higher to make room; without
+    # it the bug is pixel-identical to before.
+    vy = my0 + TV_MAIN - (40 if with_rpm else 28)
     if velo is not None:
-        d.text((TV_W - 24, my0 + TV_MAIN - 28), str(velo),
+        d.text((TV_W - 24, vy), str(velo),
                font=f_big, fill=yellow, anchor='rm')
+    if with_rpm:
+        d.text((TV_W - 24, my0 + TV_MAIN - 15), f'{rpm} RPM',
+               font=_font(theme, 15), fill=pal['dim'], anchor='rm')
     return img
 
 
