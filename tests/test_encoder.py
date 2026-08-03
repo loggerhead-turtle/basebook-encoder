@@ -727,3 +727,141 @@ def test_factory_reset_removes_nm_connections_before_unlink(monkeypatch):
     assert all(existed for _, existed in deletes)
     # By reboot time the config file is gone.
     assert events[-1][0] == ('reboot',) and events[-1][1] is False
+
+
+# ── self-update (the one-button "Update now") ───────────────────────────────
+
+def _fake_release_tree(root):
+    (root / 'encoder').mkdir(parents=True)
+    (root / 'encoder' / '__init__.py').write_text("__version__ = '9.9.9'\n")
+    (root / 'VERSION').write_text('9.9.9\n')
+    (root / 'mediamtx.yml').write_text('paths:\n')
+    (root / 'scripts').mkdir()
+    (root / 'scripts' / 'youtube_push.sh').write_text('#!/bin/bash\n')
+    (root / 'systemd').mkdir()
+    (root / 'systemd' / 'playcall-encoder.service').write_text('[Unit]\n')
+
+
+def test_self_update_lays_installer_payload(tmp_path, monkeypatch):
+    from encoder import system
+    install = tmp_path / 'opt'
+    (install / 'encoder' / '__pycache__').mkdir(parents=True)
+    (install / 'encoder' / '__pycache__' / 'stale.pyc').write_text('x')
+    (install / 'encoder' / '__init__.py').write_text("__version__ = '1.0.0'\n")
+
+    cloned = []
+
+    def fake_run(cmd, **kw):
+        assert cmd[:4] == ['git', 'clone', '--depth', '1']
+        cloned.append(cmd[4])
+        _fake_release_tree(Path(cmd[5]))
+
+        class R:
+            returncode = 0
+            stderr = ''
+        return R()
+    monkeypatch.setattr(system, 'run', fake_run)
+    ok, detail = system.self_update(install_dir=str(install))
+    assert ok and detail == '9.9.9'
+    assert cloned == [system.UPDATE_REPO]
+    # Same payload install.sh lays: encoder/, VERSION, mediamtx.yml, scripts/
+    assert (install / 'VERSION').read_text().strip() == '9.9.9'
+    assert '9.9.9' in (install / 'encoder' / '__init__.py').read_text()
+    assert (install / 'mediamtx.yml').exists()
+    push = install / 'scripts' / 'youtube_push.sh'
+    assert push.exists() and push.stat().st_mode & 0o111
+    # Stale bytecode purged so old .pyc can't shadow the new tree.
+    assert not (install / 'encoder' / '__pycache__').exists()
+
+
+def test_self_update_reports_download_failure(tmp_path, monkeypatch):
+    from encoder import system
+
+    def fake_run(cmd, **kw):
+        class R:
+            returncode = 128
+            stderr = 'fatal: unable to access repo'
+        return R()
+    monkeypatch.setattr(system, 'run', fake_run)
+    install = tmp_path / 'opt'
+    install.mkdir()
+    ok, detail = system.self_update(install_dir=str(install))
+    assert not ok and 'unable to access' in detail
+    assert not (install / 'VERSION').exists()      # nothing half-laid
+
+
+class _CloudStub:
+    latest_version = '9.9.9'
+    assignment = None
+
+    def ingest_status(self):
+        return {'connected': False, 'kbps': None}
+
+    def push_status(self):
+        return {'connected': False, 'kbps': None, 'reconnects_5m': 0}
+
+
+def test_web_update_button_and_route(monkeypatch):
+    from encoder import web
+    provisioning.headless_setup()
+    monkeypatch.setattr(web.system, 'journal_tail', lambda *a, **k: [])
+    app = web.create_app(cloud=_CloudStub())
+    c = app.test_client()
+    # PIN-gated like every settings route.
+    assert c.post('/update').status_code == 302
+    c.post('/login', data={'pin': config.load()['device']['pin']})
+    html = c.get('/').get_data(as_text=True)
+    assert 'update 9.9.9 available' in html
+    assert 'Update available' in html and 'action="/update"' in html
+    assert 'Update software' in html               # maintenance fallback
+
+    restarted = []
+    monkeypatch.setattr(web.system, 'self_update', lambda: (True, '9.9.9'))
+    monkeypatch.setattr(web.system, 'systemctl',
+                        lambda *a: restarted.append(a))
+    monkeypatch.setattr(web.time, 'sleep', lambda s: None)
+    r = c.post('/update')
+    assert r.status_code == 302
+    assert 'msg=' in r.headers['Location'] and '9.9.9' in r.headers['Location']
+    for _ in range(300):                           # restart thread finishes
+        if len(restarted) == 4:
+            break
+        time.sleep(0.01)
+    # Siblings first; the unit hosting this web app restarts LAST.
+    assert restarted == [('restart', 'playcall-encoder-mediamtx'),
+                         ('restart', 'playcall-encoder-youtube'),
+                         ('restart', 'playcall-encoder-clipper'),
+                         ('restart', 'playcall-encoder')]
+
+
+def test_web_update_failure_no_restarts(monkeypatch):
+    from encoder import web
+    provisioning.headless_setup()
+    monkeypatch.setattr(web.system, 'journal_tail', lambda *a, **k: [])
+    monkeypatch.setattr(web.system, 'self_update',
+                        lambda: (False, 'download timed out'))
+    restarted = []
+    monkeypatch.setattr(web.system, 'systemctl',
+                        lambda *a: restarted.append(a))
+    app = web.create_app(cloud=_CloudStub())
+    c = app.test_client()
+    c.post('/login', data={'pin': config.load()['device']['pin']})
+    r = c.post('/update')
+    assert r.status_code == 302 and 'err=' in r.headers['Location']
+    time.sleep(0.05)
+    assert restarted == []
+
+
+def test_web_no_update_card_when_current(monkeypatch):
+    from encoder import web
+    provisioning.headless_setup()
+    monkeypatch.setattr(web.system, 'journal_tail', lambda *a, **k: [])
+
+    class Cur(_CloudStub):
+        from encoder import __version__ as latest_version
+    app = web.create_app(cloud=Cur())
+    c = app.test_client()
+    c.post('/login', data={'pin': config.load()['device']['pin']})
+    html = c.get('/').get_data(as_text=True)
+    assert 'Update available' not in html
+    assert 'Update software' in html               # fallback always there

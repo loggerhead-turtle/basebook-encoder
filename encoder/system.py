@@ -9,6 +9,7 @@ and no subprocess is ever spawned.
 import os
 import shutil
 import subprocess
+import tempfile
 
 
 def fake_mode():
@@ -37,6 +38,81 @@ def systemctl(*args):
 
 def reboot():
     run(['reboot'])
+
+
+UPDATE_REPO = 'https://github.com/loggerhead-turtle/ndi-encoder'
+INSTALL_DIR = '/opt/playcall-encoder'
+# Restart order matters: the box's own service (which hosts this web UI)
+# goes LAST, so the siblings come up on new code before we kill ourselves
+# and systemd revives us on the new tree.
+UPDATE_UNITS = ('playcall-encoder-mediamtx', 'playcall-encoder-youtube',
+                'playcall-encoder-clipper', 'playcall-encoder')
+
+
+def self_update(repo_url=None, install_dir=None):
+    """One-button code update: shallow-clone the release repo and lay the
+    same payload the installer lays (encoder/, VERSION, mediamtx.yml,
+    scripts/, systemd units) over the install dir. Pure file copy — config
+    in /etc/playcall-encoder is never touched, so this is exactly a re-run
+    of the installer's copy step. Returns (ok, detail): detail is the new
+    VERSION string on success, an error message on failure. The caller
+    restarts UPDATE_UNITS afterwards."""
+    repo_url = repo_url or os.environ.get('PLAYCALL_ENCODER_REPO',
+                                          UPDATE_REPO)
+    install_dir = install_dir or INSTALL_DIR
+    tmp = tempfile.mkdtemp(prefix='playcall-update-')
+    try:
+        try:
+            r = run(['git', 'clone', '--depth', '1', repo_url,
+                     os.path.join(tmp, 'src')], timeout=180)
+        except subprocess.TimeoutExpired:
+            return False, 'download timed out — check this box’s internet'
+        if r.returncode != 0:
+            return False, ('download failed: '
+                           + (r.stderr or 'git clone error').strip()[-200:])
+        src = os.path.join(tmp, 'src')
+        if not (os.path.isdir(os.path.join(src, 'encoder'))
+                and os.path.isfile(os.path.join(src, 'VERSION'))):
+            return False, 'download was missing the encoder payload'
+        shutil.copytree(os.path.join(src, 'encoder'),
+                        os.path.join(install_dir, 'encoder'),
+                        dirs_exist_ok=True)
+        for name in ('VERSION', 'mediamtx.yml'):
+            shutil.copy2(os.path.join(src, name), install_dir)
+        push = os.path.join(src, 'scripts', 'youtube_push.sh')
+        if os.path.isfile(push):
+            os.makedirs(os.path.join(install_dir, 'scripts'), exist_ok=True)
+            dst = os.path.join(install_dir, 'scripts', 'youtube_push.sh')
+            shutil.copy2(push, dst)
+            os.chmod(dst, 0o755)
+        # Stale bytecode from removed/renamed modules must not shadow the
+        # new tree on restart.
+        for root, dirs, _files in os.walk(os.path.join(install_dir,
+                                                       'encoder')):
+            for d in list(dirs):
+                if d == '__pycache__':
+                    shutil.rmtree(os.path.join(root, d), ignore_errors=True)
+                    dirs.remove(d)
+        # New/changed units ship with the code; refresh them like install.sh
+        # does. Best-effort — a dev checkout without /etc write access still
+        # gets the code update.
+        sysd = os.path.join(src, 'systemd')
+        if os.path.isdir(sysd) and not fake_mode():
+            try:
+                for f in os.listdir(sysd):
+                    if f.startswith('playcall-encoder') and \
+                            f.endswith('.service'):
+                        shutil.copy2(os.path.join(sysd, f),
+                                     '/etc/systemd/system/')
+                systemctl('daemon-reload')
+            except OSError:
+                pass
+        with open(os.path.join(src, 'VERSION')) as fh:
+            return True, fh.read().strip()
+    except OSError as e:
+        return False, f'update failed: {e}'
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def have_networkmanager():

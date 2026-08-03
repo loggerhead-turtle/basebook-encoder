@@ -123,6 +123,19 @@ STATUS_PAGE = """<!doctype html><html><head>
 <div class="sub">v{{ version }}{% if latest and latest != version %}
   · update {{ latest }} available{% endif %}</div>
 
+{% if latest and latest != version %}
+<div class="card">
+  <h2>Update available</h2>
+  <p class="hint">v{{ version }} → v{{ latest }}. Downloads the new software
+    and restarts the encoder — the stream and this page blip for a few
+    seconds. Your settings and pairing are kept.</p>
+  <form method="post" action="/update"
+        onsubmit="return confirm('Download v{{ latest }} and restart the encoder now?')">
+    <button class="btn" type="submit">&#11015; Update now</button>
+  </form>
+</div>
+{% endif %}
+
 <div class="card">
   <h2>Status</h2>
   <div class="row"><span class="dot {{ 'ok' if ingest.connected }}"></span>
@@ -227,6 +240,9 @@ STATUS_PAGE = """<!doctype html><html><head>
 
 <div class="card">
   <h2>Maintenance</h2>
+  <form method="post" action="/update" style="display:inline"
+        onsubmit="return confirm('Re-download the encoder software and restart? The stream blips for a few seconds.')">
+    <button class="btn2" type="submit">Update software</button></form>
   <form method="post" action="/rotate-key" style="display:inline"
         onsubmit="return confirm('Rotate the local ingest key? Your camera app RTMP URL will change.')">
     <button class="btn2" type="submit">Rotate ingest key</button></form>
@@ -537,6 +553,29 @@ def create_app(cloud=None, sender=None):
         system.systemctl('restart', 'playcall-encoder-mediamtx')
         system.systemctl('restart', 'playcall-encoder-youtube')
         return redirect(url_for('index'))
+
+    @app.route('/update', methods=['POST'])
+    def update():
+        """One-button software update. The download+copy runs inline (a few
+        seconds on a shallow clone); the service restarts are deferred to a
+        background thread so this response reaches the browser before
+        playcall-encoder — the unit hosting this very web app — is bounced.
+        systemd revives us on the new code."""
+        ok, detail = system.self_update()
+        if not ok:
+            log.warning(f'self-update failed: {detail}')
+            return redirect(url_for('index', err=f'Update failed — {detail}'))
+        log.info(f'self-update laid down v{detail}; restarting services')
+
+        def _restart():
+            time.sleep(1.5)
+            for unit in system.UPDATE_UNITS:
+                system.systemctl('restart', unit)
+        threading.Thread(target=_restart, daemon=True).start()
+        return redirect(url_for(
+            'index',
+            msg=f'Updated to v{detail} — restarting now, this page will '
+                'blip for a few seconds'))
 
     @app.route('/factory-reset', methods=['POST'])
     def factory_reset():
