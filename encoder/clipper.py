@@ -187,6 +187,33 @@ class Clipper:
             return None
 
     @staticmethod
+    def _media_seconds(data):
+        """Seconds of video actually PRESENT, from the packet count. The
+        container duration lies when the rolling recording has holes (the
+        stream dropped mid-game): timestamps are preserved, so a clip cut
+        across a dropout probes as the full window while holding a few
+        seconds of media — it plays 10s then 'jumps to the end'. Counting
+        packets against the frame rate measures what's really there."""
+        try:
+            with tempfile.NamedTemporaryFile(suffix='.mp4') as f:
+                f.write(data)
+                f.flush()
+                probe = subprocess.run(
+                    ['ffprobe', '-v', 'error', '-count_packets',
+                     '-select_streams', 'v:0', '-show_entries',
+                     'stream=nb_read_packets,r_frame_rate',
+                     '-of', 'csv=p=0', f.name],
+                    capture_output=True, text=True, timeout=60)
+                rate_s, n_s = probe.stdout.strip().split(',')[:2]
+                num, den = (rate_s.split('/') + ['1'])[:2]
+                fps = float(num) / float(den or 1)
+                if fps <= 0:
+                    return None
+                return int(n_s) / fps
+        except Exception:
+            return None
+
+    @staticmethod
     def _fix_audio_for_ios(data):
         """A WHIP (phone/WebRTC) publish records Opus audio, which Safari on
         iPhone can't play in MP4; a Mevo's AAC plays everywhere, so this is a
@@ -247,6 +274,14 @@ class Clipper:
                 raise RuntimeError(
                     f'playback returned a truncated clip '
                     f'({actual:.1f}s of {requested:.1f}s requested)')
+            # …and a clip whose CONTAINER spans the window but whose media
+            # has holes (recording gaps from a stream dropout) is just as
+            # wrong — the label says a minute, the video holds ten seconds.
+            media = self._media_seconds(data)
+            if media is not None and media < requested * 0.6:
+                raise RuntimeError(
+                    f'recording has holes under this window '
+                    f'({media:.1f}s of media across {requested:.1f}s)')
         except Exception as e:
             if now - end > CUT_GIVE_UP_AFTER:
                 log.error('giving up on %s: %s', cid, e)
