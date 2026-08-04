@@ -14,6 +14,17 @@
 
 logLevel: info
 
+# Uplink-blip tolerance. Starlink (and cellular) service pauses for a few
+# seconds at a time — satellite handoffs, obstructions — even when the LAN
+# link is rock solid. The defaults (512-packet reader queue ≈ 1 s of video,
+# 10 s write timeout) turn every such blip into "reader is too slow,
+# discarding frames" followed by a full push teardown + reconnect: a 3 s
+# blip becomes a 20-40 s on-stream gap. A ~15-20 s queue (~11 MB RAM per
+# reader) and a 30 s timeout let the push absorb the blip and catch up
+# instead — viewers see a moment of buffering, not a dropout.
+writeQueueSize: 8192
+writeTimeout: 30s
+
 # Ingest protocols
 rtmp: yes
 rtmpAddress: :1935
