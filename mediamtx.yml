@@ -58,11 +58,14 @@ pathDefaults:
 paths:
   live/__INGEST_KEY__:
     # Rolling local recording — survives uplink drops and is the source of
-    # every clip. Short segments keep clip boundaries tight;
-    # recordDeleteAfter prunes the disk (3 Mbps × 12 h ≈ 16 GB worst case).
+    # every clip. Short segments keep clip boundaries tight. Retention is a
+    # SETTING (config.json record_hours, settings-page picker), baked in by
+    # write_mediamtx_config — hand-edits here used to be silently reverted
+    # by every install/update. 4 Mbps ≈ 1.8 GB/h: 12 h fits an SD card,
+    # 72 h wants the NVMe build.
     record: yes
     recordPath: /var/lib/playcall-encoder/segments/%path/%Y-%m-%d_%H-%M-%S-%f
     recordFormat: fmp4
     recordPartDuration: 1s
     recordSegmentDuration: 4s
-    recordDeleteAfter: 12h
+    recordDeleteAfter: __RECORD_HOURS__h

@@ -897,3 +897,36 @@ def test_heartbeat_carries_the_settings_pin():
     link = cloud_link.CloudLink(http=lambda *a, **k: {})
     hb = link.heartbeat_payload()
     assert hb['pin'] == '431905'
+
+
+def test_recording_retention_is_a_setting_that_survives_updates(tmp_path,
+                                                                monkeypatch):
+    """record_hours bakes into mediamtx.yml from config — hand edits used
+    to be reverted by every install/update; a setting survives them."""
+    from encoder import web
+    cfg = config.load()
+    cfg['local_ingest_key'] = 'k1'
+    cfg['record_hours'] = 72
+    config.save(cfg)
+    dest = config.write_mediamtx_config(config.load())
+    text = dest.read_text()
+    assert 'recordDeleteAfter: 72h' in text and '__RECORD_HOURS__' not in text
+    # default stays 12h; junk clamps sanely
+    cfg['record_hours'] = None
+    config.save(cfg)
+    assert 'recordDeleteAfter: 12h' in \
+        config.write_mediamtx_config(config.load()).read_text()
+    # the settings page saves it and restarts mediamtx
+    provisioning.headless_setup()
+    monkeypatch.setattr(web.system, 'journal_tail', lambda *a, **k: [])
+    calls = []
+    monkeypatch.setattr(web.system, 'systemctl', lambda *a: calls.append(a))
+    app = web.create_app()
+    c = app.test_client()
+    c.post('/login', data={'pin': config.load()['device']['pin']})
+    r = c.post('/retention', data={'hours': '48'})
+    assert r.status_code == 302
+    assert config.load()['record_hours'] == 48
+    assert ('restart', 'playcall-encoder-mediamtx') in calls
+    html = c.get('/').get_data(as_text=True)
+    assert 'Recording retention' in html and 'selected' in html

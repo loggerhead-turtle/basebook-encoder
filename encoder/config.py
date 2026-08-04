@@ -194,8 +194,15 @@ def write_mediamtx_config(cfg, template=None, dest=None):
     template = Path(template or package_dir() / 'mediamtx.yml')
     dest = Path(dest or config_dir() / 'mediamtx.yml')
     key = cfg.get('local_ingest_key') or 'setup'
+    try:
+        hours = int(cfg.get('record_hours') or 12)
+    except (TypeError, ValueError):
+        hours = 12
+    hours = max(1, min(168, hours))
     dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_text(template.read_text().replace('__INGEST_KEY__', key))
+    dest.write_text(template.read_text()
+                    .replace('__INGEST_KEY__', key)
+                    .replace('__RECORD_HOURS__', str(hours)))
     return dest
 
 

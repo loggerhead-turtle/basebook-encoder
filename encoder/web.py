@@ -207,6 +207,21 @@ STATUS_PAGE = """<!doctype html><html><head>
 </div>
 
 <div class="card">
+  <h2>Recording retention</h2>
+  <p class="hint">How long the rolling game recording (the source of every
+    clip) stays on this box before pruning. 4 Mbps &asymp; 1.8 GB/h — keep
+    12 h on an SD card; 72 h wants NVMe. Survives updates.</p>
+  <form method="post" action="/retention">
+    <select name="hours">
+      {% for h in [12, 24, 48, 72] %}
+      <option value="{{ h }}" {{ 'selected' if h == record_hours }}>{{ h }} hours</option>
+      {% endfor %}
+    </select>
+    <button class="btn" type="submit">Save retention</button>
+  </form>
+</div>
+
+<div class="card">
   <h2>Scorebug bandwidth</h2>
   <form method="post" action="/bandwidth">
     <select name="bandwidth">
@@ -428,6 +443,7 @@ def create_app(cloud=None, sender=None):
             yt_placeholder='(saved)' if cfg['youtube'].get('key')
             else 'xxxx-xxxx-xxxx-xxxx',
             bandwidth=cfg.get('bandwidth', 0),
+            record_hours=int(cfg.get('record_hours') or 12),
             bandwidth_levels=BANDWIDTH_LEVELS,
             logs='\n'.join(config.redact_lines(system.journal_tail(60), cfg))
                  or '(no logs)')
@@ -521,6 +537,24 @@ def create_app(cloud=None, sender=None):
             config.save(cfg)
             system.systemctl('restart', 'playcall-encoder-youtube')
         return redirect(url_for('index'))
+
+    @app.route('/retention', methods=['POST'])
+    def retention():
+        try:
+            hours = max(1, min(168, int(request.form.get('hours', 12))))
+        except (TypeError, ValueError):
+            hours = 12
+        cfg = config.load()
+        cfg['record_hours'] = hours
+        config.save(cfg)
+        try:
+            config.write_mediamtx_config(cfg)
+        except OSError as e:
+            log.warning(f'mediamtx config not written: {e}')
+        system.systemctl('restart', 'playcall-encoder-mediamtx')
+        log.info(f'recording retention set to {hours}h')
+        return redirect(url_for('index',
+                                msg=f'Recording retention: {hours} hours'))
 
     @app.route('/bandwidth', methods=['POST'])
     def bandwidth():
