@@ -40,7 +40,7 @@ def reboot():
     run(['reboot'])
 
 
-UPDATE_REPO = 'https://github.com/loggerhead-turtle/ndi-encoder'
+UPDATE_REPO = 'https://github.com/loggerhead-turtle/basebook-encoder'
 INSTALL_DIR = '/opt/playcall-encoder'
 # Restart order matters: the box's own service (which hosts this web UI)
 # goes LAST, so the siblings come up on new code before we kill ourselves

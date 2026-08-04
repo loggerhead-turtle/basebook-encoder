@@ -4,7 +4,7 @@
 #  Raspberry Pi 4/5, Raspberry Pi OS Bookworm (64-bit), NetworkManager.
 #
 #  One-liner (self-install):
-#    curl -fsSL https://raw.githubusercontent.com/loggerhead-turtle/ndi-encoder/main/install.sh | sudo bash
+#    curl -fsSL https://raw.githubusercontent.com/loggerhead-turtle/basebook-encoder/main/install.sh | sudo bash
 #
 #  Or from a checkout:
 #    sudo bash install.sh
@@ -20,7 +20,7 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
-REPO_URL="${PLAYCALL_ENCODER_REPO:-https://github.com/loggerhead-turtle/ndi-encoder}"
+REPO_URL="${PLAYCALL_ENCODER_REPO:-https://github.com/loggerhead-turtle/basebook-encoder}"
 INSTALL_DIR=/opt/playcall-encoder
 CONFIG_DIR=/etc/playcall-encoder
 MEDIAMTX_VERSION="${MEDIAMTX_VERSION:-latest}"
