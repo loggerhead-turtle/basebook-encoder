@@ -490,7 +490,8 @@ def test_heartbeat_payload_shape():
     hb = link.heartbeat_payload()
     assert hb['state'] == 'pushing'
     assert set(hb) == {'state', 'ingest', 'push', 'cpu', 'temp',
-                       'version', 'log_tail', 'hostname', 'ip', 'clips'}
+                       'version', 'log_tail', 'hostname', 'ip', 'clips',
+                       'pin'}
     assert set(hb['ingest']) == {'connected', 'kbps'}
     assert set(hb['push']) == {'connected', 'kbps', 'reconnects_5m'}
     assert hb['push']['reconnects_5m'] == 1          # only the recent one
@@ -884,3 +885,15 @@ def test_web_never_offers_a_downgrade(monkeypatch):
     assert 'update 1.0.0 available' not in html
     assert 'Update available' not in html
     assert 'Update software' in html          # manual reinstall still there
+
+
+def test_heartbeat_carries_the_settings_pin():
+    """The PIN rides the authenticated heartbeat so team staff can recover
+    it from the site instead of SSHing into the box."""
+    _paired_cfg()
+    cfg = config.load()
+    cfg['device']['pin'] = '431905'
+    config.save(cfg)
+    link = cloud_link.CloudLink(http=lambda *a, **k: {})
+    hb = link.heartbeat_payload()
+    assert hb['pin'] == '431905'

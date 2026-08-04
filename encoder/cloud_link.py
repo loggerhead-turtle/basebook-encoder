@@ -225,6 +225,12 @@ class CloudLink:
             # instead of assuming playcall-encoder.local resolves.
             'ip': system.lan_ip(),
             'hostname': system.hostname(),
+            # The settings PIN rides the authenticated heartbeat so team
+            # staff can recover it from the site ("Show settings PIN" on
+            # the encoder card) instead of SSHing into the box. This link
+            # is already trusted with the stream assignment; the site
+            # gates the reveal to staff.
+            'pin': str((config.load().get('device') or {}).get('pin') or ''),
             # Journald lines can contain ffmpeg's push URL (stream key) —
             # scrub before anything leaves the box.
             'log_tail': config.redact_lines(system.journal_tail(20),
