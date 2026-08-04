@@ -865,3 +865,22 @@ def test_web_no_update_card_when_current(monkeypatch):
     html = c.get('/').get_data(as_text=True)
     assert 'Update available' not in html
     assert 'Update software' in html               # fallback always there
+
+
+def test_web_never_offers_a_downgrade(monkeypatch):
+    """A misconfigured cloud reporting an OLDER release (the literal field
+    bug: fresh 1.2.1 box told 'update 1.0.0 available') shows no update
+    card and no header nag."""
+    from encoder import web
+    provisioning.headless_setup()
+    monkeypatch.setattr(web.system, 'journal_tail', lambda *a, **k: [])
+
+    class Old(_CloudStub):
+        latest_version = '1.0.0'
+    app = web.create_app(cloud=Old())
+    c = app.test_client()
+    c.post('/login', data={'pin': config.load()['device']['pin']})
+    html = c.get('/').get_data(as_text=True)
+    assert 'update 1.0.0 available' not in html
+    assert 'Update available' not in html
+    assert 'Update software' in html          # manual reinstall still there

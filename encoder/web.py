@@ -395,6 +395,16 @@ def create_app(cloud=None, sender=None):
             return redirect(url_for('login', next=request.full_path))
         return None
 
+    def _is_newer(a, b):
+        """True when version a is strictly newer than b. A cloud that
+        reports an OLDER release (misconfigured, or a rollback) must
+        never make this box offer a downgrade as an 'update'."""
+        try:
+            return ([int(x) for x in str(a).split('.')]
+                    > [int(x) for x in str(b).split('.')])
+        except (ValueError, AttributeError):
+            return False
+
     @app.route('/')
     def index():
         from .scorebug import BANDWIDTH_LEVELS
@@ -403,9 +413,10 @@ def create_app(cloud=None, sender=None):
             {'connected': False, 'kbps': None}
         push = cloud.push_status() if cloud else \
             {'connected': False, 'kbps': None, 'reconnects_5m': 0}
+        latest = cloud.latest_version if cloud else None
         return render_template_string(
             STATUS_PAGE, version=__version__,
-            latest=cloud.latest_version if cloud else None,
+            latest=latest if _is_newer(latest, __version__) else None,
             ingest=ingest, push=push,
             assignment=cloud.assignment if cloud else None,
             hostname=system.hostname(), ip=system.lan_ip(),
