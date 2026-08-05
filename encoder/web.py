@@ -316,9 +316,32 @@ def log_bundle(cloud=None, lines=200):
     return '\n'.join(parts) + '\n'
 
 
+def _session_secret():
+    """A signing secret that SURVIVES restarts. os.urandom-per-boot signed
+    every coach out whenever the service restarted — which is exactly what
+    a self-update does, so 'update, then change the PIN' bounced through
+    login and died on a 405. Stored beside the config (0600, never in the
+    support bundle); per-process fallback when the dir isn't writable."""
+    path = config.config_dir() / 'web_secret'
+    try:
+        data = path.read_bytes()
+        if len(data) >= 24:
+            return data
+    except OSError:
+        pass
+    data = os.urandom(24)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'wb') as fh:
+            fh.write(data)
+    except OSError:
+        pass                       # dev checkout: sessions die with process
+    return data
+
+
 def create_app(cloud=None, sender=None):
     app = Flask(__name__)
-    app.secret_key = os.urandom(24)
+    app.secret_key = _session_secret()
 
     # Global (not per-request) brute-force state, shared by every client.
     lockout = {'fails': 0, 'until': 0.0}
@@ -425,8 +448,13 @@ def create_app(cloud=None, sender=None):
             return None
         if not _authed():
             # Preserve where the user was headed (the /pair deep link from
-            # the PlayCall site carries its params through the PIN step).
-            return redirect(url_for('login', next=request.full_path))
+            # the PlayCall site carries its params through the PIN step) —
+            # but only for GETs. Replaying a bounced POST's path as a GET
+            # after sign-in hit 405 on POST-only routes (a coach changing
+            # the PIN right after an update landed on a bare error page).
+            if request.method == 'GET':
+                return redirect(url_for('login', next=request.full_path))
+            return redirect(url_for('login'))
         return None
 
     def _is_newer(a, b):
@@ -588,11 +616,14 @@ def create_app(cloud=None, sender=None):
             sender.bandwidth = level
         return redirect(url_for('index'))
 
-    @app.route('/pin', methods=['POST'])
+    @app.route('/pin', methods=['GET', 'POST'])
     def set_pin():
         """Replace the auto-generated PIN with one the coach picks. Nobody
         remembers six random digits months after installing, and the old
-        alternatives were SSH or a factory reset."""
+        alternatives were SSH or a factory reset. GET lands here only via
+        a stale next= link — go to the settings page, never a 405."""
+        if request.method == 'GET':
+            return redirect(url_for('index'))
         new = (request.form.get('pin') or '').strip()
         again = (request.form.get('pin2') or '').strip()
         if len(new) < 4 or len(new) > 32:

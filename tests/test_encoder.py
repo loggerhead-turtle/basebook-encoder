@@ -989,3 +989,33 @@ def test_a_dead_token_explains_itself_instead_of_a_silent_pin_form():
     body = r.get_data(as_text=True)
     assert r.status_code == 200
     assert 'didn’t go through' in body               # guidance, not silence
+
+
+# ── the update-then-change-PIN 405 (session survives restarts) ───────────────
+
+def test_sessions_survive_a_service_restart():
+    """Real outage: sign in, self-update restarts the service, submit the
+    new PIN — the fresh process minted a fresh random secret, saw you as
+    signed out, and the bounce ended on a 405. The secret is now stored
+    beside the config, so a cookie from before the restart still works."""
+    from encoder import web
+    cfg = _paired_cfg()
+    cfg['device']['pin'] = '123456'
+    config.save(cfg)
+    c1 = web.create_app().test_client()
+    assert c1.post('/login', data={'pin': '123456'}).status_code == 302
+    cookie = c1.get_cookie('session')
+    c2 = web.create_app().test_client()          # "restarted" process
+    c2.set_cookie('session', cookie.value)
+    assert c2.get('/').status_code == 200        # still signed in
+
+
+def test_bounced_pin_change_lands_on_settings_not_a_405():
+    c = _pin_app()
+    # signed out: the POST bounces to plain login (no next= to replay)
+    r = c.post('/pin', data={'pin': '9999', 'pin2': '9999'})
+    assert r.status_code == 302 and 'next' not in r.headers['Location']
+    # a stale GET /pin (old next= link) goes to the settings page
+    c.post('/login', data={'pin': '123456'})
+    r = c.get('/pin')
+    assert r.status_code == 302 and r.headers['Location'].endswith('/')
