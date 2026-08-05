@@ -930,3 +930,62 @@ def test_recording_retention_is_a_setting_that_survives_updates(tmp_path,
     assert ('restart', 'playcall-encoder-mediamtx') in calls
     html = c.get('/').get_data(as_text=True)
     assert 'Recording retention' in html and 'selected' in html
+
+
+# ── one-click sign-in from the site (nonce token) ────────────────────────────
+
+class _FakeCloud:
+    """A CloudLink stand-in for the token flow: enabled, and a poll that
+    delivers the nonce — optionally blowing up AFTER delivery, the way a
+    real poll can when applying the assignment fails mid-request."""
+
+    def __init__(self, nonce, explode=False):
+        self._nonce = nonce
+        self._explode = explode
+        self.login_nonce = None
+        self.polls = 0
+
+    def enabled(self):
+        return True
+
+    def poll_assignment_once(self):
+        self.polls += 1
+        self.login_nonce = self._nonce
+        if self._explode:
+            raise RuntimeError('assignment apply died after capture')
+
+
+def _pin_app(cloud=None):
+    from encoder import web
+    cfg = _paired_cfg()
+    cfg['device']['pin'] = '123456'
+    config.save(cfg)
+    app = web.create_app(cloud=cloud)
+    app.config['TESTING'] = True
+    return app.test_client()
+
+
+def test_one_click_token_forces_a_poll_and_signs_in():
+    cloud = _FakeCloud('nonce-abc')
+    c = _pin_app(cloud=cloud)
+    r = c.get('/login?token=nonce-abc')
+    assert r.status_code == 302                      # straight in, no PIN
+    assert cloud.login_nonce is None                 # single use — consumed
+
+
+def test_one_click_survives_a_poll_that_dies_after_delivery():
+    """The nonce is captured before the assignment is applied, so an apply
+    failure must not bounce the coach to the PIN form."""
+    cloud = _FakeCloud('nonce-abc', explode=True)
+    c = _pin_app(cloud=cloud)
+    r = c.get('/login?token=nonce-abc')
+    assert r.status_code == 302
+    assert cloud.polls == 1
+
+
+def test_a_dead_token_explains_itself_instead_of_a_silent_pin_form():
+    c = _pin_app(cloud=_FakeCloud('different-nonce', explode=True))
+    r = c.get('/login?token=stale-token')
+    body = r.get_data(as_text=True)
+    assert r.status_code == 200
+    assert 'didn’t go through' in body               # guidance, not silence

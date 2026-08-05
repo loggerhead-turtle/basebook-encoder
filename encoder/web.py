@@ -347,8 +347,16 @@ def create_app(cloud=None, sender=None):
             if attempt == 0 and getattr(cloud, 'enabled', lambda: False)():
                 try:
                     cloud.poll_assignment_once()
-                except Exception:
-                    return False
+                except Exception as e:
+                    # The nonce is captured BEFORE the assignment is
+                    # applied, so a failed apply (or a slow uplink mid-
+                    # request) may still have delivered it — re-check
+                    # instead of giving up and bouncing the coach to the
+                    # PIN form.
+                    log.warning(f'one-click sign-in poll hiccup: {e}')
+        log.warning('one-click sign-in link refused: the cloud nonce '
+                    'never matched (one arrived: '
+                    f'{bool(getattr(cloud, "login_nonce", None))})')
         return False
 
     @app.route('/login', methods=['GET', 'POST'])
@@ -358,6 +366,17 @@ def create_app(cloud=None, sender=None):
             session['authed'] = True
             log.info('signed in via one-click link from the PlayCall site')
             return redirect(url_for('index'))
+        if token and request.method == 'GET':
+            # The link was real but didn't verify (nonce expired, box
+            # mid-sync, uplink hiccup). Say so — a silent PIN form reads
+            # as "the button is broken".
+            return render_template_string(
+                LOGIN_PAGE, error='That sign-in link didn’t go '
+                'through — give the box a few seconds and tap the '
+                'site’s ⚙ Settings button again, or enter the '
+                'PIN (the \U0001f511 PIN button on the site’s '
+                'Encoders card shows it).',
+                next=request.args.get('next') or '')
         if request.method == 'POST':
             # Lockout check FIRST — while locked, no comparison happens at
             # all, so parallel requests can't race past the damper.
