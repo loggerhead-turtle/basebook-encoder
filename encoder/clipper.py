@@ -215,11 +215,15 @@ class Clipper:
 
     @staticmethod
     def _fix_audio_for_ios(data):
-        """A WHIP (phone/WebRTC) publish records Opus audio, which Safari on
-        iPhone can't play in MP4; a Mevo's AAC plays everywhere, so this is a
-        no-op for camera clips. Remux video-copy/audio-AAC when needed, and
-        fall back to the original bytes on any failure — better to upload a
-        clip that might not play on iOS than to drop it."""
+        """Normalize EVERY cut, not just Opus-audio ones. Two jobs in one
+        remux: (1) Opus phone audio → AAC so iPhones can play it; (2) the
+        clock — a cut inherits the rolling recording's mid-stream
+        timestamps, and a video track starting at a NEGATIVE pts (observed:
+        -1.9s under a 0-based audio track) makes phone browsers stutter
+        and jump to the end of a clip whose media is actually perfect.
+        avoid_negative_ts zeroes the clock; faststart lets playback begin
+        before the download finishes. Falls back to the original bytes on
+        any failure — better an awkward clip than none."""
         try:
             with tempfile.NamedTemporaryFile(suffix='.mp4') as src:
                 src.write(data)
@@ -229,17 +233,19 @@ class Clipper:
                      '-show_entries', 'stream=codec_name', '-of', 'csv=p=0',
                      src.name],
                     capture_output=True, text=True, timeout=30)
-                if probe.stdout.strip() in ('', 'aac'):
-                    return data
+                aud = ['-c:a', 'copy'] if probe.stdout.strip() in ('', 'aac') \
+                    else ['-c:a', 'aac', '-b:a', '128k', '-ar', '48000']
                 with tempfile.NamedTemporaryFile(suffix='.mp4') as out:
                     subprocess.run(
                         ['ffmpeg', '-y', '-v', 'error', '-i', src.name,
-                         '-c:v', 'copy', '-c:a', 'aac', '-b:a', '128k',
-                         '-ar', '48000', '-movflags', '+faststart', out.name],
+                         '-c:v', 'copy'] + aud +
+                        ['-avoid_negative_ts', 'make_zero',
+                         '-movflags', '+faststart', out.name],
                         check=True, timeout=120)
-                    return Path(out.name).read_bytes()
+                    fixed = Path(out.name).read_bytes()
+                    return fixed if len(fixed) > 1024 else data
         except Exception as e:
-            log.warning('audio remux failed (%s) — uploading original', e)
+            log.warning('clip normalize failed (%s) — uploading original', e)
             return data
 
     # ── jobs ─────────────────────────────────────────────────────────────

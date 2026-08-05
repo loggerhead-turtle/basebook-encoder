@@ -77,7 +77,8 @@ cp -r "$SRC/encoder" "$INSTALL_DIR/"
 cp "$SRC/VERSION" "$SRC/mediamtx.yml" "$INSTALL_DIR/"
 cp "$SRC/LICENSE" "$INSTALL_DIR/" 2>/dev/null || true
 mkdir -p "$INSTALL_DIR/scripts"
-install -m 755 "$SRC/scripts/youtube_push.sh" "$INSTALL_DIR/scripts/"
+install -m 755 "$SRC/scripts/"*.sh "$SRC/scripts/"*.py "$INSTALL_DIR/scripts/" 2>/dev/null || \
+  install -m 755 "$SRC/scripts/youtube_push.sh" "$INSTALL_DIR/scripts/"
 find "$INSTALL_DIR" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
 
 # ── MediaMTX (static binary from GitHub releases; arm64 on Pi 4/5) ────────────

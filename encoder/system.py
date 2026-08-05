@@ -79,12 +79,14 @@ def self_update(repo_url=None, install_dir=None):
                         dirs_exist_ok=True)
         for name in ('VERSION', 'mediamtx.yml'):
             shutil.copy2(os.path.join(src, name), install_dir)
-        push = os.path.join(src, 'scripts', 'youtube_push.sh')
-        if os.path.isfile(push):
+        sdir = os.path.join(src, 'scripts')
+        if os.path.isdir(sdir):
             os.makedirs(os.path.join(install_dir, 'scripts'), exist_ok=True)
-            dst = os.path.join(install_dir, 'scripts', 'youtube_push.sh')
-            shutil.copy2(push, dst)
-            os.chmod(dst, 0o755)
+            for name in os.listdir(sdir):
+                if name.endswith(('.sh', '.py')):
+                    dst = os.path.join(install_dir, 'scripts', name)
+                    shutil.copy2(os.path.join(sdir, name), dst)
+                    os.chmod(dst, 0o755)
         # Stale bytecode from removed/renamed modules must not shadow the
         # new tree on restart.
         for root, dirs, _files in os.walk(os.path.join(install_dir,
