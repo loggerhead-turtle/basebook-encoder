@@ -14,6 +14,7 @@ import json
 import subprocess
 import sys
 import tempfile
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -71,6 +72,15 @@ def main():
             else:
                 failed += 1
                 print(f'  ✗ cloud said: {r}')
+        except urllib.error.HTTPError as e:
+            failed += 1
+            try:
+                body = e.read(300).decode('utf-8', 'replace').strip()
+            except Exception:
+                body = ''
+            # the response body says WHY (storage limit, size…) — a bare
+            # status line made the big-clip failures undiagnosable
+            print(f'  ✗ HTTP {e.code}: {body or e.reason}')
         except Exception as e:
             failed += 1
             print(f'  ✗ {e}')
