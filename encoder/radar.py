@@ -187,6 +187,14 @@ class RadarService:
         self.frames_parsed = 0
         self.unparsed = 0
         self._post_fails = 0
+        # Display passthrough: the SECOND adapter on this box is the
+        # Stalker LED display board for the fans. The gun's raw lines
+        # are forwarded to it verbatim, so the board behaves exactly as
+        # if it were cabled straight to the gun.
+        self._serial_cls = None        # set once pyserial imports
+        self._disp = None
+        self._disp_port = None
+        self._disp_warned = 0.0
 
     # ── cloud ────────────────────────────────────────────────────────────────
     def _post(self, payload):
@@ -233,6 +241,38 @@ class RadarService:
             if 'events' in payload:
                 self.pending.clear()
 
+    # ── display board passthrough ────────────────────────────────────────────
+    def _close_display(self):
+        d, self._disp = self._disp, None
+        self._disp_port = None
+        if d is not None:
+            try:
+                d.close()
+            except Exception:
+                pass
+
+    def forward_display(self, raw, target):
+        """Write one raw gun line to the LED board's adapter. Best
+        effort forever: the board vanishing mid-game must never touch
+        the capture side."""
+        if not raw or not target or self._serial_cls is None:
+            return
+        try:
+            if self._disp is None or self._disp_port != target:
+                self._close_display()
+                self._disp = self._serial_cls(target, BAUD, timeout=0,
+                                              write_timeout=0.2)
+                self._disp_port = target
+                log.info(f'forwarding radar to the display board on {target}')
+            self._disp.write(raw)
+        except Exception as e:
+            self._close_display()
+            now = time.monotonic()
+            if now - self._disp_warned > 30:
+                self._disp_warned = now
+                log.warning(f'display board forward failed ({e}) — '
+                            'will keep retrying')
+
     # ── serial loop ──────────────────────────────────────────────────────────
     def handle_line(self, line, t=None):
         """One serial line through the whole pipeline (test entrypoint)."""
@@ -273,6 +313,7 @@ class RadarService:
         except ImportError:
             log.info('pyserial not installed — radar capture disabled')
             return
+        self._serial_cls = serial.Serial
         # A box can carry more than one USB-serial adapter, and a whole
         # game was lost to picking the wrong one alphabetically and
         # sitting on its silence. With multiple candidates we now rotate
@@ -300,6 +341,9 @@ class RadarService:
                 log.info(f'{len(ports)} serial adapters present: {ports} — '
                          f'listening on {self.port}, rotating after '
                          f'{int(ROTATE_AFTER)}s of silence')
+            # the LED board's adapter: pinned by config, else whichever
+            # candidate we are NOT reading the gun on
+            disp_pin = (cfg.get('radar') or {}).get('display_port') or None
             try:
                 with serial.Serial(self.port, BAUD, timeout=1) as ser:
                     log.info(f'radar listening on {self.port} @ {BAUD}')
@@ -311,6 +355,10 @@ class RadarService:
                         if line:
                             last_rx = time.monotonic()
                             self.handle_line(line)
+                            others = [p for p in ports if p != self.port]
+                            self.forward_display(
+                                raw, disp_pin or (others[0] if others
+                                                  else None))
                         else:
                             ev = self.engine.flush()
                             self.push(event=ev)
@@ -326,6 +374,8 @@ class RadarService:
                 port_idx += 1          # a dead adapter shouldn't wedge us
                 log.warning(f'radar serial dropped ({e}) — rescanning')
                 time.sleep(3)
+            finally:
+                self._close_display()
 
     def start_thread(self):
         t = threading.Thread(target=self.loop, daemon=True)

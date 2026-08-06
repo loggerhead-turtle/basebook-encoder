@@ -175,3 +175,59 @@ def test_find_ports_lists_all_candidates_and_config_pins_one(monkeypatch,
     assert radar_mod.find_port({}) == '/dev/serial/by-id/usb-FTDI_A9'
     pinned = {'radar': {'port': '/dev/serial/by-id/usb-FTDI_BG'}}
     assert radar_mod.find_ports(pinned) == ['/dev/serial/by-id/usb-FTDI_BG']
+
+
+# ── LED display board passthrough ────────────────────────────────────────────
+
+class _FakeSerial:
+    instances = []
+
+    def __init__(self, port, baud, timeout=0, write_timeout=0.2):
+        self.port, self.baud = port, baud
+        self.writes = []
+        self.closed = False
+        self.explode = False
+        _FakeSerial.instances.append(self)
+
+    def write(self, raw):
+        if self.explode:
+            raise IOError('display unplugged')
+        self.writes.append(raw)
+
+    def close(self):
+        self.closed = True
+
+
+def test_gun_lines_forward_verbatim_to_the_display_board():
+    """The second adapter on the box is the Stalker LED board for the
+    fans — the gun's raw frames pass through byte-for-byte, as if the
+    board were cabled straight to the gun."""
+    from encoder.radar import RadarService
+    _FakeSerial.instances = []
+    svc = RadarService(_DeadLink())
+    svc._serial_cls = _FakeSerial
+    svc.port = '/dev/gun'
+    raw = b'RD   34C 537         5C 589 869     9A15650\r\n'
+    svc.forward_display(raw, '/dev/display')
+    svc.forward_display(raw, '/dev/display')
+    assert len(_FakeSerial.instances) == 1          # opened once, reused
+    assert _FakeSerial.instances[0].port == '/dev/display'
+    assert _FakeSerial.instances[0].writes == [raw, raw]
+
+
+def test_display_board_vanishing_never_touches_capture():
+    from encoder.radar import RadarService
+    _FakeSerial.instances = []
+    svc = RadarService(_DeadLink())
+    svc._serial_cls = _FakeSerial
+    svc.port = '/dev/gun'
+    svc.forward_display(b'x', '/dev/display')
+    _FakeSerial.instances[0].explode = True
+    svc.forward_display(b'y', '/dev/display')       # raises inside → caught
+    assert svc._disp is None                        # handle dropped
+    svc.forward_display(b'z', '/dev/display')       # and re-opened after
+    assert len(_FakeSerial.instances) == 2
+    # no target / no serial class → clean no-ops
+    svc.forward_display(b'q', None)
+    svc._serial_cls = None
+    svc.forward_display(b'q', '/dev/display')
