@@ -127,3 +127,34 @@ def test_service_buffers_events_across_cloud_outages():
     assert not svc.pending                    # buffered event delivered
     events = [p for _u, p in link.posts if p.get('events')]
     assert events and events[0]['events'][0]['peak'] == 58.9
+
+
+# ── observability: the journal must be able to answer "why no velo" ──────────
+
+class _DeadLink:
+    def _cloud(self):
+        return '', ''
+
+
+def test_counters_track_lines_frames_and_unparsed():
+    from encoder.radar import RadarService
+    svc = RadarService(_DeadLink())
+    svc.handle_line('RD   34C 537         5C 589 869     9A15650', t=1.0)
+    svc.handle_line(' 80.1 ', t=1.1)
+    svc.handle_line('!!not radar!!', t=1.2)
+    assert svc.lines_seen == 3
+    assert svc.frames_parsed == 2
+    assert svc.unparsed == 1
+
+
+def test_closed_pitch_events_land_in_the_log(caplog):
+    import logging
+    from encoder.radar import RadarService
+    svc = RadarService(_DeadLink())
+    with caplog.at_level(logging.INFO, logger='radar'):
+        for i in range(6):                       # a tracked pitch...
+            svc.handle_line('RD   34C 537         5C 589 869     9A15650',
+                            t=1.0 + i * 0.1)
+        svc.handle_line(' 62.0 ', t=4.0)         # ...closed by a later burst
+    assert any('radar pitch: 58.9 mph' in r.message for r in caplog.records)
+    assert any('radar rx sample' in r.message for r in caplog.records)

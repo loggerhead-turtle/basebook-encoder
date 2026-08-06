@@ -171,6 +171,13 @@ class RadarService:
         self._last_live = (None, None)
         self.port = None
         self.connected = False
+        # Observability: "no velo showed up" was undiagnosable from the
+        # journal because everything below INFO was silent. Counters +
+        # first-N samples make one `journalctl | grep radar` the answer.
+        self.lines_seen = 0
+        self.frames_parsed = 0
+        self.unparsed = 0
+        self._post_fails = 0
 
     # ── cloud ────────────────────────────────────────────────────────────────
     def _post(self, payload):
@@ -180,9 +187,17 @@ class RadarService:
         try:
             self.link.http(f'{base}{POST_PATH}',
                            headers=self.link._headers(), payload=payload)
+            self._post_fails = 0
             return True
         except Exception as e:
-            log.debug(f'radar post failed (retrying): {e}')
+            # first failure and every 50th at WARN — visible in the
+            # journal without letting a dead uplink flood it
+            self._post_fails += 1
+            if self._post_fails == 1 or self._post_fails % 50 == 0:
+                log.warning(f'radar post failed x{self._post_fails} '
+                            f'(retrying): {e}')
+            else:
+                log.debug(f'radar post failed (retrying): {e}')
             return False
 
     def push(self, live=None, event=None, force_alive=False, now=None):
@@ -212,10 +227,29 @@ class RadarService:
     # ── serial loop ──────────────────────────────────────────────────────────
     def handle_line(self, line, t=None):
         """One serial line through the whole pipeline (test entrypoint)."""
+        self.lines_seen += 1
+        if self.lines_seen <= 3:
+            # the first few RAW lines, escaped — one glance settles
+            # "is the gun talking, and in which format?"
+            log.info(f'radar rx sample: {line[:80]!r}')
         frame = parse_frame(line)
         if frame is None:
+            self.unparsed += 1
+            if self.unparsed <= 3:
+                log.info(f'radar line did not parse: {line[:80]!r}')
+            elif self.unparsed % 200 == 0:
+                log.warning(f'radar: {self.unparsed} unparsed lines of '
+                            f'{self.lines_seen} — wrong format/baud?')
             return None
+        self.frames_parsed += 1
+        if self.frames_parsed % 500 == 0:
+            log.info(f'radar: {self.frames_parsed} frames parsed '
+                     f'({self.lines_seen} lines, {self.unparsed} unparsed)')
         ev = self.engine.feed(frame, t=t)
+        if ev and ev.get('kind') != 'ghost':
+            log.info(f"radar {ev['kind']}: {ev['peak']} mph"
+                     + (f", {ev['rpm']} rpm" if ev.get('rpm') else '')
+                     + f" ({ev['frames']} frames, {ev['dur']}s)")
         live = None
         cur = frame.get('peak') if frame.get('peak') is not None \
             else frame.get('live')
