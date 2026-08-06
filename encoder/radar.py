@@ -143,16 +143,25 @@ class BurstEngine:
                 'frames': len(frames), 'dur': dur}
 
 
-def find_port(cfg=None):
-    """The gun's USB-RS232 adapter, preferring the stable by-id path."""
+ROTATE_AFTER = 60.0   # silent this long with other adapters present → rotate
+
+
+def find_ports(cfg=None):
+    """Candidate USB-RS232 adapters, stable by-id paths preferred. A
+    configured radar.port pins ONE and disables rotation."""
     want = ((cfg or {}).get('radar') or {}).get('port') or ''
     if want:
-        return want
+        return [want]
     byid = sorted(glob.glob('/dev/serial/by-id/*'))
     if byid:
-        return byid[0]
-    tty = sorted(glob.glob('/dev/ttyUSB*'))
-    return tty[0] if tty else None
+        return byid
+    return sorted(glob.glob('/dev/ttyUSB*'))
+
+
+def find_port(cfg=None):
+    """The first candidate (kept for callers that need exactly one)."""
+    ports = find_ports(cfg)
+    return ports[0] if ports else None
 
 
 class RadarService:
@@ -264,31 +273,58 @@ class RadarService:
         except ImportError:
             log.info('pyserial not installed — radar capture disabled')
             return
+        # A box can carry more than one USB-serial adapter, and a whole
+        # game was lost to picking the wrong one alphabetically and
+        # sitting on its silence. With multiple candidates we now rotate
+        # to the next after ROTATE_AFTER seconds without a byte — the
+        # gun's keepalive frames mean the RIGHT port is never silent.
+        port_idx = 0
+        missing_logged = False
         while self.running:
             cfg = self.cfg_load()
             if ((cfg.get('radar') or {}).get('enabled') or 'auto') == 'off':
                 time.sleep(10)
                 continue
-            self.port = find_port(cfg)
-            if not self.port:
+            ports = find_ports(cfg)
+            if not ports:
                 self.connected = False
+                if not missing_logged:
+                    log.info('no USB-serial adapter present — radar idle, '
+                             'watching for one')
+                    missing_logged = True
                 time.sleep(5)
                 continue
+            missing_logged = False
+            self.port = ports[port_idx % len(ports)]
+            if len(ports) > 1:
+                log.info(f'{len(ports)} serial adapters present: {ports} — '
+                         f'listening on {self.port}, rotating after '
+                         f'{int(ROTATE_AFTER)}s of silence')
             try:
                 with serial.Serial(self.port, BAUD, timeout=1) as ser:
                     log.info(f'radar listening on {self.port} @ {BAUD}')
                     self.connected = True
+                    last_rx = time.monotonic()
                     while self.running:
                         raw = ser.readline()
                         line = raw.decode('ascii', 'replace') if raw else ''
                         if line:
+                            last_rx = time.monotonic()
                             self.handle_line(line)
                         else:
                             ev = self.engine.flush()
                             self.push(event=ev)
+                            if (len(ports) > 1 and time.monotonic()
+                                    - last_rx > ROTATE_AFTER):
+                                port_idx += 1
+                                log.info(f'no data on {self.port} for '
+                                         f'{int(ROTATE_AFTER)}s — trying '
+                                         'the next adapter')
+                                break
             except Exception as e:
                 self.connected = False
-                log.debug(f'radar serial error ({e}) — rescanning')
+                port_idx += 1          # a dead adapter shouldn't wedge us
+                log.warning(f'radar serial dropped ({e}) — rescanning')
                 time.sleep(3)
 
     def start_thread(self):

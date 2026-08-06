@@ -158,3 +158,20 @@ def test_closed_pitch_events_land_in_the_log(caplog):
         svc.handle_line(' 62.0 ', t=4.0)         # ...closed by a later burst
     assert any('radar pitch: 58.9 mph' in r.message for r in caplog.records)
     assert any('radar rx sample' in r.message for r in caplog.records)
+
+
+def test_find_ports_lists_all_candidates_and_config_pins_one(monkeypatch,
+                                                             tmp_path):
+    """REGRESSION: two adapters were present and the service silently
+    picked the alphabetically-first (wrong) one for a whole game. The
+    port finder now returns every candidate so the loop can rotate off
+    a silent one; an explicit radar.port config pins exactly one."""
+    from encoder import radar as radar_mod
+    fake = {'/dev/serial/by-id/usb-FTDI_A9': None,
+            '/dev/serial/by-id/usb-FTDI_BG': None}
+    monkeypatch.setattr(radar_mod.glob, 'glob',
+                        lambda pat: (sorted(fake) if 'by-id' in pat else []))
+    assert radar_mod.find_ports({}) == sorted(fake)
+    assert radar_mod.find_port({}) == '/dev/serial/by-id/usb-FTDI_A9'
+    pinned = {'radar': {'port': '/dev/serial/by-id/usb-FTDI_BG'}}
+    assert radar_mod.find_ports(pinned) == ['/dev/serial/by-id/usb-FTDI_BG']
