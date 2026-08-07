@@ -12,6 +12,13 @@ Wire format (confirmed on the bench against the gun's display):
   Idle keepalive frames carry the tags with empty values — they are the
   gun-connected heartbeat and are never stored.
 
+  The tag SUFFIX letter varies with the gun's format/units setting: a
+  field unit sent `34A … 5A … 6A` (no constant field while idle), which
+  the original 34C/5C-only pattern silently rejected — a live, streaming
+  gun read as "no radar". Any letter is accepted now. Guns in this mode
+  also end frames with a bare \r, so one serial read can carry several
+  frames glued together — handle_line() splits and feeds each.
+
   Format A fallback: a bare fixed-width speed per line (` 80.1`), idle
   keepalive `   . ` lines.
 
@@ -51,10 +58,17 @@ BAND = (30.0, 110.0)          # plausible pitch band (pref: set the GUN's
                               # LO threshold BELOW the slowest pitcher and
                               # let software filter — see the roadmap doc)
 
-# ˆRD   34C [live]   5C [peak]   <const>   [6A | 9A<spin>]
+# ˆRD   34C [live]   5C [peak]   [const]   [6A | 9A<spin>]
+# The letter after 34/5 depends on the gun's format/units setting (34C on
+# the bench, 34A in the field). The constant field exists in C mode
+# (every frame, idle included) and is absent in A mode — so after the
+# 5-tag there may be zero, one, or two numbers, and a LONE number is
+# ambiguous: C-idle's constant, or A-live's peak. parse_frame settles it
+# by the 34 field: a frame with a live speed is a reading (lone number =
+# peak); a frame with an empty 34 field is idle (lone number = const).
 _FRAME = re.compile(
-    r'RD\s+34C\s+(?:(\d{2,5})\s+)?5C\s+(?:(\d{2,5})\s+)?\d+\s+'
-    r'(?:6A|9A(\d{3,7}))')
+    r'RD\s+34[A-Z]\s+(?:(\d{2,5})\s+)?5[A-Z]\s+(?:(\d{2,5})\s+)?'
+    r'(?:(\d{2,5})\s+)?(?:6A|9A(\d{3,7}))')
 # Format A: one space-padded speed per line; idle = spaces + '.'
 _FMT_A = re.compile(r'^\s*(\d{1,3}(?:\.\d)?)\s*$')
 
@@ -66,7 +80,11 @@ def parse_frame(line):
         return None
     m = _FRAME.search(line)
     if m:
-        live, peak, spin = m.group(1), m.group(2), m.group(3)
+        live, n1, n2, spin = (m.group(1), m.group(2), m.group(3),
+                              m.group(4))
+        # two numbers after the 5-tag → peak + const; a lone number is
+        # the peak only when the frame carries a live speed (see _FRAME)
+        peak = n1 if (n2 or live) else None
         return {
             'live': int(live) / 10.0 if live else None,
             'peak': int(peak) / 10.0 if peak else None,
@@ -275,7 +293,18 @@ class RadarService:
 
     # ── serial loop ──────────────────────────────────────────────────────────
     def handle_line(self, line, t=None):
-        """One serial line through the whole pipeline (test entrypoint)."""
+        """One serial READ through the whole pipeline (test entrypoint).
+        A-mode guns end frames with a bare \r and no \n, so one
+        readline() chunk can carry several frames glued together —
+        split and feed each; the last event wins the return."""
+        segs = [s for s in (line or '').split('\r') if s.strip()]
+        if len(segs) > 1:
+            ev = None
+            for seg in segs:
+                got = self.handle_line(seg, t=t)
+                if got is not None:
+                    ev = got
+            return ev
         self.lines_seen += 1
         if self.lines_seen <= 3:
             # the first few RAW lines, escaped — one glance settles

@@ -30,6 +30,39 @@ def test_parse_multivalue_frames_match_the_gun_display():
     assert f == {'live': None, 'peak': None, 'rpm': None, 'alive': True}
 
 
+# the field gun (2026-08-07 support bundle): tag suffix A, no constant
+# field, frames end with a bare \r so serial reads glue them together
+FIELD_IDLE = '\x88RD   34A             5A             6A             '
+FIELD_LIVE = '\x88RD   34A 586         5A 589         6A             '
+FIELD_SPIN = '\x88RD   34A 537         5A 589         9A15650        '
+FIELD_CHUNK = FIELD_IDLE + '\r' + FIELD_IDLE[:30]
+
+
+def test_parse_a_suffix_frames_from_the_field_gun():
+    """The gun that read as "no radar" at the field: tags 34A/5A, no
+    constant field. The 34C/5C-only pattern rejected every frame."""
+    f = parse_frame(FIELD_IDLE)
+    assert f == {'live': None, 'peak': None, 'rpm': None, 'alive': True}
+    f = parse_frame(FIELD_LIVE)
+    assert f == {'live': 58.6, 'peak': 58.9, 'rpm': None, 'alive': True}
+    f = parse_frame(FIELD_SPIN)
+    assert f == {'live': 53.7, 'peak': 58.9, 'rpm': 1565.0, 'alive': True}
+    # the C-mode idle's LONE number stays a constant, never a phantom
+    # 86.9 peak — disambiguated by the empty 34 field
+    assert parse_frame(IDLE)['peak'] is None
+
+
+def test_handle_line_splits_cr_joined_frames():
+    svc = RadarService(link=_FakeLink())
+    svc.handle_line(FIELD_LIVE + '\r' + FIELD_SPIN + '\r', t=1.0)
+    assert svc.frames_parsed == 2
+    assert svc.lines_seen == 2
+    # a torn tail segment counts as a line but not a frame
+    svc.handle_line(FIELD_CHUNK, t=1.1)
+    assert svc.frames_parsed == 3
+    assert svc.unparsed == 1
+
+
 def test_parse_format_a_fallback():
     assert parse_frame(' 80.1')['live'] == 80.1
     assert parse_frame(' 54.4 ')['live'] == 54.4

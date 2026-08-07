@@ -207,6 +207,23 @@ class CloudLink:
                 'failed': int(data.get('failed') or 0),
                 'last_error': data.get('last_error') or ''}
 
+    def _rtmp_urls(self):
+        """Camera-facing ingest URLs, raw IP FIRST — the address that keeps
+        working when mDNS doesn't (phone hotspots and field routers
+        routinely drop multicast, which is exactly the .local failure seen
+        at the field). Same trust level as the PIN that already rides the
+        heartbeat: the site reveals them to team staff only."""
+        try:
+            key = self.cfg_load().get('local_ingest_key', '')
+            urls = []
+            ip = system.lan_ip()
+            if ip:
+                urls.append(f'rtmp://{ip}:1935/live/{key}')
+            urls.append(f'rtmp://{system.hostname()}.local:1935/live/{key}')
+            return urls
+        except Exception:
+            return []
+
     def heartbeat_payload(self):
         ingest = self.ingest_status()
         push = self.push_status()
@@ -225,6 +242,12 @@ class CloudLink:
             # instead of assuming playcall-encoder.local resolves.
             'ip': system.lan_ip(),
             'hostname': system.hostname(),
+            # The full camera-facing ingest URLs (IP first, mDNS second).
+            # Field routers hand out a NEW address most weeks and mDNS
+            # regularly fails on hotspots, so the site shows THESE — always
+            # current as of the last heartbeat — instead of a stale note
+            # from install day.
+            'rtmp_urls': self._rtmp_urls(),
             # The settings PIN rides the authenticated heartbeat so team
             # staff can recover it from the site ("Show settings PIN" on
             # the encoder card) instead of SSHing into the box. This link

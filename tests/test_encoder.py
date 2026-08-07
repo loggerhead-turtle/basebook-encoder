@@ -491,7 +491,12 @@ def test_heartbeat_payload_shape():
     assert hb['state'] == 'pushing'
     assert set(hb) == {'state', 'ingest', 'push', 'cpu', 'temp',
                        'version', 'log_tail', 'hostname', 'ip', 'clips',
-                       'pin'}
+                       'pin', 'rtmp_urls'}
+    # camera-facing ingest URLs ride the beat, raw IP first — the
+    # address that still works when mDNS dies on a field hotspot
+    assert isinstance(hb['rtmp_urls'], list) and hb['rtmp_urls']
+    assert all(u.startswith('rtmp://') for u in hb['rtmp_urls'])
+    assert hb['rtmp_urls'][-1].split('/live/')[0].endswith('.local:1935')
     assert set(hb['ingest']) == {'connected', 'kbps'}
     assert set(hb['push']) == {'connected', 'kbps', 'reconnects_5m'}
     assert hb['push']['reconnects_5m'] == 1          # only the recent one
