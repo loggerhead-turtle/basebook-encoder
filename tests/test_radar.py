@@ -222,8 +222,25 @@ def test_loop_listens_to_every_adapter_at_once(monkeypatch):
     svc.loop()
     assert svc.frames_parsed == 1           # the sleeping gun was HEARD
     assert svc.port == gun_p                # and identified as the gun
+    # the board is DRIVEN in its own display protocol — a bare
+    # right-aligned speed — never the gun's raw multi-tag stream
+    # (verbatim EA frames rendered as garbage fragments, field report)
     disp = _FakePort.OPEN.get(disp_p)
-    assert disp and disp.written            # its frame fed the LED board
+    assert disp and disp.written == [b' 58.6\r']
+
+
+def test_display_line_speaks_the_board_protocol():
+    """Value frames become ' 57.8\\r'; keepalives are not display
+    traffic (the board holds its last number); live outranks peak."""
+    from encoder.radar import RadarService
+    assert RadarService.display_line(
+        {'live': 57.8, 'peak': 58.9}) == b' 57.8\r'
+    assert RadarService.display_line(
+        {'live': None, 'peak': 58.9}) == b' 58.9\r'
+    assert RadarService.display_line(
+        {'live': None, 'peak': None, 'rpm': None, 'alive': True}) is None
+    assert RadarService.display_line(None) is None
+    assert RadarService.display_line({'live': 104.2})[0:6] == b'104.2\r'
 
 
 # ── observability: the journal must be able to answer "why no velo" ──────────

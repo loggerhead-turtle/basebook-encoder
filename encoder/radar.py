@@ -210,6 +210,7 @@ class RadarService:
         self._disp = None
         self._disp_port = None
         self._disp_warned = 0.0
+        self.last_frame = None         # newest parse result, for the board
 
     # ── cloud ────────────────────────────────────────────────────────────────
     def _post(self, payload):
@@ -273,6 +274,23 @@ class RadarService:
     # parser into garbage segments ("8 / JN / H" flicker, field report).
     DISP_MAX_BACKLOG = 256
 
+    @staticmethod
+    def display_line(frame):
+        """What the LED board is SENT for one parsed gun frame, in the
+        board's own language. The gun's streaming output is the
+        multi-tag EA format — feeding that to a Stalker display renders
+        garbage fragments, because the board expects the classic
+        display protocol: a bare right-aligned speed (' 57.8'), exactly
+        the parser's format-A. Value frames only — idle keepalives are
+        not display traffic, the board holds its last number."""
+        if not frame:
+            return None
+        v = frame.get('live') if frame.get('live') is not None \
+            else frame.get('peak')
+        if v is None:
+            return None
+        return ('%5.1f\r' % v).encode('ascii')
+
     def forward_display(self, raw, target):
         """Write one raw gun line to the LED board's adapter. Best
         effort forever: the board vanishing mid-game must never touch
@@ -322,6 +340,7 @@ class RadarService:
             # "is the gun talking, and in which format?"
             log.info(f'radar rx sample: {line[:80]!r}')
         frame = parse_frame(line)
+        self.last_frame = frame          # the loop drives the LED board off this
         if frame is None:
             self.unparsed += 1
             if self.unparsed <= 3:
@@ -380,6 +399,8 @@ class RadarService:
                 continue
             missing_logged = False
             disp_pin = (cfg.get('radar') or {}).get('display_port') or None
+            disp_fmt = ((cfg.get('radar') or {}).get('display_format')
+                        or 'speed')
             handles, bufs = {}, {}
             try:
                 for p in ports:
@@ -442,10 +463,18 @@ class RadarService:
                                     log.info(f'gun identified on {p}')
                             if gun == p:
                                 others = [q for q in handles if q != p]
-                                self.forward_display(
-                                    raw + b'\r',
-                                    disp_pin or (others[0] if others
-                                                 else None))
+                                tgt = disp_pin or (others[0] if others
+                                                   else None)
+                                # 'speed' (default) drives the board in
+                                # the display protocol it understands;
+                                # radar.display_format='raw' restores
+                                # the verbatim passthrough
+                                if disp_fmt == 'raw':
+                                    self.forward_display(raw + b'\r', tgt)
+                                else:
+                                    out = self.display_line(self.last_frame)
+                                    if out:
+                                        self.forward_display(out, tgt)
                     if not got_any:
                         ev = self.engine.flush()
                         self.push(event=ev)
