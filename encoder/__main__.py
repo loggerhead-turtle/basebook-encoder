@@ -79,6 +79,27 @@ def main():
     from . import radar
     radar.RadarService(link, cfg_load=config.load).start_thread()
 
+    # Clip cutter: systemd normally runs it as its own unit, but a box
+    # installed before that unit existed never got it — self-update
+    # cannot write /etc/systemd/system as the service user, so the unit
+    # copy silently fails and every clip job sits "pending" forever
+    # ("12 uploading" all night on the Videos page, field report). When
+    # systemd is not running a clipper, run one in-process; the server
+    # keeps jobs eligible for six hours, so the backlog cuts as soon as
+    # this thread comes up.
+    def _clipper_unit_active():
+        try:
+            r = system.run(['systemctl', 'is-active',
+                            'playcall-encoder-clipper'])
+            return (r.stdout or '').strip() == 'active'
+        except Exception:
+            return False
+    if not fake and not _clipper_unit_active():
+        from . import clipper as _clipper
+        log.info('no clipper unit active — cutting clips in-process')
+        threading.Thread(target=_clipper.Clipper().run_forever,
+                         daemon=True).start()
+
     threading.Thread(target=web.serve,
                      kwargs={'cloud': link, 'sender': sender},
                      daemon=True).start()

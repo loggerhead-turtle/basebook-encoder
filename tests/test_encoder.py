@@ -604,6 +604,23 @@ def test_web_pin_gate_and_bundle(monkeypatch):
     assert '123456' not in bundle
 
 
+def test_main_runs_clipper_in_process_when_unit_is_missing():
+    """A box installed before the clipper unit existed never got it —
+    self-update cannot write /etc/systemd/system as the service user,
+    so the unit copy silently fails and every clip job sat "pending"
+    forever (field report: "12 uploading" all night on the Videos
+    page). The main service now supervises a clipper thread whenever
+    systemd is not running one."""
+    import inspect
+    from encoder import __main__ as entry
+    src = inspect.getsource(entry)
+    assert "'playcall-encoder-clipper'" in src
+    assert '_clipper.Clipper().run_forever' in src
+    assert 'cutting clips in-process' in src
+    # never in laptop/dev fake mode
+    assert 'not fake and not _clipper_unit_active()' in src
+
+
 def test_copy_logs_button_copies_on_plain_http():
     """The settings page is served over LAN http, where
     navigator.clipboard does not exist (secure contexts only) — the old
