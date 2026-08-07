@@ -266,10 +266,18 @@ class RadarService:
             except Exception:
                 pass
 
+    # More than this queued for the board's UART = it is behind; DROP the
+    # frame instead of queueing. The board only ever shows the LATEST
+    # reading — queued history plays back as a strobe of stale numbers,
+    # and blocked writes chop frames mid-byte, which desyncs the board's
+    # parser into garbage segments ("8 / JN / H" flicker, field report).
+    DISP_MAX_BACKLOG = 256
+
     def forward_display(self, raw, target):
         """Write one raw gun line to the LED board's adapter. Best
         effort forever: the board vanishing mid-game must never touch
-        the capture side."""
+        the capture side, and a slow board never queues history — a
+        frame the board has no room for is dropped whole."""
         if not raw or not target or self._serial_cls is None:
             return
         try:
@@ -279,6 +287,12 @@ class RadarService:
                                               write_timeout=0.2)
                 self._disp_port = target
                 log.info(f'forwarding radar to the display board on {target}')
+            try:
+                behind = self._disp.out_waiting
+            except Exception:
+                behind = 0
+            if behind > self.DISP_MAX_BACKLOG:
+                return                      # board is behind — drop, whole
             self._disp.write(raw)
         except Exception as e:
             self._close_display()
@@ -402,6 +416,18 @@ class RadarService:
                         got_any = True
                         bufs[p] += data
                         *lines, bufs[p] = re.split(rb'[\r\n]+', bufs[p])
+                        # A huge single drain is STALE HISTORY — a
+                        # buffer that backed up while the process was
+                        # blocked or restarting (2,000 frames landed in
+                        # 0.2s on the field). Parsing it fabricates
+                        # compressed phantom bursts and replaying it
+                        # strobes the LED board with minutes-old
+                        # numbers; keep the newest few, let history go.
+                        if len(lines) > 25:
+                            log.info(f'{len(lines)} buffered frames on '
+                                     f'{p} — stale backlog, keeping the '
+                                     'newest 5')
+                            lines = lines[-5:]
                         for raw in lines:
                             if not raw.strip():
                                 continue

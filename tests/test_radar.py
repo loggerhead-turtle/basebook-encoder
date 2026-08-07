@@ -312,6 +312,52 @@ def test_gun_lines_forward_verbatim_to_the_display_board():
     assert _FakeSerial.instances[0].writes == [raw, raw]
 
 
+def test_display_board_drops_frames_when_behind_never_queues():
+    """A backlog replayed through the board strobed it with stale
+    numbers, and blocked writes chopped frames mid-byte — the board's
+    parser desynced into garbage segments ("8 / JN / H" flicker, field
+    report). A frame the board's UART has no room for is dropped WHOLE;
+    the board only ever needs the latest reading."""
+    from encoder.radar import RadarService
+    _FakeSerial.instances = []
+    svc = RadarService(_DeadLink())
+    svc._serial_cls = _FakeSerial
+    svc.forward_display(b'a\r', '/dev/display')
+    disp = _FakeSerial.instances[0]
+    disp.out_waiting = 9999                 # the board is far behind
+    svc.forward_display(b'b\r', '/dev/display')
+    assert disp.writes == [b'a\r']          # dropped whole — no queue
+    disp.out_waiting = 0
+    svc.forward_display(b'c\r', '/dev/display')
+    assert disp.writes == [b'a\r', b'c\r']  # caught up — flowing again
+
+
+def test_loop_discards_a_stale_backlog(monkeypatch):
+    """2,000 frames draining in one read is HISTORY from a stall, not a
+    pitch — the field log shows exactly that flood fabricating a
+    compressed phantom burst. Only the newest few frames of a giant
+    drain are parsed."""
+    import sys
+    import types
+    from encoder import radar as radar_mod
+    gun_p = '/dev/serial/by-id/usb-FTDI_GUN'
+    _FakePort.SCRIPT = {gun_p: [(FIELD_LIVE + '\r').encode() * 100]}
+    _FakePort.OPEN = {}
+    monkeypatch.setitem(sys.modules, 'serial',
+                        types.SimpleNamespace(Serial=_FakePort))
+    monkeypatch.setattr(radar_mod, 'find_ports', lambda cfg=None: [gun_p])
+    svc = RadarService(_FakeLink())
+    sleeps = {'n': 0}
+
+    def _sleep(s):
+        sleeps['n'] += 1
+        if sleeps['n'] > 3:
+            svc.running = False
+    monkeypatch.setattr(radar_mod.time, 'sleep', _sleep)
+    svc.loop()
+    assert svc.frames_parsed == 5           # the newest 5, not all 100
+
+
 def test_display_board_vanishing_never_touches_capture():
     from encoder.radar import RadarService
     _FakeSerial.instances = []
