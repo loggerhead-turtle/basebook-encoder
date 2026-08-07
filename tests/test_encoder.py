@@ -617,8 +617,11 @@ def test_main_runs_clipper_in_process_when_unit_is_missing():
     assert "'playcall-encoder-clipper'" in src
     assert '_clipper.Clipper().run_forever' in src
     assert 'cutting clips in-process' in src
-    # never in laptop/dev fake mode
-    assert 'not fake and not _clipper_unit_active()' in src
+    # never in laptop/dev fake mode, and every boot LOGS the decision
+    assert 'if not fake:' in src
+    assert 'systemd runs the cutter' in src
+    # a broken cutter is loud but never fatal to the box's other jobs
+    assert "log.exception('in-process clipper failed to start')" in src
 
 
 def test_copy_logs_button_copies_on_plain_http():

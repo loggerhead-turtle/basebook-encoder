@@ -87,18 +87,29 @@ def main():
     # systemd is not running a clipper, run one in-process; the server
     # keeps jobs eligible for six hours, so the backlog cuts as soon as
     # this thread comes up.
-    def _clipper_unit_active():
+    def _clipper_unit_state():
         try:
             r = system.run(['systemctl', 'is-active',
                             'playcall-encoder-clipper'])
-            return (r.stdout or '').strip() == 'active'
-        except Exception:
-            return False
-    if not fake and not _clipper_unit_active():
-        from . import clipper as _clipper
-        log.info('no clipper unit active — cutting clips in-process')
-        threading.Thread(target=_clipper.Clipper().run_forever,
-                         daemon=True).start()
+            return (r.stdout or '').strip() or 'unknown'
+        except Exception as e:
+            return f'probe failed: {e}'
+    if not fake:
+        state = _clipper_unit_state()
+        if state == 'active':
+            log.info('clipper unit is active — systemd runs the cutter')
+        else:
+            # every boot states which mode cuts clips, so "the clips
+            # never uploaded" is one journal grep, not a guessing game
+            log.info(f'clipper unit: {state} — cutting clips in-process')
+            try:
+                from . import clipper as _clipper
+                threading.Thread(target=_clipper.Clipper().run_forever,
+                                 daemon=True).start()
+            except Exception:
+                # a broken cutter must never take down the scorebug,
+                # the web app, or the stream — but it must be VISIBLE
+                log.exception('in-process clipper failed to start')
 
     threading.Thread(target=web.serve,
                      kwargs={'cloud': link, 'sender': sender},

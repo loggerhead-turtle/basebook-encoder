@@ -15,6 +15,7 @@ import logging
 import os
 import threading
 import time
+from pathlib import Path
 
 from flask import (Flask, redirect, render_template_string, request,
                    session, url_for)
@@ -324,6 +325,36 @@ def log_bundle(cloud=None, lines=200):
                                   'push': cloud.push_status(),
                                   'assignment': cloud.assignment}, indent=2)),
                   '']
+    # Clip-cutter health: which mode runs it, what it thinks it's doing,
+    # and whether there is even a recording to cut from. "The clips
+    # never uploaded" was undiagnosable without these three facts.
+    try:
+        unit = system.run(['systemctl', 'is-active',
+                           'playcall-encoder-clipper'])
+        unit_state = (unit.stdout or '').strip() or 'unknown'
+    except Exception:
+        unit_state = 'unknown'
+    try:
+        clips = (config.state_dir() / 'clips.json').read_text()
+    except OSError:
+        clips = '(no clips.json — no clipper has ever written status)'
+    seg_line = '(no segments dir)'
+    try:
+        segs = sorted(Path('/var/lib/playcall-encoder/segments').rglob('*'),
+                      key=lambda p: p.stat().st_mtime)
+        files = [p for p in segs if p.is_file()]
+        if files:
+            age = int(time.time() - files[-1].stat().st_mtime)
+            seg_line = f'{len(files)} segment file(s), newest {age}s old'
+        else:
+            seg_line = '0 segment files — nothing recorded yet'
+    except OSError:
+        pass
+    parts += ['── clips ──',
+              f'clipper unit: {unit_state}',
+              f'status: {red(clips)}',
+              f'recordings: {seg_line}',
+              '']
     parts += [f'── last {lines} service log lines ──',
               *config.redact_lines(system.journal_tail(lines), cfg), '']
     try:

@@ -199,7 +199,8 @@ def cpu_temp():
 
 def journal_tail(lines=20, units=('playcall-encoder',
                                   'playcall-encoder-youtube',
-                                  'playcall-encoder-mediamtx')):
+                                  'playcall-encoder-mediamtx',
+                                  'playcall-encoder-clipper')):
     if fake_mode() or not have('journalctl'):
         return []
     cmd = ['journalctl', '--no-pager', '-n', str(lines), '-o', 'short-iso']
