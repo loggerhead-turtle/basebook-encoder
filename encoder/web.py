@@ -270,8 +270,27 @@ STATUS_PAGE = """<!doctype html><html><head>
 <script>
 async function copyBundle(){
   const r = await fetch('/logs/bundle'); const t = await r.text();
-  try { await navigator.clipboard.writeText(t); alert('Copied — paste it into your support chat.'); }
-  catch(e){ const w = window.open('/logs/bundle','_blank'); }
+  /* This page is served over plain LAN http, where navigator.clipboard
+     does not exist (secure contexts only) — so the "modern" path always
+     failed and every phone got bounced to a select-all page. The hidden
+     textarea + execCommand path still copies fine on http. */
+  if (navigator.clipboard && window.isSecureContext) {
+    try { await navigator.clipboard.writeText(t);
+          alert('Copied — paste it into your support chat.'); return; }
+    catch(e){}
+  }
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = t;
+    ta.setAttribute('readonly','');
+    ta.style.cssText = 'position:fixed;left:-9999px;top:0';
+    document.body.appendChild(ta);
+    ta.focus(); ta.select(); ta.setSelectionRange(0, t.length);
+    const ok = document.execCommand('copy');
+    document.body.removeChild(ta);
+    if (ok) { alert('Copied — paste it into your support chat.'); return; }
+  } catch(e){}
+  window.open('/logs/bundle','_blank');   /* last resort: the old page */
 }
 </script>
 </body></html>"""

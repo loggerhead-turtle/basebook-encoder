@@ -604,6 +604,22 @@ def test_web_pin_gate_and_bundle(monkeypatch):
     assert '123456' not in bundle
 
 
+def test_copy_logs_button_copies_on_plain_http():
+    """The settings page is served over LAN http, where
+    navigator.clipboard does not exist (secure contexts only) — the old
+    copyBundle always fell into its catch and bounced every phone to a
+    select-all page. The execCommand fallback copies in place; the new
+    tab is the LAST resort, not the first."""
+    import inspect
+    from encoder import web
+    src = inspect.getsource(web)
+    assert 'window.isSecureContext' in src           # gate the modern API
+    assert "document.execCommand('copy')" in src     # the http fallback
+    assert 'ta.setSelectionRange(0, t.length)' in src
+    # the old page stays only as the final fallback
+    assert src.count("window.open('/logs/bundle','_blank')") == 1
+
+
 class _StubCloud:
     """Minimal cloud_link stand-in for web/bundle tests."""
     latest_version = None
