@@ -162,6 +162,70 @@ def test_service_buffers_events_across_cloud_outages():
     assert events and events[0]['events'][0]['peak'] == 58.9
 
 
+class _FakePort:
+    SCRIPT = {}
+    OPEN = {}
+
+    def __init__(self, port, baud, timeout=0, write_timeout=None):
+        self.port = port
+        self.chunks = list(_FakePort.SCRIPT.get(port, []))
+        self.written = []
+        _FakePort.OPEN[port] = self
+
+    @property
+    def in_waiting(self):
+        return len(self.chunks[0]) if self.chunks else 0
+
+    def read(self, n):
+        return self.chunks.pop(0) if self.chunks else b''
+
+    def write(self, b):
+        self.written.append(b)
+
+    def close(self):
+        pass
+
+
+def test_loop_listens_to_every_adapter_at_once(monkeypatch):
+    """The gun SLEEPS between pitches, so the old rotate-after-60s
+    design parked the service on the LED display board half of every
+    game — a pitch landed while we listened to a screen ("a velo popped
+    up, then nothing", field report). Every adapter is read at once
+    now: the port that parses claims the gun, and its raw bytes feed
+    the display board."""
+    import sys
+    import types
+    from encoder import radar as radar_mod
+    gun_p = '/dev/serial/by-id/usb-FTDI_GUN'
+    disp_p = '/dev/serial/by-id/usb-FTDI_DISPLAY'
+    _FakePort.SCRIPT = {gun_p: [FIELD_LIVE.encode() + b'\r'], disp_p: []}
+    _FakePort.OPEN = {}
+    monkeypatch.setitem(sys.modules, 'serial',
+                        types.SimpleNamespace(Serial=_FakePort))
+    monkeypatch.setattr(radar_mod, 'find_ports',
+                        lambda cfg=None: [gun_p, disp_p])
+    svc = RadarService(_FakeLink())
+    orig_handle = svc.handle_line
+
+    def _handle(line, t=None):
+        ev = orig_handle(line, t=t)
+        svc.running = False                 # one frame is the test
+        return ev
+    svc.handle_line = _handle
+    sleeps = {'n': 0}
+
+    def _sleep(s):                          # safety: never hang the suite
+        sleeps['n'] += 1
+        if sleeps['n'] > 100:
+            svc.running = False
+    monkeypatch.setattr(radar_mod.time, 'sleep', _sleep)
+    svc.loop()
+    assert svc.frames_parsed == 1           # the sleeping gun was HEARD
+    assert svc.port == gun_p                # and identified as the gun
+    disp = _FakePort.OPEN.get(disp_p)
+    assert disp and disp.written            # its frame fed the LED board
+
+
 # ── observability: the journal must be able to answer "why no velo" ──────────
 
 class _DeadLink:

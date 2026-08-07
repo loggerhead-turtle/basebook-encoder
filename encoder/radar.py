@@ -161,12 +161,9 @@ class BurstEngine:
                 'frames': len(frames), 'dur': dur}
 
 
-ROTATE_AFTER = 60.0   # silent this long with other adapters present → rotate
-
-
 def find_ports(cfg=None):
     """Candidate USB-RS232 adapters, stable by-id paths preferred. A
-    configured radar.port pins ONE and disables rotation."""
+    configured radar.port pins the GUN to one of them."""
     want = ((cfg or {}).get('radar') or {}).get('port') or ''
     if want:
         return [want]
@@ -343,12 +340,15 @@ class RadarService:
             log.info('pyserial not installed — radar capture disabled')
             return
         self._serial_cls = serial.Serial
-        # A box can carry more than one USB-serial adapter, and a whole
-        # game was lost to picking the wrong one alphabetically and
-        # sitting on its silence. With multiple candidates we now rotate
-        # to the next after ROTATE_AFTER seconds without a byte — the
-        # gun's keepalive frames mean the RIGHT port is never silent.
-        port_idx = 0
+        # A box can carry more than one USB-serial adapter (the gun AND
+        # its LED display board). The old design ROTATED to the next
+        # adapter after 60s of silence — but a Stalker SLEEPS between
+        # pitches, sending nothing while it dozes, so the service spent
+        # half of every game parked on the display board and the pitch
+        # landed while we listened to a screen ("a velo popped up, then
+        # nothing" — field report). Listen to EVERY adapter at once:
+        # whichever port produces gun-shaped frames is the gun (sticky),
+        # and its raw bytes are forwarded to the rest.
         missing_logged = False
         while self.running:
             cfg = self.cfg_load()
@@ -365,45 +365,80 @@ class RadarService:
                 time.sleep(5)
                 continue
             missing_logged = False
-            self.port = ports[port_idx % len(ports)]
-            if len(ports) > 1:
-                log.info(f'{len(ports)} serial adapters present: {ports} — '
-                         f'listening on {self.port}, rotating after '
-                         f'{int(ROTATE_AFTER)}s of silence')
-            # the LED board's adapter: pinned by config, else whichever
-            # candidate we are NOT reading the gun on
             disp_pin = (cfg.get('radar') or {}).get('display_port') or None
+            handles, bufs = {}, {}
             try:
-                with serial.Serial(self.port, BAUD, timeout=1) as ser:
-                    log.info(f'radar listening on {self.port} @ {BAUD}')
-                    self.connected = True
-                    last_rx = time.monotonic()
-                    while self.running:
-                        raw = ser.readline()
-                        line = raw.decode('ascii', 'replace') if raw else ''
-                        if line:
-                            last_rx = time.monotonic()
-                            self.handle_line(line)
-                            others = [p for p in ports if p != self.port]
-                            self.forward_display(
-                                raw, disp_pin or (others[0] if others
-                                                  else None))
-                        else:
-                            ev = self.engine.flush()
-                            self.push(event=ev)
-                            if (len(ports) > 1 and time.monotonic()
-                                    - last_rx > ROTATE_AFTER):
-                                port_idx += 1
-                                log.info(f'no data on {self.port} for '
-                                         f'{int(ROTATE_AFTER)}s — trying '
-                                         'the next adapter')
-                                break
+                for p in ports:
+                    try:
+                        handles[p] = serial.Serial(p, BAUD, timeout=0)
+                        bufs[p] = b''
+                    except Exception as e:
+                        log.warning(f'radar port {p} failed to open ({e})')
+                if not handles:
+                    self.connected = False
+                    time.sleep(5)
+                    continue
+                # one adapter = it IS the gun; a pinned radar.port wins;
+                # otherwise the first port that parses claims the title
+                gun = ((cfg.get('radar') or {}).get('port') or None)
+                if gun not in handles:
+                    gun = list(handles)[0] if len(handles) == 1 else None
+                self.port = gun or sorted(handles)[0]
+                log.info(f'radar listening on {len(handles)} adapter(s) '
+                         f'{sorted(handles)} @ {BAUD}'
+                         + (f' — gun on {gun}' if gun else
+                            ' — waiting for the gun to speak first'))
+                self.connected = True
+                rescan_at = time.monotonic() + 10
+                while self.running:
+                    got_any = False
+                    for p, ser in list(handles.items()):
+                        n = ser.in_waiting
+                        if not n:
+                            continue
+                        data = ser.read(n)
+                        if not data:
+                            continue
+                        got_any = True
+                        bufs[p] += data
+                        *lines, bufs[p] = re.split(rb'[\r\n]+', bufs[p])
+                        for raw in lines:
+                            if not raw.strip():
+                                continue
+                            if gun is None or p == gun:
+                                before = self.frames_parsed
+                                self.handle_line(
+                                    raw.decode('ascii', 'replace'))
+                                if gun is None \
+                                        and self.frames_parsed > before:
+                                    gun = p
+                                    self.port = p
+                                    log.info(f'gun identified on {p}')
+                            if gun == p:
+                                others = [q for q in handles if q != p]
+                                self.forward_display(
+                                    raw + b'\r',
+                                    disp_pin or (others[0] if others
+                                                 else None))
+                    if not got_any:
+                        ev = self.engine.flush()
+                        self.push(event=ev)
+                        time.sleep(0.05)
+                    if time.monotonic() > rescan_at:
+                        if sorted(find_ports(cfg)) != sorted(handles):
+                            log.info('serial adapters changed — reopening')
+                            break
+                        rescan_at = time.monotonic() + 10
             except Exception as e:
                 self.connected = False
-                port_idx += 1          # a dead adapter shouldn't wedge us
                 log.warning(f'radar serial dropped ({e}) — rescanning')
                 time.sleep(3)
             finally:
+                for ser in handles.values():
+                    try:
+                        ser.close()
+                    except Exception:
+                        pass
                 self._close_display()
 
     def start_thread(self):
