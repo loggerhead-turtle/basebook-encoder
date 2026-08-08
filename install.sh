@@ -137,6 +137,14 @@ if [[ "$CURRENT_HOST" == "raspberrypi" || -z "$CURRENT_HOST" ]]; then
 fi
 systemctl enable --now avahi-daemon >/dev/null 2>&1 || true
 
+# ── Radar LAN feed advertisement (_basebook-radar._tcp :8791) ────────────────
+# The encoder's in-process radar capture also serves the LAN feed, so the
+# app can discover a full encoder box exactly like a standalone radar box
+# (scripts/install_radar_box.sh) — velo with zero internet either way.
+mkdir -p /etc/avahi/services
+install -m 644 "$SRC/preconfig/avahi-basebook-radar.service" \
+  /etc/avahi/services/basebook-radar.service 2>/dev/null || true
+
 # ── systemd units ─────────────────────────────────────────────────────────────
 install -m 644 "$SRC/systemd/playcall-encoder.service"          /etc/systemd/system/
 install -m 644 "$SRC/systemd/playcall-encoder-mediamtx.service" /etc/systemd/system/

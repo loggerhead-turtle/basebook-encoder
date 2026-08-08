@@ -1,0 +1,26 @@
+[Unit]
+Description=PlayCall Encoder - standalone radar box (capture + LAN feed + cloud shadow)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 -m encoder.radar_standalone
+WorkingDirectory=/opt/playcall-encoder
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=3
+StartLimitIntervalSec=0
+# Reads the gun's USB-RS232 adapter (dialout) and
+# /etc/playcall-encoder/config.json (root:playcall 640); serves plain
+# TCP on 8791 (RADAR_LAN_PORT) — nothing here needs root. Only the
+# radar-box installer enables this unit: on a full encoder box the main
+# playcall-encoder.service already runs the identical capture + LAN feed
+# in-process, and two listeners would fight over the serial port.
+User=playcall
+Group=playcall
+SupplementaryGroups=dialout
+RuntimeDirectory=playcall-encoder
+RuntimeDirectoryPreserve=yes
+
+[Install]
+WantedBy=multi-user.target

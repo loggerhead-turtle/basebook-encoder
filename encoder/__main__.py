@@ -76,8 +76,19 @@ def main():
     # Stalker radar capture: idles silently until a USB-RS232 adapter (and
     # pyserial) is present, then streams velo/spin to the cloud. See
     # encoder/radar.py — display-only data, never the scorebook.
-    from . import radar
-    radar.RadarService(link, cfg_load=config.load).start_thread()
+    from . import radar, radar_lan
+    radar_svc = radar.RadarService(link, cfg_load=config.load)
+    # The same readings get a LAN mouth (JSON lines on :8791, advertised
+    # as _basebook-radar._tcp) so the app shows velo with zero internet —
+    # a full encoder box and a standalone radar box look identical to the
+    # app. Additive: a taken port costs the LAN feed only, never capture
+    # or the cloud path.
+    try:
+        radar_svc.lan = radar_lan.LanServer(
+            gun_connected=lambda: radar_svc.connected).start()
+    except OSError as e:
+        log.warning(f'radar LAN feed not started: {e}')
+    radar_svc.start_thread()
 
     # Clip cutter: systemd normally runs it as its own unit, but a box
     # installed before that unit existed never got it — self-update

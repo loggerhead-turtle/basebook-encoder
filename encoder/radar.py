@@ -211,6 +211,15 @@ class RadarService:
         self._disp_port = None
         self._disp_warned = 0.0
         self.last_frame = None         # newest parse result, for the board
+        # LAN mouth (radar_lan.LanServer, or anything with the same
+        # send_live/send_burst/send_alive face). Optional and ADDITIVE:
+        # None means cloud-only, exactly as before. The LAN keeps its
+        # own throttle clocks because the cloud's only advance on a
+        # successful POST — a dead uplink must not mute the LAN.
+        self.lan = None
+        self._lan_last_live = 0.0
+        self._lan_last_live_val = (None, None)
+        self._lan_last_alive = 0.0
 
     # ── cloud ────────────────────────────────────────────────────────────────
     def _post(self, payload):
@@ -233,8 +242,37 @@ class RadarService:
                 log.debug(f'radar post failed (retrying): {e}')
             return False
 
+    # ── LAN feed (additive — the cloud payloads below are untouched) ─────────
+    def _lan_feed(self, live, event, now):
+        """Mirror push()'s decisions onto the LAN mouth: bursts always,
+        live readings throttled to the same LIVE_MIN_INTERVAL, an
+        `alive` heartbeat at the same ALIVE_INTERVAL cadence while idle.
+        A reading counts as proof of life, so alive only flows when the
+        gun is quiet — exactly the "gun asleep vs box gone" signal the
+        app needs. LAN failures are contained here: nothing on this
+        path may ever cost the cloud a POST."""
+        lan = self.lan
+        if lan is None:
+            return
+        try:
+            if event:
+                lan.send_burst(event)
+            if (live is not None
+                    and now - self._lan_last_live >= LIVE_MIN_INTERVAL
+                    and live != self._lan_last_live_val):
+                lan.send_live(live[0], live[1])
+                self._lan_last_live = now
+                self._lan_last_live_val = live
+                self._lan_last_alive = now
+            elif now - self._lan_last_alive >= ALIVE_INTERVAL:
+                lan.send_alive(self.connected)
+                self._lan_last_alive = now
+        except Exception as e:
+            log.debug(f'radar LAN feed failed (cloud unaffected): {e}')
+
     def push(self, live=None, event=None, force_alive=False, now=None):
         now = time.monotonic() if now is None else now
+        self._lan_feed(live, event, now)
         if event:
             self.pending.append(event)
         want_live = (live is not None

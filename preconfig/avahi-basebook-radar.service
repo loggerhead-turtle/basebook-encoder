@@ -1,0 +1,22 @@
+<?xml version="1.0" standalone='no'?><!--*-nxml-*-->
+<!DOCTYPE service-group SYSTEM "avahi-service.dtd">
+<!--
+  mDNS advertisement for the radar LAN feed (encoder/radar_lan.py):
+  newline-delimited JSON over plain TCP, schema
+  protocol/radar-lan.schema.json in the basebook-stream repo. The Pi
+  ships Avahi, so advertising costs zero Python dependencies — the app
+  just browses for _basebook-radar._tcp and connects a plain socket.
+
+  Installed to /etc/avahi/services/basebook-radar.service by
+  scripts/install_radar_box.sh (radar box) and install.sh (full encoder
+  box — the same service runs there in-process, and the app treats the
+  two identically). The port below must match radar_lan.DEFAULT_PORT;
+  if you override RADAR_LAN_PORT, edit this file to match.
+-->
+<service-group>
+  <name replace-wildcards="yes">Basebook radar on %h</name>
+  <service>
+    <type>_basebook-radar._tcp</type>
+    <port>8791</port>
+  </service>
+</service-group>
