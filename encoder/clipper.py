@@ -289,13 +289,20 @@ class Clipper:
                     f'recording has holes under this window '
                     f'({media:.1f}s of media across {requested:.1f}s)')
         except Exception as e:
+            # the playback server's 404 means ONE thing: no recording
+            # covers this window — the camera wasn't feeding the box
+            # when the play happened. Say that, not "HTTP Error 404".
+            why = str(e)
+            if isinstance(e, urllib.error.HTTPError) and e.code == 404:
+                why = ('no recording covers this play — the camera was '
+                       'not connected when it happened')
             if now - end > CUT_GIVE_UP_AFTER:
-                log.error('giving up on %s: %s', cid, e)
-                self._mark_failed(base, key, cid, f'cut failed: {e}')
+                log.error('giving up on %s: %s', cid, why)
+                self._mark_failed(base, key, cid, f'cut failed: {why}')
                 self.status.failed += 1
-                self.status.last_error = str(e)
+                self.status.last_error = why
                 return True
-            log.info('clip %s not cuttable yet (%s) — will retry', cid, e)
+            log.info('clip %s not cuttable yet (%s) — will retry', cid, why)
             return False
 
         data = self._fix_audio_for_ios(data)

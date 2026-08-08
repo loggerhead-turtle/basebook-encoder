@@ -604,6 +604,29 @@ def test_web_pin_gate_and_bundle(monkeypatch):
     assert '123456' not in bundle
 
 
+def test_clip_404_reads_as_camera_not_connected(monkeypatch, tmp_path):
+    """The playback server's 404 means exactly one thing — no recording
+    covers the play's window, i.e. the camera was not feeding the box
+    when it happened. The failure reason says that now, instead of the
+    bare "HTTP Error 404: Not Found" a coach cannot act on."""
+    import urllib.error
+    from encoder import clipper as cl
+    c = cl.Clipper(cfg_load=lambda: {},
+                   status=cl.StatusWriter(tmp_path / 's.json'))
+    monkeypatch.setattr(c, '_fetch_clip', lambda *a, **k: (_ for _ in ())
+                        .throw(urllib.error.HTTPError(
+                            'u', 404, 'Not Found', None, None)))
+    seen = {}
+    monkeypatch.setattr(c, '_mark_failed',
+                        lambda b, k, cid, why: seen.setdefault('why', why))
+    job = {'id': 'c1', 'start': 0.0, 'end': 10.0, 'not_before': 0.0,
+           'label': '1B'}                    # end long past the give-up
+    assert c.process_job({}, 'https://x', 'k', job, skew=0) is True
+    assert 'no recording covers this play' in seen['why']
+    assert 'camera' in seen['why'] and '404' not in seen['why']
+    assert 'no recording covers this play' in c.status.last_error
+
+
 def test_main_runs_clipper_in_process_when_unit_is_missing():
     """A box installed before the clipper unit existed never got it —
     self-update cannot write /etc/systemd/system as the service user,
