@@ -581,11 +581,15 @@ BT_LOCK = threading.Lock()      # one bluetoothctl operation at a time —
 #                                 colliding is org.bluez.Error.InProgress
 
 
-def _paired_macs():
+def _paired_pairs():
     out = _bt('devices', 'Paired')
     if 'Invalid command' in out or not out.strip():
         out = _bt('paired-devices')          # older bluez spelling
-    return [m for m, _n in _dev_lines(out)]
+    return list(_dev_lines(out))
+
+
+def _paired_macs():
+    return [m for m, _n in _paired_pairs()]
 
 
 def reconnect_loop():
@@ -669,7 +673,18 @@ def _bt_pair_inner(mac):
         except Exception:
             pass
     if ok_conn:
-        _route_to_bud()                     # speech goes to the bud now
+        # "connected" is not enough — the bud's "-BLE" twin connects too
+        # and brings NO audio. Proof of life is an audio sink appearing.
+        time.sleep(2)
+        routed = _route_to_bud()
+        if not routed:
+            time.sleep(3)
+            routed = _route_to_bud()
+        if not routed:
+            return ('⚠ connected, but the device brought no AUDIO — '
+                    'that is the bud\'s "-BLE" twin. Scan again and '
+                    'pair the entry WITHOUT -BLE, and 🗑 forget this '
+                    'one below.')
         return '✓ paired and connected'
     if ok_pair:
         return 'paired, but connect failed: ' + _bt_tail(out_c)
@@ -700,6 +715,28 @@ input{background:#0d1117;color:#e6edf3;border:1px solid #2a313c;
 border-radius:8px;padding:.55rem;font-size:1.1rem;width:8rem}
 .dim{color:#8b949e;font-size:.82rem}
 </style></head><body>__BODY__</body></html>"""
+
+
+def _ghost_rows(st):
+    """Paired-but-absent devices, each with a 🗑 forget — the parking lot
+    for dead -BLE twins and last season's buds (the reconnect chaser
+    stops hunting whatever gets forgotten here)."""
+    conn_macs = {d['mac'].upper() for d in st.get('connected', [])}
+    ghosts = [(m, n) for m, n in _paired_pairs() if m not in conn_macs]
+    if not ghosts:
+        return ''
+    return ('<div style="margin-top:.5rem"><span class="dim">paired, '
+            'not here:</span>'
+            + ''.join(
+                f'<div style="margin:.15rem 0" class="dim">💤 '
+                f'{html.escape(n or m)} '
+                f'<form method="post" action="/btforget" '
+                f'style="display:inline">'
+                f'<input type="hidden" name="mac" value="{m}">'
+                f'<button style="padding:.15rem .5rem;font-size:.7rem">'
+                f'🗑 forget</button></form></div>'
+                for m, n in ghosts)
+            + '</div>')
 
 
 def _page_body(q):
@@ -788,6 +825,7 @@ def _page_body(q):
            f'<button class="lock" name="v" value="1">🔒 LOCK Bluetooth '
            f'now</button>')
         + '</form>'
+        + _ghost_rows(st)
         + f'<form method="post" action="/boxname" style="margin-top:.5rem">'
         f'box name: <input name="v" value="{html.escape(box_name())}" '
         f'style="width:9rem;font-size:.9rem;padding:.3rem"> '
@@ -798,11 +836,22 @@ def _page_body(q):
         devs = bt_scan()
         named = [d for d in devs if d['name']]
         anon = [d for d in devs if not d['name']]
+        # the -BLE twin pairs fine and carries NO audio — steer around it
+        ble = [d for d in named if d['name'].upper().endswith('-BLE')
+               or d['name'].upper().endswith(' LE')]
+        good = [d for d in named if d not in ble]
         rows = ''.join(
             f'<form method="post" action="/pair" style="margin:.2rem 0">'
             f'<button class="go" name="mac" value="{d["mac"]}">🎧 Pair '
             f'{html.escape(d["name"])}</button></form>'
-            for d in named)
+            for d in good)
+        rows += ''.join(
+            f'<form method="post" action="/pair" style="margin:.2rem 0">'
+            f'<button name="mac" value="{d["mac"]}">'
+            f'{html.escape(d["name"])}</button> '
+            f'<span class="dim">← BLE twin, no audio — pair the one '
+            f'without -BLE</span></form>'
+            for d in ble)
         rows += ''.join(
             f'<form method="post" action="/pair" style="margin:.2rem 0">'
             f'<button name="mac" value="{d["mac"]}">🎧 Pair unnamed '
@@ -922,6 +971,11 @@ class Admin(http.server.BaseHTTPRequestHandler):
         elif self.path == '/pair':
             msg = bt_pair(form.get('mac', ''))
             loc = '/?paired=' + urllib.parse.quote(msg)
+        elif self.path == '/btforget':
+            mac = form.get('mac', '')
+            _bt('remove', mac)
+            set_ear_label(mac.upper(), '')   # no chasing a forgotten bud
+            loc = '/'
         elif self.path == '/earlabel':
             set_ear_label(form.get('mac', '').upper(), form.get('v', ''))
             loc = '/'
