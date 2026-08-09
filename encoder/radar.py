@@ -303,20 +303,26 @@ class RadarService:
             return None
         return ('%5.1f\r' % v).encode('ascii')
 
-    def forward_display(self, raw, target):
+    def forward_display(self, raw, target, baud=BAUD):
         """Write one raw gun line to the LED board's adapter. Best
         effort forever: the board vanishing mid-game must never touch
         the capture side, and a slow board never queues history — a
-        frame the board has no room for is dropped whole."""
+        frame the board has no room for is dropped whole.
+
+        BAUD IS SEPARATE from the gun's: display boards commonly run
+        slower than the gun (2400/9600 are both in the wild), and a
+        mismatched board shows NOTHING rather than garbage — set
+        radar.display_baud when a board stays dark."""
         if not raw or not target or self._serial_cls is None:
             return
         try:
-            if self._disp is None or self._disp_port != target:
+            if self._disp is None or self._disp_port != (target, baud):
                 self._close_display()
-                self._disp = self._serial_cls(target, BAUD, timeout=0,
+                self._disp = self._serial_cls(target, baud, timeout=0,
                                               write_timeout=0.2)
-                self._disp_port = target
-                log.info(f'forwarding radar to the display board on {target}')
+                self._disp_port = (target, baud)
+                log.info(f'forwarding radar to the display board on '
+                         f'{target} @ {baud}')
             try:
                 behind = self._disp.out_waiting
             except Exception:
@@ -411,6 +417,8 @@ class RadarService:
                 continue
             missing_logged = False
             disp_pin = (cfg.get('radar') or {}).get('display_port') or None
+            disp_baud = int((cfg.get('radar') or {}).get('display_baud')
+                            or BAUD)
             disp_fmt = ((cfg.get('radar') or {}).get('display_format')
                         or 'speed')
             handles, bufs = {}, {}
@@ -512,11 +520,11 @@ class RadarService:
                                 # radar.display_format='raw' restores
                                 # the verbatim passthrough
                                 if disp_fmt == 'raw':
-                                    self.forward_display(raw + b'\r', tgt)
+                                    self.forward_display(raw + b'\r', tgt, disp_baud)
                                 else:
                                     out = self.display_line(self.last_frame)
                                     if out:
-                                        self.forward_display(out, tgt)
+                                        self.forward_display(out, tgt, disp_baud)
                     if not got_any:
                         ev = self.engine.flush()
                         self.push(event=ev)
