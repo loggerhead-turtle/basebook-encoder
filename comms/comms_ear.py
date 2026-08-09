@@ -564,6 +564,36 @@ def audio_ok():
         return False
 
 
+def audio_devices_missing():
+    """'auto_null' is PipeWire's dummy sink: the engine answers, but it
+    owns NO audio devices. That state also starves BlueZ of an A2DP
+    endpoint, so buds fail to connect with profile-unavailable — the
+    classic cause is a user session that started BEFORE the bluetooth
+    group / SPA plugin were installed, which only a reboot re-reads."""
+    try:
+        r = subprocess.run(['pactl', 'list', 'short', 'sinks'],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode != 0:
+            return False
+        real = [ln for ln in r.stdout.splitlines()
+                if ln.strip() and 'auto_null' not in ln]
+        return not real
+    except Exception:
+        return False
+
+
+def reboot_box():
+    for cmd in (['sudo', '-n', 'systemctl', 'reboot'],
+                ['systemctl', 'reboot']):
+        try:
+            if subprocess.run(cmd, capture_output=True,
+                              timeout=10).returncode == 0:
+                return True
+        except Exception:
+            pass
+    return False
+
+
 def bt_status():
     show = _bt('show')
     if '__NO_BT__' in show:
@@ -873,9 +903,11 @@ def _page_body(q):
         up_msg = (f'<div class="card"><b class="'
                   f'{"ok" if m.startswith("✓") else "bad"}">'
                   f'{html.escape(m)}</b>'
-                  + ('<br><span class="dim">restarting on the new code — '
-                     'this page reloads itself in ~12 s</span>'
-                     '<script>setTimeout(()=>location="/",12000)</script>'
+                  + ('<br><span class="dim">coming back — this page '
+                     'reloads itself shortly</span>'
+                     '<script>setTimeout(()=>location="/",'
+                     + ('75000' if 'boot' in m else '12000')
+                     + ')</script>'
                      if q.get('restarting') else '')
                   + '</div>')
     paired_msg = ''
@@ -905,6 +937,13 @@ def _page_body(q):
             'drop and nothing plays. On the box, as your user, run: '
             '<code>systemctl --user enable --now pipewire '
             'pipewire-pulse wireplumber</code>')
+         + ('<br><b class="bad">⚠ NO AUDIO DEVICES</b> — the engine runs '
+            'but owns nothing (sink "auto_null"), so buds cannot connect '
+            'and nothing can play. This is a stale session: the '
+            'Bluetooth audio plugin and group landed after it started. '
+            '<form method="post" action="/reboot" style="margin:.3rem 0">'
+            '<button class="lock">🔄 Reboot the box (fixes it)</button>'
+            '</form>' if audio_devices_missing() else '')
          + f'<br>voice link: {html.escape(str(RTC_STATE.get("s", "—")))}'
          f'<br><span class="dim">voice out: '
          f'{html.escape(str(STATE.get("voice", "— (tap Test)")))} · '
@@ -1111,6 +1150,11 @@ class Admin(http.server.BaseHTTPRequestHandler):
         elif self.path == '/autopair':
             msg = bt_autopair()
             loc = '/?paired=' + urllib.parse.quote(msg)
+        elif self.path == '/reboot':
+            threading.Timer(1.5, reboot_box).start()
+            loc = ('/?updated=' + urllib.parse.quote('🔄 rebooting — '
+                   'this page comes back in about a minute')
+                   + '&restarting=1')
         elif self.path == '/btforget':
             mac = form.get('mac', '')
             _bt('remove', mac)

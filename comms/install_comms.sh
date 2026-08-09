@@ -116,7 +116,21 @@ fi
 RUNUSER="${SUDO_USER:-pi}"
 RUNUID=$(id -u "$RUNUSER")
 echo "── audio engine (PipeWire, headless session for $RUNUSER) ──"
+# A running session never re-reads its group list, and wireplumber only
+# offers BlueZ an A2DP endpoint when the bluetooth SPA plugin is loaded
+# — so a box that gains either AFTER its session started ends up with
+# PipeWire owning nothing ('auto_null'), buds failing to connect with
+# profile-unavailable, and total silence. Note it and demand a reboot.
+NEEDS_REBOOT=""
+id -nG "$RUNUSER" | tr ' ' '\n' | grep -qx bluetooth || NEEDS_REBOOT="1"
 usermod -aG bluetooth "$RUNUSER" 2>/dev/null || true
+dpkg -s libspa-0.2-bluetooth >/dev/null 2>&1 || NEEDS_REBOOT="1"
+# let the box reboot itself from its own admin page — no SSH at a field
+printf '%s ALL=(root) NOPASSWD: /usr/bin/systemctl reboot\n' "$RUNUSER" \
+  > /etc/sudoers.d/playcall-comms
+chmod 440 /etc/sudoers.d/playcall-comms
+visudo -c -f /etc/sudoers.d/playcall-comms >/dev/null 2>&1 \
+  || rm -f /etc/sudoers.d/playcall-comms
 loginctl enable-linger "$RUNUSER"
 # a fresh linger takes a moment to bring the user manager (and its bus)
 # up — starting pipewire before the bus exists fails SILENTLY, and the
@@ -184,4 +198,13 @@ echo
 echo "  Even easier: team staff get a '⚙ Open settings — no PIN'"
 echo "  button on the team comms page on the site — it signs into"
 echo "  this page in one tap."
+if [ -n "$NEEDS_REBOOT" ]; then
+  echo
+  echo "  ⚠ REBOOT THIS BOX NOW:  sudo reboot"
+  echo "    This install added the bluetooth group and/or the Bluetooth"
+  echo "    audio plugin. A session already running never re-reads"
+  echo "    those, and the symptom is brutal — buds refuse to connect"
+  echo "    (profile-unavailable) and nothing plays. One reboot and it"
+  echo "    all works."
+fi
 echo "══════════════════════════════════════════════════════════"
