@@ -183,6 +183,7 @@ def _route_to_bud():
         if len(sinks) == 1:
             subprocess.run(['pactl', 'set-default-sink', sinks[0]],
                            check=False, timeout=5)
+            _sink_audible(sinks[0])
             return True
         key = ','.join(sorted(sinks))
         if _COMBINE['slaves'] != key:
@@ -199,10 +200,31 @@ def _route_to_bud():
                 _COMBINE['slaves'] = key
         subprocess.run(['pactl', 'set-default-sink', 'playcall_both'],
                        check=False, timeout=5)
+        for s in sinks:
+            _sink_audible(s)
+        _sink_audible('playcall_both')
         return True
     except Exception:
         pass
     return False
+
+
+def _sink_audible(sink):
+    """A sink that exists but is muted or at 4% volume is silence with
+    extra steps — every route unmutes and sets a solid level."""
+    subprocess.run(['pactl', 'set-sink-mute', sink, '0'],
+                   check=False, timeout=5)
+    subprocess.run(['pactl', 'set-sink-volume', sink, '85%'],
+                   check=False, timeout=5)
+
+
+def _default_sink():
+    try:
+        r = subprocess.run(['pactl', 'get-default-sink'],
+                           capture_output=True, text=True, timeout=5)
+        return r.stdout.strip()
+    except Exception:
+        return ''
 
 
 # Piper (neural TTS, installed by install_comms.sh) sounds like a
@@ -212,7 +234,10 @@ PIPER_VOICE = '/opt/piper/voice.onnx'
 
 
 def say(text):
+    """Speak, and RECORD which path actually produced sound — the admin
+    page's 'voice out' line is how a silent Test explains itself."""
     _route_to_bud()
+    err = ''
     if os.path.exists(PIPER) and os.path.exists(PIPER_VOICE):
         try:
             wav = tempfile.NamedTemporaryFile(suffix='.wav',
@@ -222,13 +247,27 @@ def say(text):
                                input=text.encode(), capture_output=True,
                                timeout=20)
             if r.returncode == 0:
-                subprocess.run(['paplay', wav], check=False, timeout=30)
+                p = subprocess.run(['paplay', wav], capture_output=True,
+                                   timeout=30)
                 os.unlink(wav)
-                return
-            os.unlink(wav)
-        except Exception:
-            pass
-    subprocess.run(['espeak-ng', '-s', '150', text], check=False)
+                if p.returncode == 0:
+                    STATE['voice'] = ('piper → '
+                                      + (_default_sink() or 'default'))
+                    return
+                err = ('paplay failed: '
+                       + (p.stderr.decode(errors="replace").strip()[-120:]
+                          or f'exit {p.returncode}'))
+            else:
+                os.unlink(wav)
+                err = ('piper failed: '
+                       + (r.stderr.decode(errors="replace").strip()[-120:]
+                          or f'exit {r.returncode}'))
+        except Exception as exc:
+            err = f'piper error: {exc}'
+    e = subprocess.run(['espeak-ng', '-s', '150', text],
+                       capture_output=True)
+    STATE['voice'] = ((err + ' → ') if err else '') + 'espeak' \
+        + ('' if e.returncode == 0 else f' (exit {e.returncode})')
 
 
 def play_clip(data_uri):
@@ -867,6 +906,9 @@ def _page_body(q):
             '<code>systemctl --user enable --now pipewire '
             'pipewire-pulse wireplumber</code>')
          + f'<br>voice link: {html.escape(str(RTC_STATE.get("s", "—")))}'
+         f'<br><span class="dim">voice out: '
+         f'{html.escape(str(STATE.get("voice", "— (tap Test)")))} · '
+         f'sink: {html.escape(_default_sink() or "?")}</span>'
          f'<br><span class="dim">box code: {html.escape(code_version())}'
          f'</span> <form method="post" action="/update" '
          f'style="display:inline">'
