@@ -391,3 +391,17 @@ def test_display_board_vanishing_never_touches_capture():
     svc.forward_display(b'q', None)
     svc._serial_cls = None
     svc.forward_display(b'q', '/dev/display')
+
+
+def test_peak_and_constant_glued_together_still_parse():
+    """FIELD REPORT: the gun's constant field reached four digits and
+    ran into the peak with no separator — 'RD 34C 824  5G 8571024  6A'
+    is live 82.4 + peak 85.7 + const 1024. The whole line used to fail,
+    so a live gun logged 2000 unparsed lines of 2485, the pad saw only
+    the rare narrow frame, and the LED board — which is fed only from
+    PARSED frames — stayed dark all game."""
+    f = parse_frame('RD   34C 824         5G 8571024     6A             ')
+    assert f == {'live': 82.4, 'peak': 85.7, 'rpm': None, 'alive': True}
+    # the well-spaced bench format is untouched
+    assert parse_frame('RD   34C 537         5C 589 869     9A15650') == {
+        'live': 53.7, 'peak': 58.9, 'rpm': 1565.0, 'alive': True}

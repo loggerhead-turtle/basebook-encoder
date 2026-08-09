@@ -67,7 +67,7 @@ BAND = (30.0, 110.0)          # plausible pitch band (pref: set the GUN's
 # by the 34 field: a frame with a live speed is a reading (lone number =
 # peak); a frame with an empty 34 field is idle (lone number = const).
 _FRAME = re.compile(
-    r'RD\s+34[A-Z]\s+(?:(\d{2,5})\s+)?5[A-Z]\s+(?:(\d{2,5})\s+)?'
+    r'RD\s+34[A-Z]\s+(?:(\d{2,5})\s+)?5[A-Z]\s+(?:(\d{2,9})\s+)?'
     r'(?:(\d{2,5})\s+)?(?:6A|9A(\d{3,7}))')
 # Format A: one space-padded speed per line; idle = spaces + '.'
 _FMT_A = re.compile(r'^\s*(\d{1,3}(?:\.\d)?)\s*$')
@@ -82,6 +82,18 @@ def parse_frame(line):
     if m:
         live, n1, n2, spin = (m.group(1), m.group(2), m.group(3),
                               m.group(4))
+        # GLUED FIELDS: the gun writes peak and the constant field at
+        # fixed width, and once the constant reached four digits they
+        # ran together — '5G 8571024' is peak 857 + const 1024, with no
+        # separator. That failed the whole line, so a streaming gun read
+        # as mostly-garbage and the LED board (fed only from parsed
+        # frames) went dark. Split on the first plausible speed.
+        if n1 and len(n1) > 5 and not n2:
+            for cut in (3, 4):
+                head = n1[:cut]
+                if 200 <= int(head) <= 1200:      # 20.0–120.0 mph ×10
+                    n1, n2 = head, n1[cut:]
+                    break
         # two numbers after the 5-tag → peak + const; a lone number is
         # the peak only when the frame carries a live speed (see _FRAME)
         peak = n1 if (n2 or live) else None
