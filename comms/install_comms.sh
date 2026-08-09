@@ -1,0 +1,174 @@
+#!/usr/bin/env bash
+# Turn the (already-activated) display Pi into the comms ear.
+#
+#   sudo bash pi/install_comms.sh
+#
+# Installs speech + Bluetooth-audio packages, generates the 4-digit PIN
+# for the local admin page, installs playcall-comms.service, and starts
+# it. Afterwards, from any phone on the same WiFi:
+#
+#   http://<this-pi's-hostname>.local:8790   ← pair the bud, then 🔒 LOCK
+#
+# The service reuses the Pi's existing activation key
+# (/etc/playcall.env) — nothing new to pair with the cloud.
+set -euo pipefail
+[ "$(id -u)" = 0 ] || { echo "run with sudo"; exit 1; }
+ENV=/etc/playcall.env
+# The display app (main.py) keeps its activation in /var/lib/playcall/
+# — same variable names, different home. Import it rather than making a
+# working display box re-activate.
+DISPLAY_ENV=/var/lib/playcall/.playcall.env
+ENC_CFG=/etc/playcall-encoder/config.json
+if ! grep -q PLAYCALL_API_KEY "$ENV" 2>/dev/null; then
+  ENC_KEY=""
+  if [ -f "$ENC_CFG" ]; then
+    ENC_KEY=$(python3 -c "import json;print((json.load(open('$ENC_CFG'))
+.get('cloud') or {}).get('api_key') or '')" 2>/dev/null || true)
+    ENC_URL=$(python3 -c "import json;print((json.load(open('$ENC_CFG'))
+.get('cloud') or {}).get('base_url') or '')" 2>/dev/null || true)
+  fi
+  if grep -q PLAYCALL_API_KEY "$DISPLAY_ENV" 2>/dev/null; then
+    echo "── importing the display app's activation key ──"
+    grep -E '^PLAYCALL_(CLOUD_URL|API_KEY)=' "$DISPLAY_ENV" >> "$ENV"
+  elif [ -n "$ENC_KEY" ]; then
+    # ONE-PI STORY: this box is an encoder — comms rides its identity.
+    echo "── importing the encoder's activation key ──"
+    {
+      echo "PLAYCALL_CLOUD_URL=${ENC_URL:-https://basebook.org}"
+      echo "PLAYCALL_API_KEY=$ENC_KEY"
+    } >> "$ENV"
+    chmod 600 "$ENV"
+  else
+    # A display box that has only ever worked locally has no cloud key
+    # anywhere — pair it right here with a one-time code.
+    echo "── this Pi isn't paired with the cloud yet ──"
+    echo "On the site: sign in as a coach → your team page (/auth/team)"
+    echo "→ Raspberry Pi devices → generate a code for a DISPLAY Pi."
+    read -rp "Activation code (e.g. HAWK-4823): " CODE
+    [ -n "$CODE" ] || { echo "no code — aborting"; exit 1; }
+    CLOUD="${PLAYCALL_CLOUD_URL:-https://basebook.org}"
+    RESP=$(curl -sS -X POST "$CLOUD/api/pi/activate" \
+      -H 'Content-Type: application/json' \
+      -d "{\"code\":\"$CODE\",\"device_name\":\"$(hostname) (comms)\"}")
+    KEY=$(printf '%s' "$RESP" | python3 -c \
+      "import sys,json;print(json.load(sys.stdin).get('api_key',''))" \
+      2>/dev/null || true)
+    CURL2=$(printf '%s' "$RESP" | python3 -c \
+      "import sys,json;print(json.load(sys.stdin).get('cloud_url',''))" \
+      2>/dev/null || true)
+    if [ -z "$KEY" ]; then
+      echo "Activation failed — the cloud said:"
+      echo "  $RESP"
+      exit 1
+    fi
+    {
+      echo "PLAYCALL_CLOUD_URL=${CURL2:-$CLOUD}"
+      echo "PLAYCALL_API_KEY=$KEY"
+    } >> "$ENV"
+    chmod 600 "$ENV"
+    echo "✓ Paired with the cloud."
+  fi
+fi
+
+echo "── packages (speech + Bluetooth audio + live voice) ──"
+apt-get update -qq
+apt-get install -y -qq espeak-ng mpg123 ffmpeg \
+  pipewire pipewire-audio pipewire-pulse wireplumber \
+  pulseaudio-utils libspa-0.2-bluetooth >/dev/null
+# aiortc = the box answers the coach's LIVE WebRTC voice link (clips
+# stay as the fallback if it can't install on this OS release)
+apt-get install -y -qq python3-aiortc python3-av >/dev/null 2>&1 \
+  || pip3 install --break-system-packages -q aiortc 2>/dev/null \
+  || echo "   (aiortc unavailable — live voice falls back to clips)"
+
+# ── a HUMAN voice (Piper neural TTS; espeak-ng stays as fallback) ───────
+PIPER_DIR=/opt/piper
+if [ ! -x "$PIPER_DIR/piper" ]; then
+  echo "── natural voice (Piper) ──"
+  case "$(uname -m)" in
+    aarch64) PT=piper_linux_aarch64.tar.gz ;;
+    armv7l)  PT=piper_linux_armv7l.tar.gz ;;
+    x86_64)  PT=piper_linux_x86_64.tar.gz ;;
+    *)       PT= ;;
+  esac
+  if [ -n "$PT" ]; then
+    mkdir -p "$PIPER_DIR"
+    curl -sSL "https://github.com/rhasspy/piper/releases/download/2023.11.14-2/$PT" \
+      | tar xz -C "$PIPER_DIR" --strip-components=1 \
+      || echo "   (piper download failed — keeping espeak voice)"
+  fi
+fi
+if [ -x "$PIPER_DIR/piper" ] && [ ! -f "$PIPER_DIR/voice.onnx" ]; then
+  VBASE="https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/lessac/medium"
+  curl -sSL -o "$PIPER_DIR/voice.onnx" "$VBASE/en_US-lessac-medium.onnx" \
+    && curl -sSL -o "$PIPER_DIR/voice.onnx.json" \
+         "$VBASE/en_US-lessac-medium.onnx.json" \
+    || { rm -f "$PIPER_DIR/voice.onnx"; \
+         echo "   (voice download failed — keeping espeak voice)"; }
+fi
+
+# ── the audio engine, headless ──────────────────────────────────────────
+# Bluetooth AUDIO needs PipeWire running, and PipeWire runs per-user —
+# on a headless box nobody ever logs in, so the bud pairs but connect
+# fails with br-connection-profile-unavailable. Lingering gives the
+# user a session at boot with no login; the comms service then runs AS
+# that user so speech routes into the same engine.
+RUNUSER="${SUDO_USER:-pi}"
+RUNUID=$(id -u "$RUNUSER")
+echo "── audio engine (PipeWire, headless session for $RUNUSER) ──"
+usermod -aG bluetooth "$RUNUSER" 2>/dev/null || true
+loginctl enable-linger "$RUNUSER"
+sleep 2
+sudo -u "$RUNUSER" XDG_RUNTIME_DIR="/run/user/$RUNUID" \
+  systemctl --user enable --now pipewire pipewire-pulse wireplumber \
+  2>/dev/null || true
+
+if ! grep -q PLAYCALL_COMMS_PIN "$ENV"; then
+  PIN=$(( RANDOM % 9000 + 1000 ))
+  echo "PLAYCALL_COMMS_PIN=$PIN" >> "$ENV"
+else
+  PIN=$(grep PLAYCALL_COMMS_PIN "$ENV" | cut -d= -f2)
+fi
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+# Runs AS the audio user (not root): that puts espeak/ffplay inside the
+# same PipeWire session the earbud connects to. systemd reads the env
+# file as root before dropping privileges, so its 600 perms are fine.
+cat > /etc/systemd/system/playcall-comms.service <<UNIT
+[Unit]
+Description=PlayCall comms ear (spoken pitch calls to the earpiece)
+After=network-online.target bluetooth.target user@$RUNUID.service
+Wants=network-online.target user@$RUNUID.service
+
+[Service]
+User=$RUNUSER
+EnvironmentFile=$ENV
+Environment=XDG_RUNTIME_DIR=/run/user/$RUNUID
+ExecStart=/usr/bin/python3 $HERE/comms_ear.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+systemctl daemon-reload
+systemctl enable --now playcall-comms.service
+systemctl restart playcall-comms.service
+
+HOST=$(hostname)
+echo
+echo "══════════════════════════════════════════════════════════"
+echo "  🎧 Comms ear is running."
+echo
+echo "  Admin page:  http://$HOST.local:8790"
+echo "  PIN:         $PIN        (also in $ENV)"
+echo
+echo "  From a phone on the same WiFi: open the page, enter the"
+echo "  PIN, put the earbud in pairing mode, tap Scan → Pair,"
+echo "  then tap 🔒 LOCK Bluetooth. Locking is what stops anyone"
+echo "  else at the field from pairing their own headset."
+echo
+echo "  Even easier: team staff get a '⚙ Open settings — no PIN'"
+echo "  button on the team comms page on the site — it signs into"
+echo "  this page in one tap."
+echo "══════════════════════════════════════════════════════════"
