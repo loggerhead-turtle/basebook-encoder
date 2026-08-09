@@ -125,6 +125,25 @@ NEEDS_REBOOT=""
 id -nG "$RUNUSER" | tr ' ' '\n' | grep -qx bluetooth || NEEDS_REBOOT="1"
 usermod -aG bluetooth "$RUNUSER" 2>/dev/null || true
 dpkg -s libspa-0.2-bluetooth >/dev/null 2>&1 || NEEDS_REBOOT="1"
+# HEADLESS SEAT FIX — the one that costs an afternoon if missed.
+# WirePlumber's bluez monitor 'wants' logind seat-monitoring, and a
+# LINGERING session (which is what a headless box has) owns no seat. It
+# then loads the monitor but parks it: no A2DP endpoint is registered
+# with BlueZ, so `bluetoothctl show` lists only AVRCP UUIDs, every bud
+# connect dies with profile-unavailable — and NOTHING is logged. Turn
+# seat-monitoring off so the monitor runs unconditionally.
+WPDIR="$(getent passwd "$RUNUSER" | cut -d: -f6)/.config/wireplumber/wireplumber.conf.d"
+mkdir -p "$WPDIR"
+cat > "$WPDIR/50-bluez-headless.conf" <<'WPCONF'
+# Headless box: no logind seat, so never gate Bluetooth audio on one.
+wireplumber.profiles = {
+  main = {
+    monitor.bluez.seat-monitoring = disabled
+  }
+}
+WPCONF
+chown -R "$RUNUSER" "$(getent passwd "$RUNUSER" | cut -d: -f6)/.config/wireplumber"
+
 # let the box reboot itself from its own admin page — no SSH at a field
 printf '%s ALL=(root) NOPASSWD: /usr/bin/systemctl reboot\n' "$RUNUSER" \
   > /etc/sudoers.d/playcall-comms
