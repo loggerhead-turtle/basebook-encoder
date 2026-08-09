@@ -564,22 +564,37 @@ def audio_ok():
         return False
 
 
-def audio_devices_missing():
-    """'auto_null' is PipeWire's dummy sink: the engine answers, but it
-    owns NO audio devices. That state also starves BlueZ of an A2DP
-    endpoint, so buds fail to connect with profile-unavailable — the
-    classic cause is a user session that started BEFORE the bluetooth
-    group / SPA plugin were installed, which only a reboot re-reads."""
-    try:
-        r = subprocess.run(['pactl', 'list', 'short', 'sinks'],
-                           capture_output=True, text=True, timeout=5)
-        if r.returncode != 0:
-            return False
-        real = [ln for ln in r.stdout.splitlines()
-                if ln.strip() and 'auto_null' not in ln]
-        return not real
-    except Exception:
-        return False
+def bt_audio_problem():
+    """The PRECISE check, not the lazy one.
+
+    'auto_null' alone means nothing on a box with no speakers or HDMI
+    audio — an encoder Pi legitimately owns no sinks until a bud
+    connects (an earlier build cried wolf about exactly that). What
+    actually makes a bud fail with profile-unavailable is BlueZ having
+    no A2DP endpoint, and that endpoint comes from ONE thing: the
+    PipeWire bluez5 SPA plugin. Test for it directly, then for the
+    connected-but-silent case. Returns (headline, fix) or None."""
+    import glob
+    if not glob.glob('/usr/lib/*/spa-0.2/bluez5/libspa-bluez5.so') \
+            and not glob.glob('/usr/lib/spa-0.2/bluez5/libspa-bluez5.so'):
+        return ('⚠ BLUETOOTH AUDIO PLUGIN MISSING',
+                'BlueZ has no audio profile to give a bud, so every '
+                'connect fails with profile-unavailable. On the box: '
+                '<code>sudo apt install -y libspa-0.2-bluetooth</code> '
+                'then reboot.')
+    st = bt_status()
+    if st.get('ok') and st.get('connected'):
+        try:
+            r = subprocess.run(['pactl', 'list', 'short', 'sinks'],
+                               capture_output=True, text=True, timeout=5)
+            if 'bluez' not in r.stdout:
+                return ('⚠ BUD CONNECTED, NO AUDIO SINK',
+                        'The plugin is installed but did not attach to '
+                        'this bud — reboot the box, or if it persists '
+                        'the bud connected as its no-audio "-BLE" twin.')
+        except Exception:
+            pass
+    return None
 
 
 def reboot_box():
@@ -872,6 +887,16 @@ border-radius:8px;padding:.55rem;font-size:1.1rem;width:8rem}
 </style></head><body>__BODY__</body></html>"""
 
 
+def _bt_audio_warning():
+    prob = bt_audio_problem()
+    if not prob:
+        return ''
+    head, fix = prob
+    return (f'<br><b class="bad">{head}</b> — {fix}'
+            '<form method="post" action="/reboot" style="margin:.3rem 0">'
+            '<button class="lock">🔄 Reboot the box</button></form>')
+
+
 def _ghost_rows(st):
     """Paired-but-absent devices, each with a 🗑 forget — the parking lot
     for dead -BLE twins and last season's buds (the reconnect chaser
@@ -937,13 +962,7 @@ def _page_body(q):
             'drop and nothing plays. On the box, as your user, run: '
             '<code>systemctl --user enable --now pipewire '
             'pipewire-pulse wireplumber</code>')
-         + ('<br><b class="bad">⚠ NO AUDIO DEVICES</b> — the engine runs '
-            'but owns nothing (sink "auto_null"), so buds cannot connect '
-            'and nothing can play. This is a stale session: the '
-            'Bluetooth audio plugin and group landed after it started. '
-            '<form method="post" action="/reboot" style="margin:.3rem 0">'
-            '<button class="lock">🔄 Reboot the box (fixes it)</button>'
-            '</form>' if audio_devices_missing() else '')
+         + _bt_audio_warning()
          + f'<br>voice link: {html.escape(str(RTC_STATE.get("s", "—")))}'
          f'<br><span class="dim">voice out: '
          f'{html.escape(str(STATE.get("voice", "— (tap Test)")))} · '
