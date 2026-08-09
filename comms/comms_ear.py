@@ -580,6 +580,22 @@ BT_LOCK = threading.Lock()      # one bluetoothctl operation at a time —
 #                                 the reconnect chaser and the Pair button
 #                                 colliding is org.bluez.Error.InProgress
 
+_AUDIO_BOUNCE = {'t': 0.0}
+
+
+def _bounce_audio(force=False):
+    """br-connection-profile-unavailable = the engine runs but its
+    Bluetooth half missed the bus (a once-per-setup hiccup). The box
+    heals itself: bounce the PipeWire trio and give it a beat. Rate-
+    limited for the background chaser; a human-initiated pair forces."""
+    if not force and time.time() - _AUDIO_BOUNCE['t'] < 300:
+        return
+    _AUDIO_BOUNCE['t'] = time.time()
+    subprocess.run(['systemctl', '--user', 'restart', 'pipewire',
+                    'pipewire-pulse', 'wireplumber'], check=False,
+                   timeout=25)
+    time.sleep(5)
+
 
 def _paired_pairs():
     out = _bt('devices', 'Paired')
@@ -616,7 +632,9 @@ def reconnect_loop():
                 for mac in missing:
                     if PAIRING['busy']:
                         break
-                    _bt('connect', mac, timeout=8)
+                    out = _bt('connect', mac, timeout=8)
+                    if 'profile-unavailable' in out:
+                        _bounce_audio()        # self-heal, rate-limited
             finally:
                 BT_LOCK.release()
             if {d['mac'].upper() for d in
@@ -678,6 +696,9 @@ def _pair_seq(mac):
                or 'already paired' in out_p.lower())
     _bt('trust', mac)
     out_c = _bt('connect', mac, timeout=25)
+    if 'profile-unavailable' in out_c:
+        _bounce_audio(force=True)
+        out_c = _bt('connect', mac, timeout=25)
     ok_conn = 'Connection successful' in out_c
     if ok_conn:
         # "connected" is not enough — the bud's "-BLE" twin connects too
