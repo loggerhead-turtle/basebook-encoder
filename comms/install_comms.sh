@@ -118,10 +118,23 @@ RUNUID=$(id -u "$RUNUSER")
 echo "── audio engine (PipeWire, headless session for $RUNUSER) ──"
 usermod -aG bluetooth "$RUNUSER" 2>/dev/null || true
 loginctl enable-linger "$RUNUSER"
-sleep 2
-sudo -u "$RUNUSER" XDG_RUNTIME_DIR="/run/user/$RUNUID" \
+# a fresh linger takes a moment to bring the user manager (and its bus)
+# up — starting pipewire before the bus exists fails SILENTLY, and the
+# symptom downstream is maddening: buds pair, connect, then drop, and
+# the test speaker plays nothing
+for _i in $(seq 1 15); do
+  [ -S "/run/user/$RUNUID/bus" ] && break
+  sleep 1
+done
+if sudo -u "$RUNUSER" XDG_RUNTIME_DIR="/run/user/$RUNUID" \
   systemctl --user enable --now pipewire pipewire-pulse wireplumber \
-  2>/dev/null || true
+  2>/dev/null; then
+  echo "   ✓ audio engine running"
+else
+  echo "   ⚠ the user audio engine did not start — buds will pair but"
+  echo "     drop, and nothing will play. Fix: log in as $RUNUSER and run"
+  echo "       systemctl --user enable --now pipewire pipewire-pulse wireplumber"
+fi
 
 if ! grep -q PLAYCALL_COMMS_PIN "$ENV"; then
   PIN=$(( RANDOM % 9000 + 1000 ))

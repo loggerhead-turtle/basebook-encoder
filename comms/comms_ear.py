@@ -513,6 +513,18 @@ def _bt(*args, timeout=12):
         return str(exc)
 
 
+def audio_ok():
+    """Is the PipeWire engine reachable? Without it a bud pairs, connects
+    at the Bluetooth level, finds no audio service, and silently drops —
+    the admin page must SAY that instead of playing dead."""
+    try:
+        r = subprocess.run(['pactl', 'info'], capture_output=True,
+                           timeout=4)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
 def bt_status():
     show = _bt('show')
     if '__NO_BT__' in show:
@@ -697,7 +709,13 @@ def _page_body(q):
          f'<br>game: {game}<br>last call: '
          f'<b>{html.escape(STATE["last_call"])}</b> '
          f'<span class="dim">({STATE["spoken"]} spoken)</span>'
-         f'<br>voice link: {html.escape(str(RTC_STATE.get("s", "—")))}'
+         f'<br>audio engine: '
+         + ('<b class="ok">✓ running</b>' if audio_ok() else
+            '<b class="bad">⚠ NOT RUNNING</b> — buds will pair then '
+            'drop and nothing plays. On the box, as your user, run: '
+            '<code>systemctl --user enable --now pipewire '
+            'pipewire-pulse wireplumber</code>')
+         + f'<br>voice link: {html.escape(str(RTC_STATE.get("s", "—")))}'
          f'<br><span class="dim">box code: {html.escape(code_version())}'
          f'</span> <form method="post" action="/update" '
          f'style="display:inline">'
