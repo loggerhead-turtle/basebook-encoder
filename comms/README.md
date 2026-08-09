@@ -15,4 +15,4 @@ on the display Pi it imports the display app's key; on a fresh box it
 asks for a team activation code (generated on /auth/team).
 
 These files are exported from the main repo (Play-call/pi/) — edit them
-there; a test keeps the copies identical.
+there and re-export here.
