@@ -77,7 +77,11 @@ def main():
     # pyserial) is present, then streams velo/spin to the cloud. See
     # encoder/radar.py — display-only data, never the scorebook.
     from . import radar
-    radar.RadarService(link, cfg_load=config.load).start_thread()
+    _radar = radar.RadarService(link, cfg_load=config.load)
+    _radar.start_thread()
+    # the heartbeat carries radar health so the SITE can show a dark
+    # board / a collapsed parse rate without anyone SSHing in
+    link.radar_health = _radar.health
 
     # Clip cutter: systemd normally runs it as its own unit, but a box
     # installed before that unit existed never got it — self-update

@@ -237,6 +237,11 @@ class CloudLink:
             'clips': self.clips_status(),
             'cpu': system.cpu_percent(),
             'temp': system.cpu_temp(),
+            # Radar chain health (gun parse rate, board writes). Set by
+            # __main__ when the radar service starts; absent on boxes
+            # without a gun.
+            'radar': (self.radar_health() if callable(
+                getattr(self, 'radar_health', None)) else None),
             'version': __version__,
             # So the site can link straight to this box's settings page
             # instead of assuming playcall-encoder.local resolves.
