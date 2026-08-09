@@ -655,6 +655,18 @@ def _bt_pair_inner(mac):
         time.sleep(4)                    # let the bud reappear in view
     except Exception:
         pass
+    msg = _pair_seq(mac)
+    if scanner:
+        try:
+            scanner.terminate()
+        except Exception:
+            pass
+    return msg
+
+
+def _pair_seq(mac):
+    """pair → trust → connect → PROVE an audio sink appeared. The shared
+    tail of the manual Pair button and the ⚡ auto-pair."""
     out_p = _bt('pair', mac, timeout=35)
     if 'InProgress' in out_p:
         # an operation was mid-flight when we started — let it settle
@@ -667,11 +679,6 @@ def _bt_pair_inner(mac):
     _bt('trust', mac)
     out_c = _bt('connect', mac, timeout=25)
     ok_conn = 'Connection successful' in out_c
-    if scanner:
-        try:
-            scanner.terminate()
-        except Exception:
-            pass
     if ok_conn:
         # "connected" is not enough — the bud's "-BLE" twin connects too
         # and brings NO audio. Proof of life is an audio sink appearing.
@@ -689,6 +696,64 @@ def _bt_pair_inner(mac):
     if ok_pair:
         return 'paired, but connect failed: ' + _bt_tail(out_c)
     return 'pairing failed: ' + _bt_tail(out_p)
+
+
+def bt_autopair():
+    """⚡ One tap while the bud flashes: watch the live scan and pair the
+    FIRST new audio-capable device the instant it appears — no list to
+    read, no MAC to recognize, no racing the bud's pairing-mode timeout
+    (a failed attempt knocks most buds out of pairing mode, so speed is
+    the whole game)."""
+    PAIRING['busy'] = True
+    scanner = None
+    try:
+        with BT_LOCK:
+            _bt('power', 'on')
+            _bt('pairable', 'on')
+            known = set(_paired_macs())
+            try:
+                scanner = subprocess.Popen(
+                    ['bluetoothctl', '--timeout', '30', 'scan', 'on'],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    text=True)
+            except Exception as exc:
+                return f'scan failed: {exc}'
+            target = None
+            t0 = time.time()
+            while time.time() - t0 < 22:
+                line = scanner.stdout.readline()
+                if not line:
+                    time.sleep(0.2)
+                    continue
+                if 'NEW]' not in line:
+                    continue
+                m = re.search(r'Device ((?:[0-9A-Fa-f]{2}:){5}'
+                              r'[0-9A-Fa-f]{2}) ?(.*)', line)
+                if not m:
+                    continue
+                mac = m.group(1).upper()
+                name = (m.group(2) or '').strip()
+                if mac in known or not name:
+                    continue
+                if name.replace(':', '-').upper() == mac.replace(':', '-'):
+                    continue                     # unnamed so far — wait
+                up = name.upper()
+                if up.endswith('-BLE') or up.endswith(' LE'):
+                    continue                     # the no-audio twin
+                target = (mac, name)
+                break
+            if not target:
+                return ('no new earbud appeared — is it flashing in '
+                        'pairing mode? (tap ⚡ again the moment it is)')
+            mac, name = target
+            return f'🎧 {name}: ' + _pair_seq(mac)
+    finally:
+        if scanner:
+            try:
+                scanner.terminate()
+            except Exception:
+                pass
+        PAIRING['busy'] = False
 
 
 def bt_lock(locked):
@@ -756,13 +821,15 @@ def _page_body(q):
     paired_msg = ''
     if q.get('paired'):
         m = urllib.parse.unquote(q['paired'])
-        good = m.startswith('✓')
+        good = '✓' in m and '⚠' not in m
         paired_msg = (f'<div class="card"><b class="'
                       f'{"ok" if good else "bad"}">{html.escape(m)}</b>'
                       + ('' if good else
                          '<br><span class="dim">put the bud back in '
-                         'pairing mode and try again — two or three '
-                         'tries is normal</span>')
+                         'pairing mode and tap ⚡ again. If it fails '
+                         'repeatedly with an authentication error, '
+                         'factory-reset the buds — they may still trust '
+                         'an old box or phone.</span>')
                       + '</div>')
     game = (f"live vs <b>{html.escape(STATE['opponent'])}</b>"
             if STATE['game'] else 'no live game right now')
@@ -869,10 +936,17 @@ def _page_body(q):
             'showing as "unnamed device" is usually yours — its name '
             'often arrives a scan later.</span></div>')
     else:
-        b.append('<div class="card"><form method="post" action="/scan">'
-                 '<button class="go">🔍 Scan for the earbud</button>'
-                 '</form><span class="dim">put the bud in pairing mode '
-                 'first (hold its button until it flashes)</span></div>')
+        b.append('<div class="card">'
+                 '<form method="post" action="/autopair">'
+                 '<button class="go">⚡ Pair the flashing bud '
+                 '(automatic)</button></form>'
+                 '<span class="dim">put the bud in pairing mode FIRST '
+                 '(hold its button until it flashes), then tap — the '
+                 'box grabs it the moment it appears (~20 s)</span>'
+                 '<form method="post" action="/scan" '
+                 'style="margin-top:.6rem">'
+                 '<button>🔍 Scan and pick from a list instead</button>'
+                 '</form></div>')
     return ''.join(b)
 
 
@@ -970,6 +1044,9 @@ class Admin(http.server.BaseHTTPRequestHandler):
             loc = '/?scanned=1'
         elif self.path == '/pair':
             msg = bt_pair(form.get('mac', ''))
+            loc = '/?paired=' + urllib.parse.quote(msg)
+        elif self.path == '/autopair':
+            msg = bt_autopair()
             loc = '/?paired=' + urllib.parse.quote(msg)
         elif self.path == '/btforget':
             mac = form.get('mac', '')
