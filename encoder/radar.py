@@ -402,6 +402,7 @@ class RadarService:
             disp_fmt = ((cfg.get('radar') or {}).get('display_format')
                         or 'speed')
             handles, bufs = {}, {}
+            claims = {'lines': 0, 'ok': 0}
             try:
                 for p in ports:
                     try:
@@ -460,7 +461,36 @@ class RadarService:
                                         and self.frames_parsed > before:
                                     gun = p
                                     self.port = p
+                                    claims = {'lines': 0, 'ok': 0}
                                     log.info(f'gun identified on {p}')
+                                elif gun == p:
+                                    # A WRONG claim is self-correcting: a
+                                    # display board chatters status back
+                                    # up its own cable, and one lucky
+                                    # parse could crown it — after which
+                                    # the real gun was never read and its
+                                    # speeds were forwarded to itself,
+                                    # leaving the board dark (field
+                                    # report: 2000 unparsed of 2485).
+                                    # Sustained garbage releases the
+                                    # title so the other adapter can take
+                                    # it. Pinning radar.port skips this.
+                                    claims['lines'] += 1
+                                    if self.frames_parsed > before:
+                                        claims['ok'] += 1
+                                    if claims['lines'] >= 300 and \
+                                            claims['ok'] * 5 < claims['lines'] \
+                                            and len(handles) > 1:
+                                        log.warning(
+                                            f'{p} claimed the gun but only '
+                                            f'{claims["ok"]}/{claims["lines"]} '
+                                            'lines parse — releasing it; '
+                                            'the adapters are probably '
+                                            'swapped (pin radar.port and '
+                                            'radar.display_port to settle '
+                                            'this permanently)')
+                                        gun = None
+                                        claims = {'lines': 0, 'ok': 0}
                             if gun == p:
                                 others = [q for q in handles if q != p]
                                 tgt = disp_pin or (others[0] if others
