@@ -491,7 +491,9 @@ def test_heartbeat_payload_shape():
     assert hb['state'] == 'pushing'
     assert set(hb) == {'state', 'ingest', 'push', 'cpu', 'temp',
                        'version', 'log_tail', 'hostname', 'ip', 'clips',
-                       'pin', 'rtmp_urls'}
+                       'pin', 'rtmp_urls', 'radar'}
+    # a box with no gun still beats — radar rides as None
+    assert hb['radar'] is None
     # camera-facing ingest URLs ride the beat, raw IP first — the
     # address that still works when mDNS dies on a field hotspot
     assert isinstance(hb['rtmp_urls'], list) and hb['rtmp_urls']

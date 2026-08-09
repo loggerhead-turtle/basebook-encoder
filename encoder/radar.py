@@ -221,6 +221,9 @@ class RadarService:
         self._serial_cls = None        # set once pyserial imports
         self._disp = None
         self._disp_port = None
+        self.disp_writes = 0
+        self.disp_fails = 0
+        self.gun_baud = BAUD
         self._disp_warned = 0.0
         self.last_frame = None         # newest parse result, for the board
 
@@ -303,6 +306,32 @@ class RadarService:
             return None
         return ('%5.1f\r' % v).encode('ascii')
 
+    def health(self):
+        """One dict the heartbeat carries so the SITE can show whether
+        the gun and the board are actually working — today's whole
+        outage class ('velocity fine, board dark', '80% of frames
+        rejected') was invisible from the dugout and cost an afternoon
+        of SSH. Everything here is cheap and already counted."""
+        lines = self.lines_seen
+        parsed = self.frames_parsed
+        return {
+            'connected': bool(self.connected),
+            'port': self.port,
+            'baud': self.gun_baud,
+            'lines': lines,
+            'parsed': parsed,
+            # the number that would have named the glued-field bug in
+            # one glance instead of a log dive
+            'parse_pct': (round(100.0 * parsed / lines, 1)
+                          if lines else None),
+            'display_port': (self._disp_port[0] if self._disp_port
+                             else None),
+            'display_baud': (self._disp_port[1] if self._disp_port
+                             else None),
+            'display_writes': self.disp_writes,
+            'display_fails': self.disp_fails,
+        }
+
     def forward_display(self, raw, target, baud=BAUD):
         """Write one raw gun line to the LED board's adapter. Best
         effort forever: the board vanishing mid-game must never touch
@@ -330,7 +359,9 @@ class RadarService:
             if behind > self.DISP_MAX_BACKLOG:
                 return                      # board is behind — drop, whole
             self._disp.write(raw)
+            self.disp_writes += 1
         except Exception as e:
+            self.disp_fails += 1
             self._close_display()
             now = time.monotonic()
             if now - self._disp_warned > 30:
@@ -423,6 +454,7 @@ class RadarService:
             # else entirely, and a mismatch on either side is silence or
             # character salad, never a useful error.
             gun_baud = int((cfg.get('radar') or {}).get('baud') or BAUD)
+            self.gun_baud = gun_baud
             disp_baud = int((cfg.get('radar') or {}).get('display_baud')
                             or gun_baud)
             disp_fmt = ((cfg.get('radar') or {}).get('display_format')
