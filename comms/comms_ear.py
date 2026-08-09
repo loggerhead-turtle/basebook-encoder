@@ -576,6 +576,9 @@ def _bt_tail(out):
 
 
 PAIRING = {'busy': False}
+BT_LOCK = threading.Lock()      # one bluetoothctl operation at a time —
+#                                 the reconnect chaser and the Pair button
+#                                 colliding is org.bluez.Error.InProgress
 
 
 def _paired_macs():
@@ -601,24 +604,43 @@ def reconnect_loop():
             want = {m.upper() for m in ear_labels()} \
                 or {m.upper() for m in _paired_macs()}
             missing = sorted(want - connected)
-            if missing:
-                RTC_STATE.setdefault('bt', '')
-            for mac in missing:
-                _bt('connect', mac, timeout=12)
-            if missing and {d['mac'].upper() for d in
-                            bt_status().get('connected', [])} - connected:
+            if not missing:
+                continue
+            if not BT_LOCK.acquire(blocking=False):
+                continue                     # someone's pairing — stand down
+            try:
+                for mac in missing:
+                    if PAIRING['busy']:
+                        break
+                    _bt('connect', mac, timeout=8)
+            finally:
+                BT_LOCK.release()
+            if {d['mac'].upper() for d in
+                    bt_status().get('connected', [])} - connected:
                 _route_to_bud()              # a bud came home — route to it
         except Exception:
             pass
 
 
 def bt_pair(mac):
-    """Pair + trust + connect, with the radio actively scanning DURING
+    """Pair + trust + connect. PAIRING['busy'] + BT_LOCK stop the
+    reconnect chaser from colliding with us (that collision is
+    org.bluez.Error.InProgress); the finally guarantees the chaser is
+    never left believing a pair is still running."""
+    PAIRING['busy'] = True
+    try:
+        with BT_LOCK:
+            return _bt_pair_inner(mac)
+    finally:
+        PAIRING['busy'] = False
+
+
+def _bt_pair_inner(mac):
+    """The actual pair flow, with the radio actively scanning DURING
     the attempt — BlueZ forgets unpaired devices ~30 s after a scan
     ends, so pairing from a read-the-list-first tap fails with 'not
     available' unless the bud is brought back into view. Returns a
     short human-readable outcome for the page to show."""
-    PAIRING['busy'] = True
     _bt('power', 'on')
     _bt('pairable', 'on')
     scanner = None
@@ -630,6 +652,11 @@ def bt_pair(mac):
     except Exception:
         pass
     out_p = _bt('pair', mac, timeout=35)
+    if 'InProgress' in out_p:
+        # an operation was mid-flight when we started — let it settle
+        # and try once more before reporting anything
+        time.sleep(6)
+        out_p = _bt('pair', mac, timeout=35)
     ok_pair = ('Pairing successful' in out_p
                or 'AlreadyExists' in out_p          # tapped again — fine
                or 'already paired' in out_p.lower())
@@ -641,7 +668,6 @@ def bt_pair(mac):
             scanner.terminate()
         except Exception:
             pass
-    PAIRING['busy'] = False
     if ok_conn:
         _route_to_bud()                     # speech goes to the bud now
         return '✓ paired and connected'
