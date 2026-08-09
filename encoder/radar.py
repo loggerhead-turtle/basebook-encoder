@@ -417,8 +417,14 @@ class RadarService:
                 continue
             missing_logged = False
             disp_pin = (cfg.get('radar') or {}).get('display_port') or None
+            # The GUN's rate (radar.baud) and the BOARD's rate
+            # (radar.display_baud) are independent: a Stalker set to LO
+            # talks 9600 while its display board may want something
+            # else entirely, and a mismatch on either side is silence or
+            # character salad, never a useful error.
+            gun_baud = int((cfg.get('radar') or {}).get('baud') or BAUD)
             disp_baud = int((cfg.get('radar') or {}).get('display_baud')
-                            or BAUD)
+                            or gun_baud)
             disp_fmt = ((cfg.get('radar') or {}).get('display_format')
                         or 'speed')
             handles, bufs = {}, {}
@@ -426,7 +432,7 @@ class RadarService:
             try:
                 for p in ports:
                     try:
-                        handles[p] = serial.Serial(p, BAUD, timeout=0)
+                        handles[p] = serial.Serial(p, gun_baud, timeout=0)
                         bufs[p] = b''
                     except Exception as e:
                         log.warning(f'radar port {p} failed to open ({e})')
@@ -441,7 +447,7 @@ class RadarService:
                     gun = list(handles)[0] if len(handles) == 1 else None
                 self.port = gun or sorted(handles)[0]
                 log.info(f'radar listening on {len(handles)} adapter(s) '
-                         f'{sorted(handles)} @ {BAUD}'
+                         f'{sorted(handles)} @ {gun_baud}'
                          + (f' — gun on {gun}' if gun else
                             ' — waiting for the gun to speak first'))
                 self.connected = True
