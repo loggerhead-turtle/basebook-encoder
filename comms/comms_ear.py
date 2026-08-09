@@ -582,6 +582,21 @@ def bt_audio_problem():
                 'connect fails with profile-unavailable. On the box: '
                 '<code>sudo apt install -y libspa-0.2-bluetooth</code> '
                 'then reboot.')
+    # No A2DP endpoint on the adapter = no bud can ever connect. The
+    # classic headless cause is wireplumber's bluez monitor parked
+    # waiting for a logind SEAT that a lingering session never has.
+    try:
+        show = _bt('show')
+        if '__NO_BT__' not in show and 'Powered: yes' in show \
+                and 'Audio Source' not in show:
+            return ('⚠ NO BLUETOOTH AUDIO PROFILE',
+                    'The adapter offers no A2DP endpoint, so every bud '
+                    'connect fails. Usually wireplumber is waiting for '
+                    'a login seat this headless box will never have — '
+                    're-run <code>install_comms.sh</code> (it writes the '
+                    'headless fix) or reboot.')
+    except Exception:
+        pass
     st = bt_status()
     if st.get('ok') and st.get('connected'):
         try:
