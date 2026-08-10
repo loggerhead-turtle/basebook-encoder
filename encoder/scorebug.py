@@ -184,6 +184,22 @@ _FONT_DIRS = ['', '/usr/share/fonts/truetype/dejavu/']
 _font_cache = {}
 
 
+def _team_label(theme, t, cap=4):
+    """What to print for a team: the three-letter abbreviation, or the
+    FULL NAME when the theme's `fullname` toggle is on and the layout
+    has room. Mirrors nameFor() in the browser overlay so the hardware
+    renderer and the web overlay never disagree about a team's name."""
+    show = (theme or {}).get('show') or {}
+    full = str(t.get('name') or '').strip()
+    ab = str(t.get('abbr') or '').strip()
+    if not show.get('fullname') or not full:
+        return ab[:cap] or full[:cap]
+    if (theme or {}).get('layout') in ('pill', 'corner', 'ticker', 'bar',
+                                       'l3', 'sidebar') and len(full) > 14:
+        return ab[:cap] or full
+    return full
+
+
 def _font(theme, size, bold=True):
     fam = theme['font'] if theme else 'system'
     key = (fam, size, bold)
@@ -283,7 +299,7 @@ def _render_bar(bug, theme):
         fallback = (31, 111, 235, 255) if side == 'away' else (218, 54, 51, 255)
         d.rounded_rectangle((12, y + 12, 18, y + row_h - 12), 3,
                             fill=_team_color(t, fallback))
-        d.text((32, y + row_h // 2), str(t.get('abbr', ''))[:4],
+        d.text((32, y + row_h // 2), _team_label(theme, t),
                font=f_abbr, fill=pal['text'], anchor='lm')
         d.text((210, y + row_h // 2), str(t.get('runs', 0)),
                font=f_runs, fill=pal['text'], anchor='mm')
@@ -368,7 +384,7 @@ def _render_tv(bug, theme):
         fallback = (38, 41, 47, 255) if side == 'away' else (27, 47, 82, 255)
         d.rectangle((tabs_w, y, tabs_w + block_w, y + row_h),
                     fill=_team_color(t, fallback))
-        d.text((tabs_w + 12, y + row_h // 2), str(t.get('abbr', ''))[:4],
+        d.text((tabs_w + 12, y + row_h // 2), _team_label(theme, t),
                font=f_ab, fill=pal['text'], anchor='lm')
         d.rectangle((tabs_w + block_w, y, tabs_w + block_w + score_w,
                      y + row_h), fill=(255, 255, 255, 255))
@@ -449,7 +465,7 @@ def _render_tvbox(bug, theme):
         fallback = (38, 41, 47, 255) if side == 'away' else (27, 47, 82, 255)
         d.rectangle((0, y + (0 if i else 4), 8, y + TVBOX_ROW),
                     fill=_team_color(t, fallback))
-        d.text((22, y + TVBOX_ROW // 2), str(t.get('abbr', ''))[:4],
+        d.text((22, y + TVBOX_ROW // 2), _team_label(theme, t),
                font=f_ab, fill=pal['text'], anchor='lm')
         d.text((team_w - 26, y + TVBOX_ROW // 2), str(t.get('runs', 0)),
                font=f_sc, fill=pal['text'], anchor='mm')
@@ -508,7 +524,7 @@ def _render_bottomline(bug, theme):
         t = bug.get(side) or {}
         fallback = (31, 111, 235, 255) if side == 'away' else (218, 54, 51, 255)
         d.rectangle((x, 0, x + 6, BL_H), fill=_team_color(t, fallback))
-        d.text((x + 18, cy), str(t.get('abbr', ''))[:4], font=f_ab,
+        d.text((x + 18, cy), _team_label(theme, t), font=f_ab,
                fill=pal['text'], anchor='lm')
         d.text((x + 116, cy), str(t.get('runs', 0)), font=f_sc,
                fill=pal['text'], anchor='mm')
@@ -593,14 +609,14 @@ def _render_lowerthird(bug, theme):
         if i == 0:      # away on the left half
             d.rounded_rectangle((20, my0 + 16, 26, my0 + LT_MAIN - 16), 3,
                                 fill=stripe)
-            d.text((40, cy), str(t.get('abbr', ''))[:4], font=f_ab,
+            d.text((40, cy), _team_label(theme, t), font=f_ab,
                    fill=pal['text'], anchor='lm')
             d.text((mid - 46, cy), str(t.get('runs', 0)), font=f_sc,
                    fill=pal['text'], anchor='mm')
         else:           # home on the right half, mirrored
             d.rounded_rectangle((LT_W - 26, my0 + 16, LT_W - 20,
                                  my0 + LT_MAIN - 16), 3, fill=stripe)
-            d.text((LT_W - 40, cy), str(t.get('abbr', ''))[:4], font=f_ab,
+            d.text((LT_W - 40, cy), _team_label(theme, t), font=f_ab,
                    fill=pal['text'], anchor='rm')
             d.text((mid + 46, cy), str(t.get('runs', 0)), font=f_sc,
                    fill=pal['text'], anchor='mm')
@@ -631,7 +647,7 @@ def _render_sidestack(bug, theme):
         fallback = (31, 111, 235, 255) if side == 'away' else (218, 54, 51, 255)
         d.rounded_rectangle((10, y + 10, 16, y + SS_ROW - 10), 3,
                             fill=_team_color(t, fallback))
-        d.text((28, y + SS_ROW // 2), str(t.get('abbr', ''))[:4],
+        d.text((28, y + SS_ROW // 2), _team_label(theme, t),
                font=f_ab, fill=pal['text'], anchor='lm')
         d.text((SS_W - 34, y + SS_ROW // 2), str(t.get('runs', 0)),
                font=f_sc, fill=pal['text'], anchor='mm')
