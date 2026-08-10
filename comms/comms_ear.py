@@ -151,11 +151,28 @@ def _lan_ip():
 
 def fetch():
     global NONCE
+    # The box reports its OWN readiness on every poll — earpiece
+    # connected (and which role it carries), audio engine alive, live
+    # link state. Without this the site could only say "a box exists";
+    # a coach had to walk to it to learn whether the catcher would hear
+    # anything. Cheap: three short headers, no extra request.
+    ears = []
+    try:
+        st = bt_status()
+        labs = ear_labels()
+        for d in (st.get('connected') or []):
+            lab = labs.get(d['mac'].upper()) or labs.get(d['mac']) or ''
+            ears.append(lab or d.get('name') or 'bud')
+    except Exception:
+        pass
     req = urllib.request.Request(
         BASE + '/api/sk/device/comms',
         headers={'X-Api-Key': KEY, 'Authorization': 'Bearer ' + KEY,
                  'X-Pi-Hostname': HOSTNAME, 'X-Pi-Ip': _lan_ip(),
-                 'X-Pi-Comms-Port': str(PORT)})
+                 'X-Pi-Comms-Port': str(PORT),
+                 'X-Pi-Name': box_name()[:40],
+                 'X-Pi-Ears': ','.join(ears)[:120],
+                 'X-Pi-Voice': str(RTC_STATE.get('s', ''))[:60]})
     with urllib.request.urlopen(req, timeout=6) as r:
         d = json.load(r)
     # captured every poll; cleared when the cloud stops offering one
