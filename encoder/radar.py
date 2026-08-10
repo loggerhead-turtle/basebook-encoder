@@ -224,6 +224,8 @@ class RadarService:
         self.disp_writes = 0
         self.disp_fails = 0
         self.gun_baud = BAUD
+        self.cfg_pinned = False
+        self.cfg_disp_pinned = False
         self._disp_warned = 0.0
         self.last_frame = None         # newest parse result, for the board
 
@@ -330,6 +332,13 @@ class RadarService:
                              else None),
             'display_writes': self.disp_writes,
             'display_fails': self.disp_fails,
+            # CONFIG DRIFT: 'auto' means the roles are being guessed
+            # from whatever enumerated first — which is how a replug
+            # once handed the gun's speeds to the gun's own adapter.
+            # The site says pinned/auto so drift is visible, not
+            # discovered at a field.
+            'pinned': bool(self.cfg_pinned),
+            'display_pinned': bool(self.cfg_disp_pinned),
         }
 
     def forward_display(self, raw, target, baud=BAUD):
@@ -455,6 +464,8 @@ class RadarService:
             # character salad, never a useful error.
             gun_baud = int((cfg.get('radar') or {}).get('baud') or BAUD)
             self.gun_baud = gun_baud
+            self.cfg_pinned = bool((cfg.get('radar') or {}).get('port'))
+            self.cfg_disp_pinned = bool(disp_pin)
             disp_baud = int((cfg.get('radar') or {}).get('display_baud')
                             or gun_baud)
             disp_fmt = ((cfg.get('radar') or {}).get('display_format')

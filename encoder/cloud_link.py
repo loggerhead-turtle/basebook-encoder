@@ -224,6 +224,23 @@ class CloudLink:
         except Exception:
             return []
 
+    def _temp_peak(self):
+        """Highest temperature seen since the previous heartbeat, then
+        reset. Sampled by the heartbeat loop; an instantaneous reading
+        misses the spikes that actually throttle the box."""
+        t = system.cpu_temp()
+        peak = max([v for v in (t, getattr(self, '_temp_hi', None))
+                    if v is not None] or [None])
+        self._temp_hi = None
+        return peak
+
+    def note_temp(self):
+        """Cheap sample between beats — call from any loop."""
+        t = system.cpu_temp()
+        if t is not None:
+            hi = getattr(self, '_temp_hi', None)
+            self._temp_hi = t if hi is None else max(hi, t)
+
     def heartbeat_payload(self):
         ingest = self.ingest_status()
         push = self.push_status()
@@ -237,6 +254,10 @@ class CloudLink:
             'clips': self.clips_status(),
             'cpu': system.cpu_percent(),
             'temp': system.cpu_temp(),
+            # the PEAK since the last beat: a box that spikes to 82 °C
+            # between 15 s samples is throttling in ways an instant
+            # reading hides
+            'temp_max': self._temp_peak(),
             # Radar chain health (gun parse rate, board writes). Set by
             # __main__ when the radar service starts; absent on boxes
             # without a gun.

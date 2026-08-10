@@ -41,7 +41,7 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import config
+from . import config, system
 
 log = logging.getLogger('clipper')
 
@@ -57,6 +57,9 @@ UPLOAD_BPS = int(os.environ.get('UPLOAD_BPS', '250000'))
 # rolling recording (or was never recorded) — report it failed rather than
 # retry forever.
 CUT_GIVE_UP_AFTER = 15 * 60
+# Pi throttling starts ~80 °C; shed the heavy optional work before the
+# whole box slows down (field report: an overheat killed radar capture).
+CLIP_HOT_C = 78.0
 
 _PRUNE_EVERY = 3600
 # How long to wait between "still not paired" log lines (seconds).
@@ -107,6 +110,7 @@ class Clipper:
         self.status = status or StatusWriter()
         self.running = True
         self._last_unpaired_log = 0.0
+        self._last_hot_log = 0.0
 
     # ── cloud ────────────────────────────────────────────────────────────
 
@@ -348,6 +352,20 @@ class Clipper:
             self.status.write(0)
             return 0
         if not cfg.get('local_ingest_key'):
+            self.status.write(0)
+            return 0
+        # THERMAL SELF-DEFENSE: cutting and uploading clips is the
+        # heaviest thing this box does, and a Pi past ~80 °C throttles
+        # everything — including the radar read and the live push. An
+        # overheat took a box down mid-setup in the field. Clips are the
+        # one workload that can wait, so above the line we skip the cut
+        # cycle entirely and let the jobs sit server-side until it cools.
+        _t = system.cpu_temp()
+        if _t is not None and _t >= CLIP_HOT_C:
+            if time.time() - self._last_hot_log > 60:
+                self._last_hot_log = time.time()
+                log.warning('%.0f°C — pausing clip cutting until the box '
+                            'cools (streaming and radar keep running)', _t)
             self.status.write(0)
             return 0
         out = self._api(base, key, '/api/pi/clips/jobs')
