@@ -85,8 +85,10 @@ REASONS = {
                     '— four letters then four digits, e.g. HAWK-4823.',
     'code_already_used': '{code} has already been used by another box. '
                          'Generate a fresh one on the website.',
-    'code_expired': '{code} has expired. Codes last an hour — generate a '
-                    'fresh one on the website.',
+    # Deliberately no duration here: the site owns that number, and a
+    # box repeating a stale one is how documentation starts lying.
+    'code_expired': '{code} has expired. Generate a fresh one on the '
+                    'website.',
     'missing_code': 'No code was sent.',
 }
 

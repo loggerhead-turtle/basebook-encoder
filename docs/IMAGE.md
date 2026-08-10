@@ -5,10 +5,14 @@ exists for the coach who does not want a terminal at all.
 
 ## What a coach does
 
-1. Download `playcall-encoder.img.xz` and write it with Raspberry Pi
-   Imager. In Imager's **OS customisation** they set the things Imager
-   is good at: **username and password**, **Wi-Fi**, and SSH if they
-   want it. Nothing in the image overrides those.
+1. In Raspberry Pi Imager: **gear → Custom repository →
+   `https://basebook.org/imager.json`**. PlayCall Encoder then appears in
+   Imager's own OS list beside Raspberry Pi OS, and Imager handles the
+   download, the checksum, and the too-small-card check. (A direct
+   `playcall-encoder.img.xz` download works as well.) In Imager's **OS
+   customisation** the coach sets the things Imager is good at:
+   **username and password**, **Wi-Fi**, and SSH if they want it —
+   nothing in the image overrides those.
 2. On basebook.org: **Score Bug Studio → Encoders → ➕ Add an encoder**.
    That mints one activation code.
 3. Give the box the code, either way round:
@@ -33,6 +37,7 @@ No SSH, no `sudo`, no PIN written on a scrap of paper.
 | Portal field + deferred redemption after the box joins Wi-Fi | `encoder/provisioning.py` (`redeem_pending`) |
 | Stored-but-unspent code | `config.json` → `pending_code` (redacted from log bundles) |
 | Image build | `scripts/build_image.sh` |
+| Imager custom-repo manifest + the coach-facing page | `cloud/scorekeeper/encoder_image.py` (Play-call) |
 
 Three routes, one implementation. A code is normalised the same way
 (case, spaces, missing dash all forgiven), spent once, and dropped the
@@ -73,3 +78,10 @@ ends up compromised; Imager already asks for those per card.
 - [ ] Confirm Imager's username/Wi-Fi customisation still applies.
 - [ ] Re-run `install.sh` on a box built from the image and confirm it
       upgrades without trying to re-spend a code.
+- [ ] Set `ENCODER_IMAGE_URL` (plus `_SHA256`, `_BYTES`,
+      `_EXTRACT_BYTES`, `_EXTRACT_SHA256`, `_VERSION`, `_DATE`) on the
+      site. Until that is set, `/imager.json` returns an empty list and
+      `/score/encoder/image` says the image is not out yet — which is
+      what makes publishing a release step rather than a code change.
+- [ ] Paste the custom-repo URL into a real Raspberry Pi Imager and
+      confirm the entry appears, downloads, and verifies.

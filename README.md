@@ -55,8 +55,13 @@ a keyboard and monitor, or SSH from your laptop.
 2. Paste it into the Pi:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/loggerhead-turtle/basebook-encoder/main/install.sh | sudo bash -s -- HAWK-4823
+curl -fsSL https://basebook.org/i | sudo bash -s -- HAWK-4823
 ```
+
+`basebook.org/i` serves this repo's `install.sh`. It is short enough to
+type by hand off a phone onto a Pi keyboard, and reachable on the school
+and park networks that block `raw.githubusercontent.com`. The GitHub raw
+URL works too if you prefer it.
 
 That is the whole install. It fetches MediaMTX, installs the encoder to
 `/opt/playcall-encoder`, enables the services, sets the hostname to
@@ -64,8 +69,8 @@ That is the whole install. It fetches MediaMTX, installs the encoder to
 trades the code for this team's cloud key. Leave the studio page open —
 it goes **waiting → installing → online** by itself.
 
-The code works once, on one box, and expires after an hour. Press the
-button again for another.
+The code works once, on one box, and is good for a day. Press the button
+again for another.
 
 **No code yet?** `… | sudo bash` on its own installs everything and
 leaves the box unpaired; re-run it later with a code. Nothing is lost.

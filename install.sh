@@ -4,6 +4,12 @@
 #  Raspberry Pi 4/5, Raspberry Pi OS Bookworm (64-bit), NetworkManager.
 #
 #  One-liner (self-install), with the activation code from the website:
+#    curl -fsSL https://basebook.org/i | sudo bash -s -- HAWK-4823
+#
+#  basebook.org/i serves THIS FILE. It is short enough to type by hand off
+#  a phone onto a Pi keyboard, and reachable on the school and park
+#  networks that block raw.githubusercontent.com. The GitHub raw URL still
+#  works if you prefer it:
 #    curl -fsSL https://raw.githubusercontent.com/loggerhead-turtle/basebook-encoder/main/install.sh | sudo bash -s -- HAWK-4823
 #
 #  Without a code it still installs — the box just isn't paired to a team
@@ -216,7 +222,7 @@ elif [[ -n "$ACT_CODE" ]]; then
   echo "  message above). Everything local works; only the cloud link is"
   echo "  missing. Get a fresh code from the website and re-run:"
   echo
-  echo "    curl -fsSL $REPO_URL/raw/main/install.sh | sudo bash -s -- YOUR-CODE"
+  echo "    curl -fsSL $CLOUD_URL/i | sudo bash -s -- YOUR-CODE"
 else
   echo "The encoder is installed but not paired to a team yet."
   echo
@@ -224,7 +230,7 @@ else
   echo "It gives you a one-line command with your code already in it. Paste"
   echo "that here and this box joins your team:"
   echo
-  echo "    curl -fsSL $REPO_URL/raw/main/install.sh | sudo bash -s -- YOUR-CODE"
+  echo "    curl -fsSL $CLOUD_URL/i | sudo bash -s -- YOUR-CODE"
 fi
 
 if [[ "$ADOPTED" == 1 ]]; then
