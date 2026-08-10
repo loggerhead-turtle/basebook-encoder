@@ -3,11 +3,14 @@
 #  PlayCall Encoder — installer.
 #  Raspberry Pi 4/5, Raspberry Pi OS Bookworm (64-bit), NetworkManager.
 #
-#  One-liner (self-install):
-#    curl -fsSL https://raw.githubusercontent.com/loggerhead-turtle/basebook-encoder/main/install.sh | sudo bash
+#  One-liner (self-install), with the activation code from the website:
+#    curl -fsSL https://raw.githubusercontent.com/loggerhead-turtle/basebook-encoder/main/install.sh | sudo bash -s -- HAWK-4823
+#
+#  Without a code it still installs — the box just isn't paired to a team
+#  until you run it again with one (or drop the code on the boot partition).
 #
 #  Or from a checkout:
-#    sudo bash install.sh
+#    sudo bash install.sh [HAWK-4823]
 #
 #  Idempotent — safe to re-run for upgrades; it never touches an existing
 #  /etc/playcall-encoder/config.json.
@@ -24,8 +27,34 @@ REPO_URL="${PLAYCALL_ENCODER_REPO:-https://github.com/loggerhead-turtle/basebook
 INSTALL_DIR=/opt/playcall-encoder
 CONFIG_DIR=/etc/playcall-encoder
 MEDIAMTX_VERSION="${MEDIAMTX_VERSION:-latest}"
+CLOUD_URL="${PLAYCALL_CLOUD:-https://basebook.org}"
+
+# ── Where the activation code comes from ──────────────────────────────────────
+# Three sources, in priority order, because the person doing this may have
+# a terminal, may only have a card reader, or may have neither:
+#   1. an argument      — the copy-paste one-liner off the website
+#   2. the environment  — PLAYCALL_CODE=…, for scripted/imaged fleets
+#   3. a file on the SD card's BOOT partition — the prebuilt-image path:
+#      flash, open the card on any computer, save the code into a text
+#      file, eject. No SSH, no terminal, nothing typed on the Pi.
+# The code is normalised here (case, spaces, missing dash) so a coach
+# reading it off a phone can't get it "wrong".
+CODE_ARG="${1:-${PLAYCALL_CODE:-}}"
+CODE_FILE=""
+for f in /boot/firmware/playcall-code.txt /boot/playcall-code.txt; do
+  [[ -z "$CODE_ARG" && -f "$f" ]] && { CODE_ARG="$(cat "$f")"; CODE_FILE="$f"; break; }
+done
+ACT_CODE="$(tr -cd '[:alnum:]' <<< "${CODE_ARG:-}" | tr '[:lower:]' '[:upper:]')"
+if [[ ${#ACT_CODE} -eq 8 ]]; then
+  ACT_CODE="${ACT_CODE:0:4}-${ACT_CODE:4:4}"
+elif [[ -n "$ACT_CODE" ]]; then
+  echo "⚠ '$CODE_ARG' is not an activation code (expected 4 letters + 4 digits," >&2
+  echo "  e.g. HAWK-4823). Installing anyway — pair the box afterwards." >&2
+  ACT_CODE=""
+fi
 
 echo "── PlayCall Encoder installer ──"
+[[ -n "$ACT_CODE" ]] && echo "Activation code: $ACT_CODE${CODE_FILE:+  (from $CODE_FILE)}"
 
 # ── Not-fresh Pi detection (BEFORE we touch anything) ─────────────────────────
 # A box that is already online — Ethernet, USB tether, or a Speedify cellular
@@ -137,20 +166,69 @@ if [[ "$CURRENT_HOST" == "raspberrypi" || -z "$CURRENT_HOST" ]]; then
 fi
 systemctl enable --now avahi-daemon >/dev/null 2>&1 || true
 
+# ── Activation: trade the code for this team's cloud key ─────────────────────
+# Last real step before the services come up, so the box's very first
+# heartbeat is already authenticated and the website flips to "Online"
+# while the person who ran this is still looking at the screen.
+#
+# A failure here is NOT fatal: the encoder is installed and works locally:
+# RTMP ingest, scorebug, clips. Only the cloud link is missing, and it can
+# be re-run. Killing the install over it would waste the whole download.
+ACTIVATED=0
+if [[ -n "$ACT_CODE" ]]; then
+  echo "── Pairing with $CLOUD_URL ──"
+  set +e
+  PLAYCALL_CLOUD="$CLOUD_URL" python3 "$INSTALL_DIR/scripts/activate.py" "$ACT_CODE"
+  RC=$?
+  set -e
+  [[ $RC -eq 0 ]] && ACTIVATED=1
+fi
+
 # ── systemd units ─────────────────────────────────────────────────────────────
 install -m 644 "$SRC/systemd/playcall-encoder.service"          /etc/systemd/system/
 install -m 644 "$SRC/systemd/playcall-encoder-mediamtx.service" /etc/systemd/system/
 install -m 644 "$SRC/systemd/playcall-encoder-youtube.service"  /etc/systemd/system/
 install -m 644 "$SRC/systemd/playcall-encoder-clipper.service"  /etc/systemd/system/
+install -m 644 "$SRC/systemd/playcall-encoder-activate.service" /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable playcall-encoder playcall-encoder-mediamtx \
-                 playcall-encoder-youtube playcall-encoder-clipper >/dev/null
+                 playcall-encoder-youtube playcall-encoder-clipper \
+                 playcall-encoder-activate >/dev/null
 systemctl restart playcall-encoder-mediamtx playcall-encoder-youtube \
                   playcall-encoder-clipper playcall-encoder
 
 echo
 echo "── Done ─────────────────────────────────────────────────"
+
+# ── What to do next ──────────────────────────────────────────────────────────
+# Exactly one instruction, chosen by what actually happened. The old banner
+# ended by telling everyone to write down a six-digit PIN; almost nobody
+# needs it any more (the website opens this box's settings signed in), and
+# printing it as homework made a finished install feel unfinished.
+if [[ "$ACTIVATED" == 1 ]]; then
+  echo "This box is paired. Nothing else to do here."
+  echo
+  echo "Go back to basebook.org → Score Bug Studio. The box appears on the"
+  echo "Encoders card within a few seconds; ⚙ Settings there opens it"
+  echo "already signed in — no PIN to remember."
+elif [[ -n "$ACT_CODE" ]]; then
+  echo "⚠ The encoder is installed, but pairing did not go through (see the"
+  echo "  message above). Everything local works; only the cloud link is"
+  echo "  missing. Get a fresh code from the website and re-run:"
+  echo
+  echo "    curl -fsSL $REPO_URL/raw/main/install.sh | sudo bash -s -- YOUR-CODE"
+else
+  echo "The encoder is installed but not paired to a team yet."
+  echo
+  echo "On basebook.org → Score Bug Studio → Encoders, click 'Add an encoder'."
+  echo "It gives you a one-line command with your code already in it. Paste"
+  echo "that here and this box joins your team:"
+  echo
+  echo "    curl -fsSL $REPO_URL/raw/main/install.sh | sudo bash -s -- YOUR-CODE"
+fi
+
 if [[ "$ADOPTED" == 1 ]]; then
+  echo
   echo "This Pi was already online (Ethernet / Speedify / tether), so its"
   echo "network was ADOPTED as-is — no hotspot, and PlayCall will never"
   echo "modify this box's network configuration."
@@ -163,13 +241,13 @@ print()
 print('Camera app RTMP URL(s):')
 for u in provisioning.rtmp_urls(cfg):
     print(f'  {u}')
-print(f"Settings page:  http://localhost:8080 (or <this-pi>.local:8080)")
-print(f"Settings PIN:   {cfg['device']['pin']}   ← write this down")
+print('Settings page:  http://localhost:8080 (or <this-pi>.local:8080)')
+print('Recovery PIN:   %s   (only needed if you open the settings page '
+      'directly instead of from the website)' % cfg['device']['pin'])
 PY
-elif [[ -f "$CONFIG_DIR/config.json" ]]; then
-  echo "Existing config kept. Settings page: http://playcall-encoder.local:8080"
-else
-  echo "First-time setup: the encoder is now broadcasting a Wi-Fi hotspot"
+elif [[ ! -f "$CONFIG_DIR/config.json" ]]; then
+  echo
+  echo "This Pi has no network yet, so it is broadcasting a Wi-Fi hotspot"
   echo "named PlayCall-Encoder-XXXX. Join it from your phone and follow the"
   echo "setup page (it opens automatically, or browse to http://192.168.4.1)."
 fi

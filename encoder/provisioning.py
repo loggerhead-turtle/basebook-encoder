@@ -360,16 +360,24 @@ PORTAL_PAGE = """<!doctype html>
   <p class="hint">The first address works once your phone/laptop is on
      <strong>{{ home_ssid }}</strong> with the encoder. If it doesn't
      resolve, use the second (IP) address.</p>
-  <label>Settings PIN — write this down</label>
+  {% if code %}
+  <p class="hint" style="margin-top:1rem"><strong>Joining your team.</strong>
+     This box connects itself to basebook.org as soon as it is on your
+     Wi-Fi — usually within a minute. Watch it arrive on
+     <strong>Score Bug Studio → Encoders</strong>. Nothing else to do.</p>
+  {% else %}
+  <p class="hint" style="margin-top:1rem"><strong>Next — connect it to
+     your team:</strong> on basebook.org go to <strong>Score Bug Studio →
+     Encoders → + Add an encoder</strong> and follow the one command it
+     gives you.</p>
+  {% endif %}
+  <label>Recovery PIN</label>
   <div class="pin">{{ pin }}</div>
-  <p class="hint">Change settings later at
-     <strong>http://{{ host }}.local:8080</strong> using this PIN.</p>
-  <p class="hint" style="margin-top:1rem"><strong>Next — pair it to
-     PlayCall:</strong> once the encoder is on your Wi-Fi, sign in to
-     PlayCall on a device on the <em>same network</em> and go to
-     <strong>Score Bug Studio → Encoders → Pair a Raspberry Pi</strong>.
-     One click pairs the box (you'll enter the PIN above) and your teams
-     take over from there.</p>
+  <p class="hint">You will not normally need this — the site's
+     <strong>⚙ Settings</strong> button opens
+     <strong>http://{{ host }}.local:8080</strong> already signed in. The
+     PIN is for reaching the box directly, and the site can show it to you
+     again any time.</p>
   <p class="hint" style="margin-top:1rem">The encoder is now joining
      <strong>{{ home_ssid }}</strong> — this hotspot will disappear in a
      few seconds. You can close this page.</p>
@@ -379,7 +387,16 @@ PORTAL_PAGE = """<!doctype html>
 <div class="card">
   {% if error %}<div class="alert">{{ error }}</div>{% endif %}
   <form method="post" action="/setup">
-    <div class="step">Step 1 · Home network</div>
+    <div class="step">Step 1 · Your team</div>
+    <label>Activation code</label>
+    <input type="text" name="code" autocomplete="off" autocapitalize="characters"
+           placeholder="HAWK-4823">
+    <p class="hint">From basebook.org &rarr; Score Bug Studio &rarr;
+       Encoders &rarr; <strong>&plus; Add an encoder</strong>. This box
+       joins your team on its own as soon as it is online — nothing else
+       to do. Leave blank to connect it later.</p>
+
+    <div class="step" style="margin-top:1.25rem">Step 2 · Home network</div>
     <label>Wi-Fi network</label>
     {% if networks %}
     <select name="ssid" id="s0" onchange="oth(this,'m0')">
@@ -394,7 +411,7 @@ PORTAL_PAGE = """<!doctype html>
     <label>Password</label>
     <input type="password" name="password" autocomplete="off">
 
-    <div class="step" style="margin-top:1.25rem">Step 2 · Game-day network
+    <div class="step" style="margin-top:1.25rem">Step 3 · Game-day network
       <span style="color:#666;text-transform:none">(optional)</span></div>
     <p class="hint">Field Wi-Fi or a travel router you stream through at
        games. The encoder joins whichever known network it finds.</p>
@@ -407,7 +424,7 @@ PORTAL_PAGE = """<!doctype html>
     <input type="password" name="password3" placeholder="Password"
            autocomplete="off" style="margin-top:.4rem">
 
-    <div class="step" style="margin-top:1.25rem">Step 3 · YouTube</div>
+    <div class="step" style="margin-top:1.25rem">Step 4 · YouTube</div>
     <label>Stream key or full RTMP URL</label>
     <input type="text" name="youtube" autocomplete="off"
            placeholder="xxxx-xxxx-xxxx-xxxx  or  rtmps://…/live2/xxxx">
@@ -455,6 +472,20 @@ def complete_setup(form):
         return None, err
     cfg = config.load()
     cfg['networks'] = nets
+    # The phone typing this is joined to the BOX's hotspot, so there is no
+    # internet to spend the code on yet. Store it; _finish() redeems it a
+    # few seconds later, once the box is on the network the coach just
+    # gave us. A typo has to be caught here — after the hotspot drops,
+    # nobody is looking at this page any more.
+    raw_code = (form.get('code') or '').strip()
+    if raw_code:
+        from . import activation
+        code = activation.normalize(raw_code)
+        if not code:
+            return None, (f'"{raw_code}" is not an activation code — four '
+                          'letters then four digits, like HAWK-4823. Leave '
+                          'it blank to connect this box later.')
+        cfg['pending_code'] = code
     url, key = normalize_youtube(form.get('youtube') or '')
     if url or key:
         cfg['youtube'] = {'url': url or DEFAULT_YOUTUBE_URL, 'key': key}
@@ -466,6 +497,37 @@ def complete_setup(form):
     except OSError as e:
         log.warning(f'mediamtx config not written: {e}')
     return cfg, None
+
+
+def redeem_pending(cfg=None, tries=6, delay=10):
+    """Spend a stored activation code now that the box has a network.
+
+    Called on the way out of the setup portal, where the code was typed
+    on a phone with no route to the internet. Never raises: this runs on
+    a background thread that is about to exit the process, and a box that
+    fails to pair is still a working local encoder.
+    """
+    from . import activation
+    cfg = cfg if cfg is not None else config.load()
+    code = activation.normalize(cfg.get('pending_code') or '')
+    if not code or activation.already_paired(cfg):
+        return cfg
+    try:
+        out = activation.redeem_with_retry(code, tries=tries, delay=delay)
+    except activation.Refused as e:
+        # The site has looked at this code and said no. Asking again on
+        # every boot from here to eternity gets the same no — drop it.
+        log.warning(f'activation code refused: {e}')
+        cfg['pending_code'] = ''
+        config.save(cfg)
+        return cfg
+    except activation.Unreachable as e:
+        # Keep the code. The first-boot unit retries next boot, and the
+        # coach may simply have given us Wi-Fi that is not in range yet.
+        log.warning(f'activation deferred: {e}')
+        return cfg
+    log.info('paired to %s', out.get('team_name') or 'a team')
+    return activation.apply(out, cfg)
 
 
 def run_portal():
@@ -483,7 +545,8 @@ def run_portal():
 
     def _page(**kw):
         base = dict(networks=scan_networks(), error=None, done=False,
-                    urls=[], pin='', host=system.hostname(), home_ssid='')
+                    urls=[], pin='', host=system.hostname(), home_ssid='',
+                    code='')
         base.update(kw)
         return render_template_string(PORTAL_PAGE, **base)
 
@@ -500,6 +563,7 @@ def run_portal():
         result['cfg'] = cfg
         resp = _page(done=True, urls=rtmp_urls(cfg),
                      pin=cfg['device']['pin'],
+                     code=cfg.get('pending_code') or '',
                      home_ssid=cfg['networks'][0]['ssid'])
         done.set()
         return resp
@@ -520,6 +584,13 @@ def run_portal():
         system.systemctl('restart', 'playcall-encoder-mediamtx')
         system.systemctl('restart', 'playcall-encoder-youtube')
         time.sleep(2)
+        # The activation code the coach typed on the portal could not be
+        # spent then — their phone was on our hotspot and the box had no
+        # internet. It does now, or will within a few seconds of joining
+        # their Wi-Fi, so spend it here rather than waiting for the next
+        # reboot. Retries cover a slow join; a refusal is logged and the
+        # code dropped, because re-asking gets the same answer forever.
+        cfg = redeem_pending(cfg)
         if was_configured:
             # Watchdog re-provisioning on an already-configured box: ask
             # systemd for a graceful restart of the encoder service (SIGTERM
