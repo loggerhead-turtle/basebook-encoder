@@ -223,6 +223,22 @@ elif [[ -n "$ACT_CODE" ]]; then
   echo "  missing. Get a fresh code from the website and re-run:"
   echo
   echo "    curl -fsSL $CLOUD_URL/i | sudo bash -s -- YOUR-CODE"
+elif ALREADY="$(python3 - <<'PY' 2>/dev/null
+import sys
+sys.path.insert(0, '/opt/playcall-encoder')
+from encoder import config
+cur = config.load().get('cloud') or {}
+print(cur.get('base_url', '') if cur.get('api_key') else '')
+PY
+)" && [[ -n "$ALREADY" ]]; then
+  # UPGRADING A WORKING BOX. No code was passed because none is needed —
+  # this box has been paired for months. Saying "not paired to a team
+  # yet" here sent an owner off to mint a code for a box that was fine,
+  # right after a game where its data had genuinely gone missing. Read
+  # the config and say what is true.
+  echo "Upgraded. This box is still paired to $ALREADY — nothing else to do."
+  echo
+  echo "Its pairing, YouTube key and settings were left untouched."
 else
   echo "The encoder is installed but not paired to a team yet."
   echo
