@@ -441,9 +441,24 @@ class RadarService:
                      f'({self.lines_seen} lines, {self.unparsed} unparsed)')
         ev = self.engine.feed(frame, t=t)
         if ev and ev.get('kind') != 'ghost':
+            # EVERY reading, in a form a person can read back and a script
+            # can parse. A game's velocities once reached the cloud as six
+            # merged bursts and the per-pitch numbers were simply gone —
+            # not mis-filed, gone, because the only durable copy was the
+            # one the cloud kept. The box sees each reading first; a line
+            # in the journal costs ~24 KB a game and makes the same loss
+            # recoverable with `journalctl -u playcall-encoder | grep
+            # 'radar pitch'` instead of unrecoverable.
+            #
+            # The trailing key=value tail is deliberate: it survives being
+            # pasted into a support thread and reads as a table.
             log.info(f"radar {ev['kind']}: {ev['peak']} mph"
                      + (f", {ev['rpm']} rpm" if ev.get('rpm') else '')
-                     + f" ({ev['frames']} frames, {ev['dur']}s)")
+                     + f" ({ev['frames']} frames, {ev['dur']}s)"
+                     + f" | peak={ev['peak']}"
+                     + f" plate={ev.get('plate')}"
+                     + f" rpm={ev.get('rpm')}"
+                     + f" frames={ev['frames']} dur={ev['dur']}")
         live = None
         cur = frame.get('peak') if frame.get('peak') is not None \
             else frame.get('live')
