@@ -46,27 +46,50 @@ Hardware: Raspberry Pi 4 or 5, Raspberry Pi OS Bookworm (64-bit).
 
 ## Quickstart B — self-install on your own Pi
 
-1. **Download the installer from PlayCall** — sign in to your PlayCall
-   account and go to **Score Bug Studio → Encoders → Download the encoder
-   installer** (`/score/encoder/download`). Any signed-in user can
-   download it; the demo cannot.
-2. Flash Raspberry Pi OS Bookworm (64-bit Lite is fine) and boot the Pi.
-3. Copy the downloaded `playcall-encoder-<version>.tar.gz` to the Pi
-   (USB stick, or `scp` if SSH is enabled), then:
+You need a Raspberry Pi 4 or 5 running Raspberry Pi OS Bookworm (64-bit
+Lite is fine) and connected to the internet, plus a terminal on it —
+a keyboard and monitor, or SSH from your laptop.
+
+1. In PlayCall: **Score Bug Studio → Encoders → ➕ Add an encoder**. It
+   gives you a command with your team's activation code already in it.
+2. Paste it into the Pi:
 
 ```bash
-tar xzf playcall-encoder-*.tar.gz
-cd playcall-encoder
-sudo bash install.sh
+curl -fsSL https://basebook.org/i | sudo bash -s -- HAWK-4823
 ```
 
-The installer fetches MediaMTX, installs the encoder to
-`/opt/playcall-encoder`, enables the services, and sets the hostname to
-`playcall-encoder.local`. On a **fresh, offline** Pi, follow the hotspot
-setup below. On a Pi that is **already online** (Ethernet, Speedify,
-tether), see "Already-networked Pi" — there is no hotspot step.
+`basebook.org/i` serves this repo's `install.sh`. It is short enough to
+type by hand off a phone onto a Pi keyboard, and reachable on the school
+and park networks that block `raw.githubusercontent.com`. The GitHub raw
+URL works too if you prefer it.
 
-(Developers with repo access can still clone and `sudo bash install.sh`.)
+That is the whole install. It fetches MediaMTX, installs the encoder to
+`/opt/playcall-encoder`, enables the services, sets the hostname to
+`playcall-encoder.local` if the Pi is still on the factory name, and
+trades the code for this team's cloud key. Leave the studio page open —
+it goes **waiting → installing → online** by itself.
+
+The code works once, on one box, and is good for a day. Press the button
+again for another.
+
+**No code yet?** `… | sudo bash` on its own installs everything and
+leaves the box unpaired; re-run it later with a code. Nothing is lost.
+
+**Re-running it** on a box that is already paired upgrades the software
+and leaves the pairing alone. To move a box to a different team:
+
+```bash
+sudo PLAYCALL_FORCE_PAIR=1 bash /opt/playcall-encoder/scripts/activate.py NEW-CODE
+```
+
+**No terminal at all?** See [docs/IMAGE.md](docs/IMAGE.md) — a prebuilt
+SD image takes the code from a text file on the boot partition, or asks
+for it on the first-boot setup page.
+
+**Offline field install?** Signed-in PlayCall users can still download a
+tarball at `/score/encoder/download`, carry it in on a USB stick, and run
+`sudo bash install.sh` from the unpacked directory — it takes the same
+code argument.
 
 > **⚠ Installing on a Pi you already use for other things?** (Speedify,
 > ad-blocking, home automation…) **Make a full SD-card backup first.**
@@ -74,29 +97,25 @@ tether), see "Already-networked Pi" — there is no hotspot step.
 > your undo button. On an already-online Pi it adopts your network
 > untouched (see below), but back up anyway.
 
-## Pair it to PlayCall (cloud pairing)
+## Connecting a box that is already installed
 
-Pairing connects the box to your PlayCall account so your teams can point
-it at their games — each team's stream lands on **that team's** YouTube
-channel automatically.
-
-**If the Pi is installed and online** (this is also the path for a
-non-fresh / Speedify Pi):
+Quickstart B pairs the box as part of the install, so most people never
+need this. It is here for a box installed before there were codes, or one
+being moved between teams by hand.
 
 1. Sign in to PlayCall **on a device on the same network as the Pi** and
    open **Score Bug Studio → Encoders**.
-2. Click **🔗 Pair a Raspberry Pi**. PlayCall creates the box's cloud key
-   (shown once) and opens the box's own pairing page.
-3. On that page, enter the box's **settings PIN** and click **Pair this
-   encoder**. Done — the box checks in within seconds and appears in the
-   Encoders list.
+2. Click **🔗 Re-pair a Raspberry Pi**. PlayCall creates the box's cloud
+   key (shown once) and opens the box's own pairing page.
+3. Confirm on that page. The box checks in within seconds and appears in
+   the Encoders list.
    * If `playcall-encoder.local` doesn't resolve, browse to
-     `http://<pi-address>:8080`, sign in with the PIN, and paste the key
-     from the PlayCall page.
+     `http://<pi-address>:8080`, sign in with the box's **recovery PIN**
+     (the 🔑 button on its Encoders card shows it), and paste the key.
 
-**If the Pi is fresh and offline:** run the hotspot setup first (below) —
-the final screen reminds you — then do the three steps above once the box
-is on your Wi-Fi.
+**If the Pi is fresh and offline:** run the hotspot setup first (below).
+Its first page asks for the activation code, so a box set up that way
+pairs itself the moment it joins your Wi-Fi — nothing to do here.
 
 **After pairing — day-to-day:**
 
@@ -106,6 +125,9 @@ is on your Wi-Fi.
   **Stream here** pins it to that team + channel; **Auto-follow** lets it
   chase whichever game you score; **Release** idles it. That card is your
   list of "who is this box streaming for right now."
+* **⚙ Settings** on that card opens the box's own page already signed in.
+  The recovery PIN is only for reaching the box directly — which is what
+  you do when the cloud link is the broken thing.
 
 ## Already-networked Pi (Speedify, Ethernet, cellular bonding)
 
@@ -117,7 +139,7 @@ way:
   (a default route on any interface, or an active Speedify service /
   `connectify0` bonding adapter), the installer **adopts the existing
   network as-is**: no setup hotspot, no Wi-Fi changes, ever. It prints
-  your camera RTMP URL and settings PIN right in the terminal.
+  your camera RTMP URL and recovery PIN right in the terminal.
 * On an adopted box the config records `network_managed: false`. The
   recovery hotspot is disabled outright, the settings page hides the
   Wi-Fi section, and PlayCall never writes to NetworkManager or
@@ -141,29 +163,34 @@ page opens automatically; if not, browse to `http://192.168.4.1`.
 
 > _[screenshot placeholder: phone Wi-Fi list showing PlayCall-Encoder-7F3A]_
 
-**2. Pick your home network.** Choose your Wi-Fi from the scanned list
+**2. Enter your activation code.** From PlayCall: **Score Bug Studio →
+Encoders → ➕ Add an encoder**. The box has no internet yet, so it holds
+the code and spends it the moment it joins your Wi-Fi — it then appears
+on your Encoders card by itself. Leave it blank to connect the box later.
+
+**3. Pick your home network.** Choose your Wi-Fi from the scanned list
 and enter its password.
 
 > _[screenshot placeholder: setup step 1 — network picker]_
 
-**3. (Optional) Add game-day networks.** The field's Wi-Fi or your travel
+**4. (Optional) Add game-day networks.** The field's Wi-Fi or your travel
 router / phone hotspot. The encoder remembers up to three networks and
 automatically joins whichever one it finds — set it up at home, it just
 works at the field.
 
 > _[screenshot placeholder: setup step 2 — game-day network fields]_
 
-**4. Paste your YouTube stream key.** From YouTube Studio → **Go live** →
+**5. Paste your YouTube stream key.** From YouTube Studio → **Go live** →
 copy the Stream key (a bare key or the full `rtmps://` URL both work).
 You can skip this and add it later.
 
 > _[screenshot placeholder: setup step 3 — YouTube key field]_
 
-**5. Save.** The final screen shows two things — **write them down**:
-
-* your camera app's **RTMP URL**
-  (`rtmp://playcall-encoder.local:1935/live/<key>` plus an IP fallback),
-* your **settings PIN** for the settings page.
+**6. Save.** The final screen shows your camera app's **RTMP URL**
+(`rtmp://playcall-encoder.local:1935/live/<key>`, plus an IP fallback)
+and the box's **recovery PIN**. Neither needs writing down: the RTMP URL
+is on the Encoders card in PlayCall, always current as of the box's last
+heartbeat, and the PIN is behind the 🔑 button on that same card.
 
 The hotspot then disappears and the encoder joins your network.
 
@@ -174,8 +201,10 @@ Camera-app-specific walkthroughs (Mevo / Larix / OBS):
 
 ## Changing settings later
 
-Browse to **`http://playcall-encoder.local:8080`** from any device on the
-same network and enter your PIN. From there: view live status (camera
+**⚙ Settings** on the box's Encoders card in PlayCall opens its page
+already signed in — no PIN. Or browse to
+**`http://playcall-encoder.local:8080`** from any device on the same
+network and enter the recovery PIN. From there: view live status (camera
 receiving? pushing to YouTube?), add/remove Wi-Fi networks, update the
 YouTube key, adjust scorebug bandwidth, rotate the ingest key, copy a
 support log bundle, or factory reset.

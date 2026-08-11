@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Local settings/status app — http://playcall-encoder.local:8080.
 
-PIN-gated (the PIN shown on the final setup screen, stored in config).
+Reached one of two ways: the site's ⚙ Settings button, which signs the
+coach in with a one-time nonce, or directly at this address with the
+box's recovery PIN (stored in config) — the fallback for when the cloud
+link is the broken thing.
 Status: camera-ingest state, YouTube push state (+ cloud assignment when
 paired), a log viewer, and a "Copy logs for AI help" button that copies a
 structured plaintext bundle (config summary minus secrets + last 200 log
@@ -62,15 +65,18 @@ LOGIN_PAGE = """<!doctype html><html><head>
 <div class="card" style="max-width:340px">
   {% if error %}<div class="alert">{{ error }}</div>{% endif %}
   <form method="post" action="/login">
-    <label>Device PIN</label>
+    <label>Recovery PIN</label>
     <input type="password" name="pin" inputmode="numeric" autofocus
-           placeholder="6-digit PIN from setup">
+           placeholder="6-digit recovery PIN">
     <input type="hidden" name="next" value="{{ next or '' }}">
     <button class="btn" type="submit">Unlock</button>
   </form>
-  <p class="hint" style="margin-top:.75rem">The PIN was shown on the final
-     setup screen. Lost it? It's in /etc/playcall-encoder/config.json on
-     the SD card.</p>
+  <p class="hint" style="margin-top:.75rem">You usually don't need this.
+     On basebook.org, Score Bug Studio &rarr; Encoders &rarr;
+     <b>&#9881; Settings</b> opens this page already signed in.</p>
+  <p class="hint">Need the digits anyway? The same card has a
+     <b>&#128273; Recovery PIN</b> button. (Or read them out of
+     /etc/playcall-encoder/config.json on the SD card.)</p>
 </div></body></html>"""
 
 PAIR_PAGE = """<!doctype html><html><head>
@@ -243,10 +249,13 @@ STATUS_PAGE = """<!doctype html><html><head>
 </div>
 
 <div class="card">
-  <h2>Settings PIN</h2>
-  <p class="hint">Guards this page. Pick something you'll remember — 4–32
-    characters. You can also open this page with one click from PlayCall
-    (Score Bug Studio → Encoders → ⚙ Settings), which needs no PIN at all.</p>
+  <h2>Recovery PIN</h2>
+  <p class="hint">A fallback, not the front door: the normal way in is
+    Score Bug Studio → Encoders → ⚙ Settings, which signs you in with one
+    click and needs no PIN. This one is for reaching the box directly at
+    its own address — which is exactly what you do when the cloud link is
+    the thing that's broken. Pick something you'll remember, 4–32
+    characters.</p>
   <form method="post" action="/pin">
     <input type="password" name="pin" placeholder="New PIN" required>
     <input type="password" name="pin2" placeholder="Repeat it" required>

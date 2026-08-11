@@ -1,0 +1,28 @@
+[Unit]
+# Prebuilt-SD-image path: the software is already installed in the image,
+# so the only thing left is telling the box which team it belongs to. The
+# person flashing the card drops their activation code into
+# /boot/firmware/playcall-code.txt from any computer — no terminal, no
+# SSH, no typing on the Pi — and this unit spends it on the first boot
+# that has internet.
+#
+# It runs every boot on purpose. Once the box is paired the script exits
+# immediately, and a box with no code at all exits 2 (see below), so the
+# cost of leaving it enabled forever is nil.
+Description=PlayCall Encoder — redeem activation code from the boot partition
+After=network-online.target playcall-encoder.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# --retry: a card flashed at home and first powered on at the field has no
+# network for the first minute or two. Only unreachable-site failures are
+# retried; a wrong or already-spent code fails on the first try and stays
+# failed, because waiting cannot fix it.
+ExecStart=/usr/bin/python3 /opt/playcall-encoder/scripts/activate.py --retry=10
+# 2 = no code found, the normal state of a box that was never imaged this
+# way. Not a failure worth a red line in systemctl status.
+SuccessExitStatus=0 2
+
+[Install]
+WantedBy=multi-user.target

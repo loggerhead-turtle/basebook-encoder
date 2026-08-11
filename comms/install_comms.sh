@@ -113,7 +113,29 @@ fi
 # fails with br-connection-profile-unavailable. Lingering gives the
 # user a session at boot with no login; the comms service then runs AS
 # that user so speech routes into the same engine.
-RUNUSER="${SUDO_USER:-pi}"
+# WHOSE session. Current Raspberry Pi OS has no default 'pi' account —
+# the Imager makes you invent a username — so the old `${SUDO_USER:-pi}`
+# fallback pointed at a user that does not exist. `id -u` then failed
+# under `set -e` a dozen lines further down, in a block about PipeWire,
+# with nothing on screen about usernames. Resolve it in the open, and
+# say so plainly when we cannot.
+RUNUSER="${PLAYCALL_USER:-${SUDO_USER:-}}"
+if [ -z "$RUNUSER" ] || [ "$RUNUSER" = root ]; then
+  # `sudo bash install_comms.sh` sets SUDO_USER; a root shell or a
+  # systemd/cloud-init run does not. Fall back to the first real login
+  # account on the box (uid >= 1000), which on a Pi is the one the
+  # Imager created.
+  RUNUSER=$(getent passwd | awk -F: '$3>=1000 && $3<65534 {print $1; exit}')
+fi
+if [ -z "$RUNUSER" ] || ! id -u "$RUNUSER" >/dev/null 2>&1; then
+  echo "ERROR: could not work out which user account should own the audio" >&2
+  echo "session on this Pi. Bluetooth audio runs inside a login session, so" >&2
+  echo "this has to be a real account — the one you created in Raspberry Pi" >&2
+  echo "Imager, whatever you named it." >&2
+  echo >&2
+  echo "Re-run and name it:  sudo PLAYCALL_USER=yourusername bash pi/install_comms.sh" >&2
+  exit 1
+fi
 RUNUID=$(id -u "$RUNUSER")
 echo "── audio engine (PipeWire, headless session for $RUNUSER) ──"
 # A running session never re-reads its group list, and wireplumber only

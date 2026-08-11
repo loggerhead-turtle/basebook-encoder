@@ -31,6 +31,12 @@ DEFAULTS = {
     'youtube': {'url': DEFAULT_YOUTUBE_URL, 'key': ''},
     'cloud': {'base_url': '', 'api_key': '', 'feed_url': ''},
     'device': {'pin': '', 'name': 'PlayCall Encoder'},
+    # An activation code typed into the setup portal on a phone that was
+    # joined to this box's own hotspot — i.e. with no internet to spend it
+    # on yet. It waits here until the box joins a real network, then
+    # encoder.activation spends it and blanks this. Also the landing spot
+    # for a code taken off the boot partition of a prebuilt image.
+    'pending_code': '',
     'bandwidth': 0,
     'version_check': {'url': '', 'enabled': True},
 }
@@ -147,6 +153,9 @@ def redacted(cfg=None):
         cfg['cloud']['api_key'] = '********'
     if cfg['device'].get('pin'):
         cfg['device']['pin'] = '****'
+    if cfg.get('pending_code'):
+        # Unspent, and it pairs a box to a team — never in a log bundle.
+        cfg['pending_code'] = '********'
     cfg['version'] = __version__
     return cfg
 
