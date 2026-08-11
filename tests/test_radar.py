@@ -405,3 +405,108 @@ def test_peak_and_constant_glued_together_still_parse():
     # the well-spaced bench format is untouched
     assert parse_frame('RD   34C 537         5C 589 869     9A15650') == {
         'live': 53.7, 'peak': 58.9, 'rpm': 1565.0, 'alive': True}
+
+
+# ── constant-on guns: the failure that ate a game's velocities ─────────────
+#
+# FIELD REPORT. 66 pitches charted, 22,500 frames parsed at 100%, the
+# velocity tile correct all night — and SIX burst events reached the
+# cloud, every one of them classified 'throw'. The play-by-play had no
+# speeds on it at all.
+#
+# A Stalker in constant-on mode streams a frame many times a second
+# forever. Between pitches it reports live 0.0 while still LATCHING the
+# previous peak and rpm, so an idle frame arrives carrying three
+# non-None numbers. The old boundary test asked only "is any field
+# present", which is true of every frame the gun will ever send — so no
+# burst ever closed, and each one ran until the gun genuinely went
+# quiet: minutes long, past PITCH_MAX_DUR, filed as a throw.
+#
+# The live tile kept working throughout because it is pushed from a
+# different field, which is exactly why nobody noticed until the game
+# was over and the readings were gone.
+
+def _stalker_idle(peak=0.0, rpm=None):
+    """What the gun sends when nothing is moving: zero live, latched
+    peak and spin from the last pitch."""
+    return {'live': 0.0, 'peak': peak, 'rpm': rpm, 'alive': True}
+
+
+def _stalker_ball(mph, rpm=2100.0):
+    return {'live': mph, 'peak': mph, 'rpm': rpm, 'alive': True}
+
+
+def _stream(engine, t0, pitches, idle_s=6.0, hz=20.0):
+    """Feed a constant-on stream: idle frames, a short ball, idle again."""
+    out, t = [], t0
+    step = 1.0 / hz
+    latched_peak, latched_rpm = 0.0, None
+    for mph, rpm in pitches:
+        for _ in range(int(idle_s * hz)):
+            ev = engine.feed(_stalker_idle(latched_peak, latched_rpm), t)
+            if ev:
+                out.append(ev)
+            t += step
+        for _ in range(10):                     # ~0.5 s in the beam
+            ev = engine.feed(_stalker_ball(mph, rpm), t)
+            if ev:
+                out.append(ev)
+            t += step
+        latched_peak, latched_rpm = mph, rpm
+    for _ in range(int(idle_s * hz)):
+        ev = engine.feed(_stalker_idle(latched_peak, latched_rpm), t)
+        if ev:
+            out.append(ev)
+        t += step
+    ev = engine.flush(t + 5)
+    if ev:
+        out.append(ev)
+    return out
+
+
+def test_a_constant_on_gun_yields_one_burst_per_pitch():
+    from encoder.radar import BurstEngine
+    thrown = [(78.5, 2100.0), (71.2, 2450.0), (80.1, 1980.0),
+              (69.9, 2510.0), (77.4, 2050.0)]
+    evs = _stream(BurstEngine(), 1000.0, thrown)
+    assert len(evs) == len(thrown), \
+        f'expected one burst per pitch, got {len(evs)}'
+    assert [e['kind'] for e in evs] == ['pitch'] * len(thrown)
+    assert [e['peak'] for e in evs] == [mph for mph, _ in thrown]
+    assert [e['rpm'] for e in evs] == [rpm for _, rpm in thrown]
+
+
+def test_idle_frames_never_hold_a_burst_open():
+    """The specific regression: latched peak/rpm on a zero-live frame is
+    the gun saying nothing is happening, not a reading."""
+    from encoder.radar import BurstEngine
+    eng = BurstEngine()
+    t = 500.0
+    for _ in range(400):                        # 20 s of pure idle
+        assert eng.feed(_stalker_idle(78.5, 2100.0), t) is None
+        t += 0.05
+    assert eng.flush(t + 5) is None, 'idle alone produced a burst'
+
+
+def test_a_long_burst_is_still_a_throw():
+    """The duration rule has to keep working — a ball tracked across the
+    infield is not a pitch."""
+    from encoder.radar import BurstEngine
+    eng = BurstEngine()
+    t, out = 0.0, []
+    for _ in range(80):                         # 4 s in the beam
+        ev = eng.feed(_stalker_ball(64.0), t)
+        if ev:
+            out.append(ev)
+        t += 0.05
+    out.append(eng.flush(t + 5))
+    assert [e['kind'] for e in out if e] == ['throw']
+
+
+def test_the_plate_reading_is_the_last_live_speed_not_a_zero():
+    """`plate` used to be able to come back 0.0, because idle frames were
+    inside the burst and the last one won."""
+    from encoder.radar import BurstEngine
+    evs = _stream(BurstEngine(), 10.0, [(75.0, 2000.0)])
+    assert len(evs) == 1
+    assert evs[0]['plate'] == 75.0

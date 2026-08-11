@@ -125,13 +125,41 @@ class BurstEngine:
         self._frames = []            # (t, live, peak, rpm)
         self._last_value_t = None
 
+    @staticmethod
+    def _carries_a_ball(frame):
+        """Is something actually moving through the beam right now?
+
+        This is the whole burst boundary, and getting it wrong is silent
+        and total. A Stalker in constant-on mode streams a frame many
+        times a second forever, and between pitches it reports
+        `live 0.0` while still LATCHING the last peak and rpm — so a
+        frame that means "nothing is happening" arrives carrying three
+        non-None numbers.
+
+        Treating those as values kept every burst open. A whole game
+        came back as SIX bursts of 22,500 frames, each minutes long,
+        every one of them longer than PITCH_MAX_DUR and therefore filed
+        as a throw. The velocity tile looked perfect the entire time,
+        because the live reading is pushed separately — so the failure
+        was invisible until the play-by-play had no speeds on it.
+
+        `live` is the instantaneous reading and is authoritative when
+        present: zero means no ball. peak and rpm are latched, so they
+        may only speak for a frame that has no live field at all —
+        which is what keeps guns that report peak alone working.
+        """
+        if not frame:
+            return False
+        live = frame.get('live')
+        if live is not None:
+            return live > 0
+        return (frame.get('peak') or 0) > 0 or (frame.get('rpm') or 0) > 0
+
     def feed(self, frame, t=None):
         """Feed one parsed frame; returns a closed event dict or None."""
         t = time.monotonic() if t is None else t
         ev = None
-        has_value = frame and (frame.get('live') is not None
-                               or frame.get('peak') is not None
-                               or frame.get('rpm') is not None)
+        has_value = self._carries_a_ball(frame)
         if (self._frames and self._last_value_t is not None
                 and t - self._last_value_t > self.gap):
             ev = self._close()
