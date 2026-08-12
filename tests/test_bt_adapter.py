@@ -88,7 +88,8 @@ def box(tmp_path, monkeypatch):
         {'id': '0', 'dev': 'hci0', 'blocked': state['blocked']['hci0']},
         {'id': '1', 'dev': 'hci1', 'blocked': state['blocked']['hci1']}])
 
-    comms_ear.ADAPTER_ERR['no_permission'] = False
+    comms_ear.ADAPTER_ERR.update(no_permission=False,
+                                 did_not_take=False)
 
     def fake_rfkill(action, ident):
         if not state.get('allowed', True):
@@ -305,7 +306,27 @@ def test_a_working_install_says_nothing_about_permissions(box):
     comms_ear.enforce_adapter()
     html = comms_ear._adapter_card()
     assert 'not allowed' not in html
-    assert 'Unpin and try the other adapter' in html
+
+
+def test_a_pin_that_does_not_take_puts_every_radio_back(box):
+    """The vicious failure: the box comes up on a radio carrying none of
+    its pairings, with the earpiece it needs bonded to the one we just
+    switched off. Verify, then keep — or put it all back."""
+    box['aimed']['at'] = BUILTIN            # BlueZ ignores the pin
+    comms_ear.set_adapter_pref(DONGLE)
+    assert comms_ear.enforce_adapter() is None
+    assert box['blocked'] == {'hci0': False, 'hci1': False}
+    assert comms_ear.ADAPTER_ERR['did_not_take'] is True
+    assert 'left switched on' in comms_ear._adapter_card()
+
+
+def test_a_pin_that_takes_is_kept(box):
+    box['aimed']['at'] = DONGLE             # BlueZ followed the pin
+    comms_ear.set_adapter_pref(DONGLE)
+    got = comms_ear.enforce_adapter()
+    assert got and got['mac'] == DONGLE
+    assert box['blocked'] == {'hci0': True, 'hci1': False}
+    assert comms_ear.ADAPTER_ERR['did_not_take'] is False
 
 
 def test_rfkill_escalates_when_it_has_to(monkeypatch):
