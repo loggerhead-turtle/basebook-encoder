@@ -88,10 +88,15 @@ def box(tmp_path, monkeypatch):
         {'id': '0', 'dev': 'hci0', 'blocked': state['blocked']['hci0']},
         {'id': '1', 'dev': 'hci1', 'blocked': state['blocked']['hci1']}])
 
+    comms_ear.ADAPTER_ERR['no_permission'] = False
+
     def fake_rfkill(action, ident):
+        if not state.get('allowed', True):
+            return False              # "Operation not permitted"
         dev = {'0': 'hci0', '1': 'hci1'}[str(ident)]
         state['blocked'][dev] = (action == 'block')
         state['calls'].append((action, dev))
+        return True
     monkeypatch.setattr(comms_ear, '_rfkill', fake_rfkill)
     return state
 
@@ -267,3 +272,85 @@ def test_a_broken_picker_never_costs_the_box():
     body = src[src.index('def main():'):src.index('def main():') + 700]
     i = body.index('enforce_adapter()')
     assert 'try:' in body[:i] and 'except Exception' in body[i:]
+
+
+# ── when the box is not allowed to touch the radios ──────────────────────
+
+def test_a_refused_rfkill_is_noticed_not_swallowed(box):
+    """READING rfkill works as any user; WRITING needs root. That is what
+    made this so quiet — the card could print the block state perfectly
+    while every attempt to change it failed into output nothing read."""
+    box['allowed'] = False
+    comms_ear.set_adapter_pref(DONGLE)
+    comms_ear.enforce_adapter()
+    assert comms_ear.ADAPTER_ERR['no_permission'] is True
+    assert box['blocked'] == {'hci0': False, 'hci1': False}
+
+
+def test_the_card_names_the_permission_problem_not_a_wild_goose_chase(box):
+    """"Unpin and try the other adapter" is useless advice when the pin
+    was never applied at all — he would swap adapters forever."""
+    box['allowed'] = False
+    box['aimed']['at'] = BUILTIN
+    comms_ear.set_adapter_pref(DONGLE)
+    comms_ear.enforce_adapter()
+    html = comms_ear._adapter_card()
+    assert 'not allowed to power a radio down' in html
+    assert 'install_comms.sh' in html
+
+
+def test_a_working_install_says_nothing_about_permissions(box):
+    box['aimed']['at'] = BUILTIN
+    comms_ear.set_adapter_pref(DONGLE)
+    comms_ear.enforce_adapter()
+    html = comms_ear._adapter_card()
+    assert 'not allowed' not in html
+    assert 'Unpin and try the other adapter' in html
+
+
+def test_rfkill_escalates_when_it_has_to(monkeypatch):
+    tried = []
+
+    class _R:
+        def __init__(self, rc):
+            self.returncode = rc
+            self.stdout = self.stderr = ''
+
+    def fake_run(cmd, **k):
+        tried.append(cmd)
+        return _R(0 if cmd[:1] == ['sudo'] else 1)
+    monkeypatch.setattr(comms_ear.subprocess, 'run', fake_run)
+    assert comms_ear._rfkill('block', 0) is True
+    assert tried[0][0] == 'rfkill', 'plain first — no sudo when not needed'
+    assert tried[1][:3] == ['sudo', '-n', 'rfkill']
+
+
+def test_rfkill_reports_failure_when_even_sudo_is_refused(monkeypatch):
+    class _R:
+        returncode = 1
+        stdout = stderr = ''
+    monkeypatch.setattr(comms_ear.subprocess, 'run', lambda *a, **k: _R())
+    assert comms_ear._rfkill('block', 0) is False
+
+
+# ── the grant itself ─────────────────────────────────────────────────────
+
+def _installer():
+    return open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), 'comms', 'install_comms.sh')).read()
+
+
+def test_the_installer_grants_rfkill():
+    src = _installer()
+    assert '/usr/sbin/rfkill block' in src
+    assert '/usr/sbin/rfkill unblock' in src
+
+
+def test_the_grant_cannot_switch_off_the_box_s_own_network():
+    """A bare wildcard would also allow `rfkill block all`, which turns
+    the Wi-Fi off and takes the box off the network for good — from a
+    page reachable on the LAN behind a four-digit PIN."""
+    src = _installer()
+    assert 'rfkill block *' not in src
+    assert 'rfkill unblock *' not in src
+    assert 'rfkill block [0-9]*' in src

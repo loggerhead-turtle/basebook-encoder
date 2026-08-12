@@ -623,6 +623,9 @@ def do_update():
 # ambiguous about, and every existing call lands on the right radio
 # without knowing this code exists.
 
+ADAPTER_ERR = {'no_permission': False}
+
+
 def _rfkill_rows():
     """[{'id', 'dev', 'blocked'}] from rfkill, Bluetooth devices only."""
     out = []
@@ -641,11 +644,26 @@ def _rfkill_rows():
 
 
 def _rfkill(action, ident):
-    try:
-        subprocess.run(['rfkill', action, str(ident)],
-                       capture_output=True, text=True, timeout=6)
-    except Exception:
-        pass
+    """block/unblock a radio. True if it took.
+
+    READING rfkill works as any user; WRITING needs root, and that is
+    what made this so quiet. The picker could read the block state
+    perfectly, print it on the card, and fail every attempt to change it
+    with "Operation not permitted" into output nothing looked at —
+    subprocess.run does not raise on a non-zero exit, so the whole
+    failure was one unchecked returncode. The card said "picked" and the
+    radio never moved.
+    """
+    for cmd in (['rfkill', action, str(ident)],
+                ['sudo', '-n', 'rfkill', action, str(ident)]):
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               timeout=6)
+            if r.returncode == 0:
+                return True
+        except Exception:
+            continue
+    return False
 
 
 def _adapter_address(hci):
@@ -778,11 +796,20 @@ def _adapter_card():
     # Discovering that on your own, at a field, is an afternoon.
     mismatch = ''
     if want and actual and actual != want:
+        # Name the CAUSE where we know it. "Unpin and try the other one"
+        # is useless advice when the pin was never applied in the first
+        # place — the coach would swap adapters forever.
+        why = ('<b class="bad">The box is not allowed to power a radio '
+               'down on this install.</b> <span class="dim">Re-run '
+               '<code>install_comms.sh</code> (it grants exactly that and '
+               'nothing else), then pick the adapter again.</span>'
+               if ADAPTER_ERR.get('no_permission') else
+               '<span class="dim">Unpin and try the other adapter.</span>')
         mismatch = ('<b class="bad">⚠ BlueZ is still using a different '
                     'radio than the one picked.</b> <span class="dim">'
                     'Everything below — scans, pairing, the earpiece — is '
-                    'happening on ' + html.escape(actual) + '. Unpin and '
-                    'try the other adapter.</span><br>')
+                    'happening on ' + html.escape(actual) + '.</span> '
+                    + why + '<br>')
     note = mismatch + ('<span class="dim">Pinned — re-applied every time '
             'the box starts.<br>Pairings belong to the adapter: after a '
             'switch, put each bud back in pairing mode and pair it again.'
@@ -842,12 +869,16 @@ def enforce_adapter():
     found = [a for a in adapters() if a['mac'] == want]
     if not found:
         return None                    # dongle unplugged; leave BlueZ alone
+    ok = True
     for a in adapters():
         rid = ids.get(a['hci'])
         if rid is None:
+            ok = False
             continue
-        _rfkill('unblock' if a['mac'] == want else 'block', rid)
+        if not _rfkill('unblock' if a['mac'] == want else 'block', rid):
+            ok = False
     _bt('power', 'on')
+    ADAPTER_ERR['no_permission'] = not ok
     return found[0]
 
 
