@@ -981,12 +981,33 @@ def bt_scan():
     are the only things ACTUALLY in range and announcing themselves. So
     the page says which is which instead of running them together.
     """
-    _bt('power', 'on')
-    scan_out = _bt('--timeout', '12', 'scan', 'on', timeout=20)
+    # THE CHASER HAS TO STAND DOWN FOR THIS. bt_pair takes PAIRING['busy']
+    # and BT_LOCK for exactly this reason and bt_scan did not, so a
+    # 12-second discovery ran straight through the reconnect loop's
+    # `connect` attempts — and BlueZ will not run an inquiry and a
+    # connection on one controller at once. Discovery lost, silently: the
+    # error goes into output nobody parses and the scan returns the cache
+    # plus whatever BLE advertising leaked past.
+    #
+    # It only bites once a bud is PAIRED AND ABSENT, which is the exact
+    # state of a headset sitting in pairing mode waiting to be re-paired.
+    # The chaser wakes every 7 s and each connect can take 8, so it holds
+    # the controller more than half the time, forever, and the scan that
+    # would fix it can never see anything. Reported as "my headset says
+    # 'ready to pair' and then nothing... it is not the Bluetooth
+    # headset." It was not.
+    PAIRING['busy'] = True
+    try:
+        with BT_LOCK:
+            _bt('power', 'on')
+            scan_out = _bt('--timeout', '12', 'scan', 'on', timeout=20)
+            known_out = _bt('devices')
+    finally:
+        PAIRING['busy'] = False
     live = {m for m, _n in _dev_lines(scan_out, tag='NEW]')}
     found = {}
     for mac, name in (list(_dev_lines(scan_out, tag='NEW]'))
-                      + list(_dev_lines(_bt('devices')))):
+                      + list(_dev_lines(known_out))):
         if name.replace(':', '-').upper() == mac.replace(':', '-'):
             name = ''                       # "name" is just the MAC again
         found[mac] = name or found.get(mac, '')
@@ -1032,6 +1053,30 @@ def _paired_macs():
     return [m for m, _n in _paired_pairs()]
 
 
+_CHASE = {}          # mac -> [consecutive misses, next attempt (monotonic)]
+_CHASE_MAX = 120.0   # a bud walking back to the dugout is picked up inside
+#                      two minutes, which is faster than anyone notices
+
+
+def _chase_due(mac, now=None):
+    now = time.monotonic() if now is None else now
+    rec = _CHASE.get(mac.upper())
+    return True if not rec else now >= rec[1]
+
+
+def _chase_mark(mac, ok, now=None):
+    """Success resets to instant; misses back off 7 s, 14, 28... to two
+    minutes. Without this an earpiece left at home holds the controller
+    for eight seconds out of every fifteen, all day."""
+    now = time.monotonic() if now is None else now
+    key = mac.upper()
+    if ok:
+        _CHASE.pop(key, None)
+        return
+    misses = _CHASE.get(key, [0, 0.0])[0] + 1
+    _CHASE[key] = [misses, now + min(_CHASE_MAX, 7.0 * (2 ** (misses - 1)))]
+
+
 def reconnect_loop():
     """Buds walk to the dugout and back all game: when a labeled (or any
     paired) earpiece drops, chase it every few seconds so it's live again
@@ -1050,13 +1095,24 @@ def reconnect_loop():
             missing = sorted(want - connected)
             if not missing:
                 continue
+            # A bud that has gone home for the night is chased every 7 s
+            # for 8 s at a time, forever, and each attempt holds the
+            # controller — so an absent earpiece quietly costs half the
+            # radio and blocks the discovery that would replace it. Back
+            # off per bud after repeated misses; a bud walking back into
+            # range is still picked up within a couple of minutes, and
+            # any success resets it to instant.
+            due = [m for m in missing if _chase_due(m)]
+            if not due:
+                continue
             if not BT_LOCK.acquire(blocking=False):
                 continue                     # someone's pairing — stand down
             try:
-                for mac in missing:
+                for mac in due:
                     if PAIRING['busy']:
                         break
                     out = _bt('connect', mac, timeout=8)
+                    _chase_mark(mac, 'Connection successful' in out)
                     if 'profile-unavailable' in out:
                         _bounce_audio()        # self-heal, rate-limited
             finally:
