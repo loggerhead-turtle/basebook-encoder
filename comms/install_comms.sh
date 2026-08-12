@@ -166,9 +166,19 @@ wireplumber.profiles = {
 WPCONF
 chown -R "$RUNUSER" "$(getent passwd "$RUNUSER" | cut -d: -f6)/.config/wireplumber"
 
-# let the box reboot itself from its own admin page — no SSH at a field
-printf '%s ALL=(root) NOPASSWD: /usr/bin/systemctl reboot\n' "$RUNUSER" \
-  > /etc/sudoers.d/playcall-comms
+# let the box reboot itself from its own admin page — no SSH at a field,
+# and let it power a Bluetooth controller down. READING rfkill works as
+# any user, which is what made this so quiet: the admin page could show
+# the block state perfectly while every attempt to CHANGE it failed with
+# "Operation not permitted" into output nobody looked at. The adapter
+# picker said "picked" and nothing moved.
+{ printf '%s ALL=(root) NOPASSWD: /usr/bin/systemctl reboot\n' "$RUNUSER"
+  # numeric ids ONLY — this page is reachable on the LAN behind a PIN,
+  # and a bare wildcard would also grant `rfkill block all`, which turns
+  # the box's own Wi-Fi off and takes it off the network for good.
+  printf '%s ALL=(root) NOPASSWD: /usr/sbin/rfkill block [0-9]*, '\
+'/usr/sbin/rfkill unblock [0-9]*\n' "$RUNUSER"
+} > /etc/sudoers.d/playcall-comms
 chmod 440 /etc/sudoers.d/playcall-comms
 visudo -c -f /etc/sudoers.d/playcall-comms >/dev/null 2>&1 \
   || rm -f /etc/sudoers.d/playcall-comms
