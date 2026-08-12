@@ -731,8 +731,12 @@ def _adapter_card():
     rows = []
     for a in ads:
         live = (not a['blocked']) and (a['mac'] == want if want else None)
-        kind = ('USB dongle — external antenna' if a['usb']
-                else 'built-in radio')
+        # Say what we can SEE. Whether a dongle has an external antenna is
+        # not visible from here, and printing it because the coach said so
+        # when he ordered it turns the card into a mirror: the UB500 in
+        # this box is the nano model with an internal antenna, and the
+        # card was congratulating him on range he had not installed.
+        kind = 'USB dongle' if a['usb'] else 'built-in radio (Raspberry Pi)'
         tag = ''
         if a['mac'] == want:
             tag = ' <b class="ok">← in use</b>'
@@ -747,12 +751,17 @@ def _adapter_card():
             + f'{html.escape(kind)}<br>'
             + f'<span class="dim">{html.escape(a["hci"])} · '
             + f'{html.escape(a["mac"] or "?")}</span>{tag}</button></form>')
+    # BlueZ keys pairings by ADAPTER (/var/lib/bluetooth/<adapter>/<bud>),
+    # so changing adapters hands you an empty pairing list and a bud that
+    # will not show up in a scan unless it is put back into pairing mode.
+    # Discovering that on your own, at a field, is an afternoon.
     note = ('<span class="dim">Pinned — re-applied every time the box '
-            'starts.</span>' if want else
+            'starts.<br>Pairings belong to the adapter: after a switch, '
+            'put each bud back in pairing mode and pair it again.</span>'
+            if want else
             '<b class="warn">Not pinned.</b> <span class="dim">BlueZ picks '
             'one at boot and the choice changes between reboots, so the '
-            'external antenna is in use on some days and not others.'
-            '</span>')
+            'dongle is in use on some days and not others.</span>')
     return ('<div class="card">bluetooth adapter:<br>' + ''.join(rows)
             + note
             + ('<form method="post" action="/adapter" '
