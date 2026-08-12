@@ -63,8 +63,18 @@ def box(tmp_path, monkeypatch):
     """A two-controller box, with the kernel that stopped exposing
     /sys/class/bluetooth/hciN/address (which his does)."""
     monkeypatch.setattr(comms_ear, 'ADAPTER_FILE', str(tmp_path / 'adapter'))
-    monkeypatch.setattr(comms_ear, '_bt',
-                        lambda *a, **k: BT_LIST if a[:1] == ('list',) else '')
+    # `show` reports the controller bluetoothctl is really aimed at; the
+    # fixture lets a test move it independently of the pin, because on
+    # this box they have been seen to disagree.
+    aimed = {'at': DONGLE}
+
+    def fake_bt(*a, **k):
+        if a[:1] == ('list',):
+            return BT_LIST
+        if a[:1] == ('show',):
+            return f'Controller {aimed["at"]} (public)\n\tPowered: yes\n'
+        return ''
+    monkeypatch.setattr(comms_ear, '_bt', fake_bt)
     monkeypatch.setattr(os, 'listdir', lambda p: ['hci0', 'hci1'])
     monkeypatch.setattr(os.path, 'realpath', lambda p: SYSFS[p.split('/')[-1]])
     # his kernel: sysfs has no address, BlueZ over D-Bus does — and it maps
@@ -72,7 +82,8 @@ def box(tmp_path, monkeypatch):
     # first, which is exactly the trap
     monkeypatch.setattr(comms_ear, '_adapter_address',
                         lambda hci: {'hci0': BUILTIN, 'hci1': DONGLE}[hci])
-    state = {'blocked': {'hci0': False, 'hci1': False}, 'calls': []}
+    state = {'blocked': {'hci0': False, 'hci1': False}, 'calls': [],
+             'aimed': aimed}
     monkeypatch.setattr(comms_ear, '_rfkill_rows', lambda: [
         {'id': '0', 'dev': 'hci0', 'blocked': state['blocked']['hci0']},
         {'id': '1', 'dev': 'hci1', 'blocked': state['blocked']['hci1']}])
@@ -200,8 +211,36 @@ def test_an_unpinned_box_is_told_why_that_is_a_problem(box):
 def test_a_pinned_box_shows_which_one_is_live(box):
     comms_ear.set_adapter_pref(DONGLE)
     html = comms_ear._adapter_card()
-    assert 'in use' in html
+    assert '← in use' in html
+    assert 'NOT the one in use' not in html
     assert 'unpin' in html, 'and a way back out'
+
+
+def test_in_use_is_read_from_bluez_not_assumed_from_the_pin(box):
+    """Powering the others down is meant to leave BlueZ no choice, and it
+    is not quite a guarantee — this box printed a controller as [default]
+    while that same controller read PowerState: off-blocked. If the card
+    says "in use" about a radio nothing is using, every other reading on
+    the page is a lie."""
+    comms_ear.set_adapter_pref(DONGLE)
+    box['aimed']['at'] = BUILTIN            # BlueZ ignored the pin
+    html = comms_ear._adapter_card()
+    assert 'NOT the one in use' in html
+    assert 'BlueZ is still using a different radio' in html
+    assert BUILTIN in html
+
+
+def test_unpinning_powers_the_other_radio_back_up(box):
+    """The escape hatch has to actually escape. Returning early left the
+    radios exactly as the last pin had powered them, so "let BlueZ
+    choose" handed BlueZ one choice — and the coach tapping it is a coach
+    trying to get back to the setup that worked yesterday."""
+    comms_ear.set_adapter_pref(DONGLE)
+    comms_ear.enforce_adapter()
+    assert box['blocked'] == {'hci0': True, 'hci1': False}
+    comms_ear.set_adapter_pref('')
+    comms_ear.enforce_adapter()
+    assert box['blocked'] == {'hci0': False, 'hci1': False}
 
 
 def test_the_button_posts_the_mac(box):
