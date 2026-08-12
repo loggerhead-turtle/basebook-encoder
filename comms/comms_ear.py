@@ -623,7 +623,7 @@ def do_update():
 # ambiguous about, and every existing call lands on the right radio
 # without knowing this code exists.
 
-ADAPTER_ERR = {'no_permission': False}
+ADAPTER_ERR = {'no_permission': False, 'did_not_take': False}
 
 
 def _rfkill_rows():
@@ -804,6 +804,11 @@ def _adapter_card():
                '<code>install_comms.sh</code> (it grants exactly that and '
                'nothing else), then pick the adapter again.</span>'
                if ADAPTER_ERR.get('no_permission') else
+               '<b class="bad">The pin would not take, so every radio was '
+               'left switched on rather than stranding the box on one that '
+               'carries none of its pairings.</b> <span class="dim">Unpin '
+               'and use the adapter shown as in use.</span>'
+               if ADAPTER_ERR.get('did_not_take') else
                '<span class="dim">Unpin and try the other adapter.</span>')
         mismatch = ('<b class="bad">⚠ BlueZ is still using a different '
                     'radio than the one picked.</b> <span class="dim">'
@@ -879,6 +884,20 @@ def enforce_adapter():
             ok = False
     _bt('power', 'on')
     ADAPTER_ERR['no_permission'] = not ok
+    # VERIFY, THEN KEEP. Powering the others down is meant to leave BlueZ
+    # no choice and is not a guarantee — and the failure mode is vicious:
+    # the box comes up on a radio that carries none of its pairings, with
+    # the earpiece it needs bonded to the radio we just switched off. So
+    # if the pin did not actually take, put every radio back rather than
+    # stranding the box somewhere it cannot hear its own bud.
+    if ok and active_adapter() not in ('', want):
+        for a in adapters():
+            if ids.get(a['hci']) is not None:
+                _rfkill('unblock', ids[a['hci']])
+        _bt('power', 'on')
+        ADAPTER_ERR['did_not_take'] = True
+        return None
+    ADAPTER_ERR['did_not_take'] = False
     return found[0]
 
 
@@ -982,6 +1001,44 @@ def bt_status():
     return st
 
 
+_MAC_RE = r'((?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2})'
+
+
+def _live_macs(text):
+    """MACs that ANSWERED this scan.
+
+    `[NEW]` was used for this and does not mean it. BlueZ prints [NEW]
+    when it CREATES the D-Bus object for a device — the first time it
+    ever meets it. A device it already has an object for answers the very
+    same scan with
+
+        [CHG] Device 60:AB:D2:11:22:33 RSSI: -47
+
+    and every one of those lines was being thrown away. Objects persist
+    for every PAIRED device forever, and for anything else until
+    bluetoothd purges it a while after discovery stops — so a bud you
+    paired yesterday, or a fridge you scanned ten minutes ago, can never
+    be [NEW] again. It reads as "nothing answered" while the thing is
+    shouting from two feet away, and it explains why this worked the day
+    it was set up and never afterwards.
+
+    RSSI is the right evidence: it only arrives on an actual
+    advertisement or inquiry response, so it means "heard, just now" in a
+    way that no other property change does.
+    """
+    live = set()
+    for line in (text or '').splitlines():
+        if 'NEW]' in line:
+            m = re.search('Device ' + _MAC_RE, line)
+            if m:
+                live.add(m.group(1).upper())
+        elif 'CHG]' in line and 'RSSI' in line:
+            m = re.search('Device ' + _MAC_RE, line)
+            if m:
+                live.add(m.group(1).upper())
+    return live
+
+
 def _dev_lines(text, tag=None):
     """(mac, name) pairs from bluetoothctl output. tag filters to lines
     carrying it (e.g. 'NEW]' from a live scan) so RSSI/UUID change
@@ -1035,7 +1092,7 @@ def bt_scan():
             known_out = _bt('devices')
     finally:
         PAIRING['busy'] = False
-    live = {m for m, _n in _dev_lines(scan_out, tag='NEW]')}
+    live = _live_macs(scan_out)
     found = {}
     for mac, name in (list(_dev_lines(scan_out, tag='NEW]'))
                       + list(_dev_lines(known_out))):
@@ -1232,17 +1289,35 @@ def _pair_seq(mac):
 
 def bt_autopair():
     """⚡ One tap while the bud flashes: watch the live scan and pair the
-    FIRST new audio-capable device the instant it appears — no list to
-    read, no MAC to recognize, no racing the bud's pairing-mode timeout
-    (a failed attempt knocks most buds out of pairing mode, so speed is
-    the whole game)."""
+    FIRST audio-capable device that answers — no list to read, no MAC to
+    recognize, no racing the bud's pairing-mode timeout (a failed attempt
+    knocks most buds out of pairing mode, so speed is the whole game).
+
+    'ANSWERS' used to mean a [NEW] line, and a bud you have paired before
+    can never produce one — BlueZ keeps its object forever, so it reports
+    [CHG] … RSSI instead. This watched for a line that would never come,
+    timed out, and said "no new earbud appeared — is it flashing in
+    pairing mode?" to a coach holding a flashing earbud. Re-pairing the
+    bud you already own is the single most common thing anyone does on
+    this page, and it was the one case that could not work.
+
+    A bud already bonded but NOT connected is a stale bond — usually the
+    reason the coach is here — so the bond is dropped and rebuilt. One
+    that is CONNECTED is a working earpiece and is left alone.
+    """
     PAIRING['busy'] = True
     scanner = None
     try:
         with BT_LOCK:
             _bt('power', 'on')
             _bt('pairable', 'on')
-            known = set(_paired_macs())
+            bonded = {m.upper() for m in _paired_macs()}
+            busy = {d['mac'].upper()
+                    for d in (bt_status().get('connected') or [])}
+            # [CHG] lines carry no name, so keep the adapter's own list to
+            # look one up — and a bud that has been seen before always has
+            # a name there.
+            names = {m: n for m, n in _dev_lines(_bt('devices'))}
             try:
                 scanner = subprocess.Popen(
                     ['bluetoothctl', '--timeout', '30', 'scan', 'on'],
@@ -1257,17 +1332,19 @@ def bt_autopair():
                 if not line:
                     time.sleep(0.2)
                     continue
-                if 'NEW]' not in line:
+                heard = _live_macs(line)
+                if not heard:
                     continue
-                m = re.search(r'Device ((?:[0-9A-Fa-f]{2}:){5}'
-                              r'[0-9A-Fa-f]{2}) ?(.*)', line)
-                if not m:
-                    continue
-                mac = m.group(1).upper()
-                name = (m.group(2) or '').strip()
-                if mac in known or not name:
-                    continue
-                if name.replace(':', '-').upper() == mac.replace(':', '-'):
+                mac = heard.pop()
+                if mac in busy:
+                    continue                     # a working earpiece
+                m = re.search('Device ' + _MAC_RE + ' ?(.*)', line)
+                name = ((m.group(2) or '').strip() if m else '')
+                if name.replace(':', '-').upper() == mac.replace(':', '-') \
+                        or 'RSSI' in name or 'TxPower' in name:
+                    name = ''                    # a property, not a name
+                name = name or names.get(mac, '')
+                if not name:
                     continue                     # unnamed so far — wait
                 up = name.upper()
                 if up.endswith('-BLE') or up.endswith(' LE'):
@@ -1275,9 +1352,12 @@ def bt_autopair():
                 target = (mac, name)
                 break
             if not target:
-                return ('no new earbud appeared — is it flashing in '
-                        'pairing mode? (tap ⚡ again the moment it is)')
+                return ('nothing answered — is it flashing in pairing '
+                        'mode? (tap ⚡ again the moment it is)')
             mac, name = target
+            if mac in bonded:
+                # the bond it is refusing to honour, out of the way first
+                _bt('remove', mac)
             return f'🎧 {name}: ' + _pair_seq(mac)
     finally:
         if scanner:
