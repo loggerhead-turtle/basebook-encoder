@@ -171,7 +171,24 @@ def test_the_card_is_not_drawn_when_there_is_nothing_to_choose(monkeypatch):
 def test_the_card_offers_both_and_says_which_is_the_dongle(box):
     html = comms_ear._adapter_card()
     assert DONGLE in html and BUILTIN in html
-    assert 'external antenna' in html and 'built-in radio' in html
+    assert 'USB dongle' in html and 'built-in radio' in html
+
+
+def test_the_card_never_claims_an_antenna_it_cannot_see(box):
+    """Whether a dongle has an external antenna is not visible from
+    here. The UB500 in his box is the nano model with an internal one,
+    and the card was congratulating him on range he had not installed."""
+    assert 'external antenna' not in comms_ear._adapter_card()
+
+
+def test_a_pinned_box_is_warned_that_its_pairings_did_not_come_along(box):
+    """BlueZ keys pairings by adapter, so switching hands you an empty
+    list and a bud that will not appear in a scan until it is put back
+    into pairing mode. Discovering that at a field is an afternoon."""
+    comms_ear.set_adapter_pref(DONGLE)
+    html = comms_ear._adapter_card()
+    assert 'Pairings belong to the adapter' in html
+    assert 'pairing mode' in html
 
 
 def test_an_unpinned_box_is_told_why_that_is_a_problem(box):
