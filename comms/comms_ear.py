@@ -713,7 +713,13 @@ def adapters():
     except Exception:
         names = []
     for hci in names:
-        if not hci.startswith('hci'):
+        # hciN and nothing else. /sys/class/bluetooth also carries child
+        # nodes like 'hci0:2' — an rfcomm/LE sub-device, not a radio —
+        # and a startswith('hci') let one through as a second adapter
+        # with no MAC. The card then drew "USB dongle · hci0:2 · ?" and
+        # flagged it in red as picked-but-not-in-use: an invented fault,
+        # on the one page a coach consults when something is wrong.
+        if not re.fullmatch(r'hci\d+', hci):
             continue
         path = ''
         try:
