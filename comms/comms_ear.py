@@ -720,6 +720,23 @@ def adapters():
     return out
 
 
+def active_adapter():
+    """The controller bluetoothctl is ACTUALLY talking to, by MAC.
+
+    Powering the others down is meant to leave it no choice, and it is
+    not quite a guarantee: this box has printed a controller as
+    `[default]` while that same controller read `PowerState: off-blocked`.
+    So the pin is a request, and this is the answer — without it the card
+    can say "in use" about a radio that nothing is using, which is the
+    one failure that makes every other reading on the page a lie.
+    """
+    for line in _bt('show').splitlines():
+        f = line.split()
+        if len(f) >= 2 and f[0] == 'Controller':
+            return f[1].upper()
+    return ''
+
+
 def _adapter_card():
     """The radio picker. Only drawn when there is a choice to make — one
     controller is the normal box, and a card offering to pick it would be
@@ -728,18 +745,22 @@ def _adapter_card():
     if len(ads) < 2:
         return ''
     want = adapter_pref()
+    actual = active_adapter()
     rows = []
     for a in ads:
-        live = (not a['blocked']) and (a['mac'] == want if want else None)
         # Say what we can SEE. Whether a dongle has an external antenna is
         # not visible from here, and printing it because the coach said so
         # when he ordered it turns the card into a mirror: the UB500 in
         # this box is the nano model with an internal antenna, and the
         # card was congratulating him on range he had not installed.
         kind = 'USB dongle' if a['usb'] else 'built-in radio (Raspberry Pi)'
+        # "In use" is now READ, not assumed. The pin is a request; this
+        # is the answer, and they can disagree — see active_adapter().
         tag = ''
-        if a['mac'] == want:
+        if a['mac'] and a['mac'] == actual:
             tag = ' <b class="ok">← in use</b>'
+        elif a['mac'] == want:
+            tag = ' <b class="bad">← picked, but NOT the one in use</b>'
         elif a['blocked']:
             tag = ' <span class="dim">(powered down)</span>'
         rows.append(
@@ -755,9 +776,17 @@ def _adapter_card():
     # so changing adapters hands you an empty pairing list and a bud that
     # will not show up in a scan unless it is put back into pairing mode.
     # Discovering that on your own, at a field, is an afternoon.
-    note = ('<span class="dim">Pinned — re-applied every time the box '
-            'starts.<br>Pairings belong to the adapter: after a switch, '
-            'put each bud back in pairing mode and pair it again.</span>'
+    mismatch = ''
+    if want and actual and actual != want:
+        mismatch = ('<b class="bad">⚠ BlueZ is still using a different '
+                    'radio than the one picked.</b> <span class="dim">'
+                    'Everything below — scans, pairing, the earpiece — is '
+                    'happening on ' + html.escape(actual) + '. Unpin and '
+                    'try the other adapter.</span><br>')
+    note = mismatch + ('<span class="dim">Pinned — re-applied every time '
+            'the box starts.<br>Pairings belong to the adapter: after a '
+            'switch, put each bud back in pairing mode and pair it again.'
+            '</span>'
             if want else
             '<b class="warn">Not pinned.</b> <span class="dim">BlueZ picks '
             'one at boot and the choice changes between reboots, so the '
@@ -799,12 +828,20 @@ def enforce_adapter():
     a human taps a button is a preference that is wrong every morning.
     """
     want = adapter_pref()
+    ids = {r['dev']: r['id'] for r in _rfkill_rows()}
     if not want:
+        # UNPINNING HAS TO UNDO THE PINNING. Returning early left the
+        # radios exactly as the last pin had powered them, so "let BlueZ
+        # choose" handed BlueZ one choice — and the coach who taps it is
+        # a coach trying to get back to the setup that worked.
+        for a in adapters():
+            if ids.get(a['hci']) is not None:
+                _rfkill('unblock', ids[a['hci']])
+        _bt('power', 'on')
         return None
     found = [a for a in adapters() if a['mac'] == want]
     if not found:
         return None                    # dongle unplugged; leave BlueZ alone
-    ids = {r['dev']: r['id'] for r in _rfkill_rows()}
     for a in adapters():
         rid = ids.get(a['hci'])
         if rid is None:
