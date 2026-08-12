@@ -75,7 +75,10 @@ def box(tmp_path, monkeypatch):
             return f'Controller {aimed["at"]} (public)\n\tPowered: yes\n'
         return ''
     monkeypatch.setattr(comms_ear, '_bt', fake_bt)
-    monkeypatch.setattr(os, 'listdir', lambda p: ['hci0', 'hci1'])
+    # the real /sys/class/bluetooth also carries child nodes
+    monkeypatch.setattr(os, 'listdir',
+                        lambda p: ['hci0', 'hci0:2', 'hci1',
+                                   'hci1:12'])
     monkeypatch.setattr(os.path, 'realpath', lambda p: SYSFS[p.split('/')[-1]])
     # his kernel: sysfs has no address, BlueZ over D-Bus does — and it maps
     # hci0 to the BUILT-IN radio even though bluetoothctl lists the dongle
@@ -375,3 +378,13 @@ def test_the_grant_cannot_switch_off_the_box_s_own_network():
     assert 'rfkill block *' not in src
     assert 'rfkill unblock *' not in src
     assert 'rfkill block [0-9]*' in src
+
+
+def test_child_nodes_are_not_mistaken_for_radios(box):
+    """/sys/class/bluetooth carries entries like 'hci0:2' — an rfcomm/LE
+    sub-device, not a controller. One slipped through as a second adapter
+    with no MAC, and the card drew it in red as picked-but-not-in-use: an
+    invented fault, on the page a coach reads when something is wrong."""
+    got = [a['hci'] for a in comms_ear.adapters()]
+    assert got == ['hci0', 'hci1']
+    assert all(a['mac'] for a in comms_ear.adapters()), 'no MAC-less ghosts'
