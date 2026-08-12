@@ -932,16 +932,29 @@ def bt_scan():
     Bluetooth share one antenna, so short scans miss. Devices come from
     BOTH the scan's own [NEW] lines and the adapter list afterwards, and
     UNNAMED devices stay in (a bud often advertises its name a scan or
-    two later); they show by MAC and are still pairable."""
+    two later); they show by MAC and are still pairable.
+
+    `live` separates those two sources, and it matters more than it
+    looks. `bluetoothctl devices` is the adapter's CACHE — every device
+    that radio has ever seen, kept in /var/lib/bluetooth/<adapter>/cache
+    — so a box that has sat in a house for months lists the neighbours'
+    phones and televisions whether or not they are here today. Pinning a
+    new adapter empties that cache, the list drops from ten devices to
+    two, and it reads as a radio that has gone deaf. It hasn't: those two
+    are the only things ACTUALLY in range and announcing themselves. So
+    the page says which is which instead of running them together.
+    """
     _bt('power', 'on')
     scan_out = _bt('--timeout', '12', 'scan', 'on', timeout=20)
+    live = {m for m, _n in _dev_lines(scan_out, tag='NEW]')}
     found = {}
     for mac, name in (list(_dev_lines(scan_out, tag='NEW]'))
                       + list(_dev_lines(_bt('devices')))):
         if name.replace(':', '-').upper() == mac.replace(':', '-'):
             name = ''                       # "name" is just the MAC again
         found[mac] = name or found.get(mac, '')
-    return [{'mac': m, 'name': n} for m, n in found.items()]
+    return [{'mac': m, 'name': n, 'live': m in live}
+            for m, n in found.items()]
 
 
 def _bt_tail(out):
@@ -1313,6 +1326,10 @@ def _page_body(q):
     b.append(_adapter_card())
     if q.get('scanned'):
         devs = bt_scan()
+        # Answering just now is the only evidence that matters. The rest
+        # are this adapter's memory of devices it met once, which is not
+        # the same claim at all and used to be printed as though it were.
+        devs.sort(key=lambda d: (not d['live'], (d['name'] or '~').lower()))
         named = [d for d in devs if d['name']]
         anon = [d for d in devs if not d['name']]
         # the -BLE twin pairs fine and carries NO audio — steer around it
@@ -1321,8 +1338,12 @@ def _page_body(q):
         good = [d for d in named if d not in ble]
         rows = ''.join(
             f'<form method="post" action="/pair" style="margin:.2rem 0">'
-            f'<button class="go" name="mac" value="{d["mac"]}">🎧 Pair '
-            f'{html.escape(d["name"])}</button></form>'
+            f'<button class="{"go" if d["live"] else ""}" name="mac" '
+            f'value="{d["mac"]}">🎧 Pair '
+            f'{html.escape(d["name"])}</button>'
+            + ('' if d['live'] else '<span class="dim"> · remembered, '
+                                    'not answering now</span>')
+            + '</form>'
             for d in good)
         rows += ''.join(
             f'<form method="post" action="/pair" style="margin:.2rem 0">'
@@ -1334,19 +1355,35 @@ def _page_body(q):
         rows += ''.join(
             f'<form method="post" action="/pair" style="margin:.2rem 0">'
             f'<button name="mac" value="{d["mac"]}">🎧 Pair unnamed '
-            f'device {html.escape(d["mac"])}</button></form>'
+            f'device {html.escape(d["mac"])}</button>'
+            + ('' if d['live'] else '<span class="dim"> · remembered, '
+                                    'not answering now</span>')
+            + '</form>'
             for d in anon)
         if not devs:
             rows = ('<span class="dim">nothing found — is the bud in '
                     'pairing mode (flashing)?</span>')
+        nlive = sum(1 for d in devs if d['live'])
+        nold = len(devs) - nlive
+        tally = (f'<span class="dim">{nlive} answered this scan'
+                 + (f' · {nold} remembered from before (marked ·)'
+                    if nold else '')
+                 + '</span><br>')
+        # A bud that is merely REMEMBERED cannot be paired — it is not
+        # here. Saying so beats a coach tapping it and reading a timeout.
         b.append(
-            f'<div class="card"><b>Found nearby:</b><br>{rows}'
+            f'<div class="card"><b>Found nearby:</b><br>{tally}{rows}'
             '<form method="post" action="/scan" style="margin-top:.5rem">'
             '<button class="go">🔍 Scan again</button></form>'
             '<span class="dim">each scan runs ~12 s; WiFi and Bluetooth '
             'share the Pi\'s antenna, so 2–3 scans is normal. A bud '
             'showing as "unnamed device" is usually yours — its name '
-            'often arrives a scan later.</span></div>')
+            'often arrives a scan later.<br><br>'
+            'Only earpieces in PAIRING MODE answer a scan — ordinary '
+            'Bluetooth kit is invisible unless it is flashing, so a short '
+            'list is normal and is not the radio. And a freshly pinned '
+            'adapter has met nobody yet, so it lists only what is here '
+            'right now.</span></div>')
     else:
         b.append('<div class="card">'
                  '<form method="post" action="/autopair">'
