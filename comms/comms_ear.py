@@ -102,6 +102,7 @@ HOSTNAME = socket.gethostname()
 # writable once privileges drop, and these are field preferences anyway.
 NAME_FILE = os.path.expanduser('~/.playcall-comms-name')
 EARS_FILE = os.path.expanduser('~/.playcall-comms-ears.json')
+ADAPTER_FILE = os.path.expanduser('~/.playcall-comms-adapter')
 
 
 def box_name():
@@ -149,6 +150,44 @@ def _lan_ip():
 
 # ── cloud poll + speech ──────────────────────────────────────────────────
 
+_HDR_PLAIN = {'—': '-', '–': '-', '…': '...',
+              '‘': "'", '’': "'", '“': '"', '”': '"',
+              ' ': ' '}
+
+
+def hdr(v, limit=120):
+    """A value safe to put in an HTTP header. Never raises.
+
+    HTTP header values are latin-1 (http.client encodes them that way),
+    and ONE character outside it raises UnicodeEncodeError at send time —
+    which does not fail that header, it fails the whole request. The box
+    then reports `cloud: unreachable` and stays off the cloud for as long
+    as the offending text is on screen.
+
+    Three of the strings this box reports about ITSELF were unsendable:
+    'starting…', 'answered — connecting…', and '🎙 LIVE — coach linked'.
+    The last one is the worst of them — the box dropped off the cloud for
+    exactly as long as a coach was talking to his catcher.
+
+    And the ear names are worse still, because they are not ours: a
+    Bluetooth device carries whatever name a phone gave it, and iOS names
+    them "Erik's AirPods" with a curly apostrophe (U+2019). Pairing a bud
+    could take the box off the cloud until somebody renamed it.
+
+    So: fold the punctuation that has a plain equivalent, drop anything
+    else that will not encode, and strip control characters — a device
+    name is somebody else's text arriving in a header, and CR/LF in there
+    is header injection, not a typo.
+    """
+    s = str(v if v is not None else '')
+    for a, b in _HDR_PLAIN.items():
+        s = s.replace(a, b)
+    s = s.encode('latin-1', 'ignore').decode('latin-1')
+    s = ''.join(c for c in s if c == ' ' or 33 <= ord(c) <= 126
+                or 160 <= ord(c) <= 255)
+    return s[:limit].strip()
+
+
 def fetch():
     global NONCE
     # The box reports its OWN readiness on every poll — earpiece
@@ -165,16 +204,27 @@ def fetch():
             ears.append(lab or d.get('name') or 'bud')
     except Exception:
         pass
-    req = urllib.request.Request(
-        BASE + '/api/sk/device/comms',
-        headers={'X-Api-Key': KEY, 'Authorization': 'Bearer ' + KEY,
-                 'X-Pi-Hostname': HOSTNAME, 'X-Pi-Ip': _lan_ip(),
-                 'X-Pi-Comms-Port': str(PORT),
-                 'X-Pi-Name': box_name()[:40],
-                 'X-Pi-Ears': ','.join(ears)[:120],
-                 'X-Pi-Voice': str(RTC_STATE.get('s', ''))[:60]})
-    with urllib.request.urlopen(req, timeout=6) as r:
-        d = json.load(r)
+    auth = {'X-Api-Key': KEY, 'Authorization': 'Bearer ' + KEY}
+    told = {'X-Pi-Hostname': hdr(HOSTNAME, 60), 'X-Pi-Ip': hdr(_lan_ip(), 45),
+            'X-Pi-Comms-Port': hdr(PORT, 8),
+            'X-Pi-Name': hdr(box_name(), 40),
+            'X-Pi-Ears': hdr(','.join(ears), 120),
+            'X-Pi-Voice': hdr(RTC_STATE.get('s', ''), 60)}
+
+    def _get(headers):
+        req = urllib.request.Request(BASE + '/api/sk/device/comms',
+                                     headers=headers)
+        with urllib.request.urlopen(req, timeout=6) as r:
+            return json.load(r)
+
+    try:
+        d = _get(dict(auth, **told))
+    except UnicodeEncodeError:
+        # hdr() should have made this impossible. If something still gets
+        # through, the box telling the cloud about itself is the part we
+        # give up — never the part where it collects the coach's calls.
+        # Telemetry may not be allowed to break the control path.
+        d = _get(auth)
     # captured every poll; cleared when the cloud stops offering one
     NONCE = d.get('login_nonce') or None
     return d
@@ -554,6 +604,205 @@ def do_update():
     if 'Already up to date' in (r.stdout or ''):
         return False, '✓ already up to date (' + code_version() + ')'
     return True, '✓ updated to ' + code_version()
+
+
+# ── which radio ──────────────────────────────────────────────────────────
+#
+# A box with a USB dongle plugged in has TWO Bluetooth controllers, and
+# every bluetoothctl call here runs against BlueZ's "default" one. That
+# default is not stable: on this box it was the dongle before a reboot
+# and the built-in radio after, with nothing changed in between. So a
+# coach who buys a dongle for the external antenna gets the antenna on
+# some boots and not others, and cannot tell which — the range is just
+# worse sometimes.
+#
+# bluetoothctl has no per-invocation adapter flag (`select` lasts one
+# interactive session and every call here is one-shot), so pinning is done
+# the only way that holds for all of them: POWER DOWN the adapters we did
+# not choose. One controller up means "default" has nothing to be
+# ambiguous about, and every existing call lands on the right radio
+# without knowing this code exists.
+
+def _rfkill_rows():
+    """[{'id', 'dev', 'blocked'}] from rfkill, Bluetooth devices only."""
+    out = []
+    try:
+        r = subprocess.run(['rfkill', '--noheadings', '--output',
+                            'ID,DEVICE,TYPE,SOFT'],
+                           capture_output=True, text=True, timeout=6)
+        for line in (r.stdout or '').splitlines():
+            f = line.split()
+            if len(f) >= 4 and f[2] == 'bluetooth':
+                out.append({'id': f[0], 'dev': f[1],
+                            'blocked': f[3] == 'blocked'})
+    except Exception:
+        pass
+    return out
+
+
+def _rfkill(action, ident):
+    try:
+        subprocess.run(['rfkill', action, str(ident)],
+                       capture_output=True, text=True, timeout=6)
+    except Exception:
+        pass
+
+
+def _adapter_address(hci):
+    """The MAC of hciN. '' if it cannot be established.
+
+    sysfs used to publish this and on his kernel no longer does —
+    /sys/class/bluetooth/hci0/address is 'No such file or directory'. BlueZ
+    still knows, and its D-Bus object paths ARE the controller indices, so
+    /org/bluez/hci1's Address property is an exact answer where reading
+    `bluetoothctl list` and pairing it up by order is a guess.
+    """
+    try:
+        return open(f'/sys/class/bluetooth/{hci}/address').read().strip().upper()
+    except Exception:
+        pass
+    try:
+        r = subprocess.run(['busctl', '--system', 'get-property', 'org.bluez',
+                            '/org/bluez/' + hci, 'org.bluez.Adapter1',
+                            'Address'], capture_output=True, text=True,
+                           timeout=6)
+        # → s "AC:A7:F1:29:A9:29"
+        parts = (r.stdout or '').strip().split('"')
+        if len(parts) >= 2 and ':' in parts[1]:
+            return parts[1].strip().upper()
+    except Exception:
+        pass
+    return ''
+
+
+def adapters():
+    """Every Bluetooth controller on the box, with enough to choose by.
+
+    `usb` is read from the sysfs device path rather than the name or the
+    MAC: a dongle hangs off a USB bus and the Pi's own radio hangs off the
+    SoC's serial line, and that is the one difference no vendor can get
+    wrong.
+    """
+    macs = {}
+    for line in _bt('list').splitlines():
+        f = line.split()
+        if len(f) >= 2 and f[0] == 'Controller':
+            macs[f[1].upper()] = ' '.join(f[2:]).replace('[default]', '').strip()
+    blocked = {r['dev']: r['blocked'] for r in _rfkill_rows()}
+    out = []
+    try:
+        names = sorted(os.listdir('/sys/class/bluetooth'))
+    except Exception:
+        names = []
+    for hci in names:
+        if not hci.startswith('hci'):
+            continue
+        path = ''
+        try:
+            path = os.path.realpath('/sys/class/bluetooth/' + hci)
+        except Exception:
+            pass
+        mac = _adapter_address(hci)
+        out.append({'hci': hci, 'mac': mac,
+                    'usb': '/usb' in path or 'xhci' in path,
+                    'blocked': blocked.get(hci, False),
+                    'name': macs.get(mac, '')})
+    # Last resort: if exactly one controller is still nameless and exactly
+    # one MAC from bluetoothctl is unaccounted for, they are each other.
+    # Never guess beyond that — pairing the two LISTS by order looks
+    # reasonable and is wrong, because bluetoothctl sorts the default
+    # controller first and the default is not hci0.
+    unknown = [d for d in out if not d['mac']]
+    spare = [m for m in macs if m not in {d['mac'] for d in out if d['mac']}]
+    if len(unknown) == 1 and len(spare) == 1:
+        unknown[0]['mac'] = spare[0]
+        unknown[0]['name'] = macs.get(spare[0], '')
+    return out
+
+
+def _adapter_card():
+    """The radio picker. Only drawn when there is a choice to make — one
+    controller is the normal box, and a card offering to pick it would be
+    a question with one answer."""
+    ads = adapters()
+    if len(ads) < 2:
+        return ''
+    want = adapter_pref()
+    rows = []
+    for a in ads:
+        live = (not a['blocked']) and (a['mac'] == want if want else None)
+        kind = ('USB dongle — external antenna' if a['usb']
+                else 'built-in radio')
+        tag = ''
+        if a['mac'] == want:
+            tag = ' <b class="ok">← in use</b>'
+        elif a['blocked']:
+            tag = ' <span class="dim">(powered down)</span>'
+        rows.append(
+            f'<form method="post" action="/adapter" '
+            f'style="margin:.25rem 0">'
+            f'<button name="mac" value="{html.escape(a["mac"])}" '
+            f'style="width:100%;text-align:left;padding:.5rem .6rem"'
+            + (' disabled' if a['mac'] == want else '') + '>'
+            + f'{html.escape(kind)}<br>'
+            + f'<span class="dim">{html.escape(a["hci"])} · '
+            + f'{html.escape(a["mac"] or "?")}</span>{tag}</button></form>')
+    note = ('<span class="dim">Pinned — re-applied every time the box '
+            'starts.</span>' if want else
+            '<b class="warn">Not pinned.</b> <span class="dim">BlueZ picks '
+            'one at boot and the choice changes between reboots, so the '
+            'external antenna is in use on some days and not others.'
+            '</span>')
+    return ('<div class="card">bluetooth adapter:<br>' + ''.join(rows)
+            + note
+            + ('<form method="post" action="/adapter" '
+               'style="margin-top:.4rem">'
+               '<button name="mac" value="" style="padding:.3rem .7rem">'
+               '↩ unpin — let BlueZ choose</button></form>' if want else '')
+            + '</div>')
+
+
+def adapter_pref():
+    try:
+        v = open(ADAPTER_FILE).read().strip().upper()
+        return v if ':' in v else ''
+    except Exception:
+        return ''
+
+
+def set_adapter_pref(mac):
+    try:
+        if mac:
+            with open(ADAPTER_FILE, 'w') as fh:
+                fh.write(mac.strip().upper())
+        elif os.path.exists(ADAPTER_FILE):
+            os.remove(ADAPTER_FILE)
+    except Exception:
+        pass
+
+
+def enforce_adapter():
+    """Power down every controller except the chosen one. Returns the
+    adapter now in use, or None when no choice is stored.
+
+    Called at startup as well as on selection, because the thing being
+    corrected is a boot-time race — a preference that is only applied when
+    a human taps a button is a preference that is wrong every morning.
+    """
+    want = adapter_pref()
+    if not want:
+        return None
+    found = [a for a in adapters() if a['mac'] == want]
+    if not found:
+        return None                    # dongle unplugged; leave BlueZ alone
+    ids = {r['dev']: r['id'] for r in _rfkill_rows()}
+    for a in adapters():
+        rid = ids.get(a['hci'])
+        if rid is None:
+            continue
+        _rfkill('unblock' if a['mac'] == want else 'block', rid)
+    _bt('power', 'on')
+    return found[0]
 
 
 # ── bluetoothctl plumbing for the admin page ─────────────────────────────
@@ -1052,6 +1301,7 @@ def _page_body(q):
         f'<button style="padding:.3rem .7rem">save</button>'
         f'<br><span class="dim">what the coach page shows after '
         f'"LIVE →"</span></form></div>')
+    b.append(_adapter_card())
     if q.get('scanned'):
         devs = bt_scan()
         named = [d for d in devs if d['name']]
@@ -1233,6 +1483,10 @@ class Admin(http.server.BaseHTTPRequestHandler):
         elif self.path == '/lock':
             bt_lock(form.get('v') == '1')
             loc = '/'
+        elif self.path == '/adapter':
+            set_adapter_pref((form.get('mac') or '').strip())
+            enforce_adapter()
+            loc = '/'
         else:
             loc = '/'
         self.send_response(303)
@@ -1247,6 +1501,13 @@ def main():
     if not KEY:
         raise SystemExit('no device key — activate the Pi first '
                          '(PLAYCALL_API_KEY in /etc/playcall.env)')
+    # BEFORE anything reaches for a radio. Which controller BlueZ calls
+    # "default" changes between boots, so a pinned adapter that is only
+    # applied when a human taps a button is wrong every morning.
+    try:
+        enforce_adapter()
+    except Exception:
+        pass                    # a picker that fails must not cost the box
     threading.Thread(target=poll_loop, daemon=True).start()
     threading.Thread(target=rtc_thread, daemon=True).start()
     threading.Thread(target=reconnect_loop, daemon=True).start()
