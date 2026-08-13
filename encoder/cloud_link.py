@@ -100,6 +100,18 @@ class CloudLink:
         # the normal case when a coach asks for a sign-in link.
         nonce = a.get('login_nonce')
         self.login_nonce = str(nonce) if nonce else None
+        if a.get('shutdown'):
+            # The coach pressed "power off" on the pad — the box lives on
+            # a power bank with no keyboard, and unplugging it hot is what
+            # corrupted the recordings drive. The cloud clears the flag AS
+            # it serves it (read-once), so the next boot's first poll can
+            # never re-kill the box. poweroff, not halt: systemd stops
+            # mediamtx and the push cleanly and unmounts the recordings
+            # drive, which is the entire point of the button.
+            log.warning('cloud requested shutdown — powering off')
+            self.running = False
+            self.runner(['systemctl', 'poweroff'])
+            return True
         return self.handle_assignment(a)
 
     def handle_assignment(self, a):

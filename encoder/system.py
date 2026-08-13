@@ -117,6 +117,81 @@ def self_update(repo_url=None, install_dir=None):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+# ── power-cut survival ────────────────────────────────────────────────────
+FSTAB = '/etc/fstab'
+CMDLINE = '/boot/firmware/cmdline.txt'
+DATA_MOUNT = '/var/lib/playcall-encoder'
+# noatime: no metadata write per read; nofail: a dead drive must not hang
+# boot; commit=1: the journal flushes every second, so a power cut costs
+# ~1 s of video instead of the filesystem; the device-timeout keeps a
+# missing NVMe from stalling systemd for its default 90 s.
+FSTAB_OPTS = ('noatime', 'nofail', 'commit=1', 'x-systemd.device-timeout=10')
+
+
+def harden_storage(fstab=FSTAB, cmdline=CMDLINE, mount=DATA_MOUNT):
+    """Make a yanked power cord survivable.
+
+    The field box runs off a USB power bank and gets unplugged rather
+    than shut down (its own smart-log: 24 unsafe shutdowns in 30 power
+    cycles). One of those cuts left the recordings filesystem in ext4's
+    emergency shutdown and killed the clips pipeline until a hand-run
+    fsck. Two idempotent config repairs, applied at every boot:
+
+      * the recordings mount's fstab entry gains crash-safe options and
+        fs_passno 2, so systemd fscks it BEFORE mounting it;
+      * fsck.repair=yes on the kernel command line, so that boot-time
+        fsck repairs what it finds instead of giving up to preen mode.
+
+    Returns the list of files changed (for the boot log). Existing
+    explicit choices are respected: a commit= already present keeps its
+    value, an fsck.repair= already present keeps its answer. Never
+    raises — a read-only /boot or a nonstandard fstab must not stop the
+    encoder from encoding."""
+    if fake_mode():
+        return []
+    changed = []
+    try:
+        if os.path.exists(fstab) and _fstab_harden(fstab, mount):
+            changed.append(fstab)
+    except OSError:
+        pass
+    try:
+        if os.path.exists(cmdline) and _cmdline_fsck_repair(cmdline):
+            changed.append(cmdline)
+    except OSError:
+        pass
+    return changed
+
+
+def _fstab_harden(path, mount):
+    out, dirty = [], False
+    for ln in open(path).read().splitlines():
+        parts = ln.split()
+        if len(parts) >= 4 and not ln.lstrip().startswith('#') \
+                and parts[1] == mount:
+            opts = [o for o in parts[3].split(',') if o]
+            have = {o.split('=')[0] for o in opts}
+            opts += [o for o in FSTAB_OPTS if o.split('=')[0] not in have]
+            while len(parts) < 6:
+                parts.append('0')
+            fields = parts[:3] + [','.join(opts), parts[4], '2']
+            if fields != parts:
+                ln = '  '.join(fields)
+                dirty = True
+        out.append(ln)
+    if dirty:
+        open(path, 'w').write('\n'.join(out) + '\n')
+    return dirty
+
+
+def _cmdline_fsck_repair(path):
+    raw = open(path).read()
+    if 'fsck.repair=' in raw:
+        return False               # an explicit choice — keep it
+    open(path, 'w').write(raw.rstrip('\n') + ' fsck.repair=yes\n')
+    return True
+
+
 def have_networkmanager():
     """NetworkManager is the default stack on Raspberry Pi OS Bookworm."""
     if not have('nmcli'):

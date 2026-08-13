@@ -65,6 +65,16 @@ def main():
     except OSError as e:
         log.warning(f'mediamtx config not written: {e}')
 
+    # Field boxes get unplugged, not shut down — make that survivable
+    # (boot-time fsck + crash-safe mount options; see system.harden_storage)
+    try:
+        fixed = system.harden_storage()
+        if fixed:
+            log.info('storage hardened for power cuts: ' + ', '.join(fixed)
+                     + ' — takes effect next boot')
+    except Exception:
+        log.exception('storage hardening skipped')
+
     sender = scorebug.Sender(feed=cfg['cloud'].get('feed_url') or None,
                              layout='bar', fake=fake)
     sender.bandwidth = cfg.get('bandwidth', 0)
