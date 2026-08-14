@@ -264,6 +264,10 @@ class CloudLink:
                        'kbps': ingest['kbps']},
             'push': push,
             'clips': self.clips_status(),
+            # Recording-disk health. The stream never touches the disk,
+            # so a box can push a perfect feed into a dead NVMe all
+            # evening — this is the field that finally says so.
+            'storage': system.storage_status(),
             'cpu': system.cpu_percent(),
             'temp': system.cpu_temp(),
             # the PEAK since the last beat: a box that spikes to 82 °C

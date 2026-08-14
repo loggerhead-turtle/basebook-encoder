@@ -10,6 +10,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 
 
 def fake_mode():
@@ -270,6 +271,121 @@ def cpu_temp():
         return round(int(raw) / 1000.0, 1)
     except (OSError, ValueError):
         return None
+
+
+# ── recording-storage health ──────────────────────────────────────────────
+# The mount MediaMTX records into and the clipper cuts from. A box once
+# streamed a whole evening into a dead NVMe — the controller dropped off
+# the PCIe bus, ext4 went emergency-read-only, and every card still said
+# "pushing" because the stream itself never touches the disk.
+# (DATA_MOUNT is defined by the power-cut section above)
+PROBE_TIMEOUT = 5.0
+
+_probe_thread = None
+_probe_lock = threading.Lock()
+
+
+def _mounted_read_only(path, mounts='/proc/mounts'):
+    """True when the filesystem holding `path` can no longer be written —
+    mounted ro, or in ext4's emergency_ro/shutdown state. (Observed on a
+    real failure: after the NVMe controller dropped, the options read
+    'rw,noatime,emergency_ro,shutdown' — still claiming rw, so the plain
+    ro flag alone is not enough.) Longest-prefix match over the mount
+    table; unreadable table → assume writable and let the write probe
+    decide."""
+    try:
+        real = os.path.realpath(path)
+        best, ro = '', False
+        for ln in open(mounts):
+            parts = ln.split()
+            if len(parts) < 4:
+                continue
+            mnt = parts[1].replace('\\040', ' ')
+            if (real == mnt or real.startswith(mnt.rstrip('/') + '/')) \
+                    and len(mnt) >= len(best):
+                best = mnt
+                ro = bool({'ro', 'emergency_ro', 'shutdown'}
+                          & set(parts[3].split(',')))
+        return ro
+    except OSError:
+        return False
+
+
+def _probe_write(path, result):
+    probe = os.path.join(path, '.storage-probe')
+    try:
+        fd = os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, b'playcall storage probe\n')
+            os.fsync(fd)           # force real I/O — the page cache lies
+        finally:
+            os.close(fd)
+        os.unlink(probe)
+    except OSError as e:
+        result['error'] = (f'cannot write to {path}: '
+                           f'{e.strerror or e}')
+
+
+def storage_status(path=None):
+    """Can the recordings volume actually take a write, right now?
+
+    Three answers, cheapest first: is the mount read-only (the state a
+    dying drive leaves behind), does a real create-write-fsync-unlink
+    succeed, and how much space is left. The probe runs on a helper
+    thread with a timeout because a failing controller doesn't always
+    error — sometimes it just hangs the caller in D-state, and this
+    check must never wedge the heartbeat loop that reports it.
+
+    Returns {'ok', 'error', 'read_only', 'free_gb', 'path'} and never
+    raises; 'error' is a human sentence that goes straight onto the
+    settings card and into the heartbeat."""
+    global _probe_thread
+    path = path or os.environ.get('PLAYCALL_ENCODER_DATA')
+    if path is None:
+        if fake_mode():            # laptop dev: no /var/lib mount to probe
+            return {'ok': True, 'error': '', 'read_only': False,
+                    'free_gb': None, 'path': ''}
+        path = DATA_MOUNT
+    st = {'ok': False, 'error': '', 'read_only': False, 'free_gb': None,
+          'path': path}
+    if not os.path.isdir(path):
+        st['error'] = (f'{path} is missing — is the recordings drive '
+                       'mounted?')
+        return st
+    if _mounted_read_only(path):
+        st['read_only'] = True
+        st['error'] = ('filesystem is read-only — the kernel shut it '
+                       'down after an I/O error (failing drive?)')
+        return st
+    try:
+        s = os.statvfs(path)
+        st['free_gb'] = round(s.f_bavail * s.f_frsize / 1e9, 1)
+    except OSError:
+        pass
+    with _probe_lock:
+        if _probe_thread is not None and _probe_thread.is_alive():
+            # the previous probe never came back — that IS the diagnosis
+            st['error'] = (f'a write to {path} is hanging — the drive '
+                           'is not answering')
+            return st
+        res = {}
+        _probe_thread = threading.Thread(target=_probe_write,
+                                         args=(path, res), daemon=True)
+        _probe_thread.start()
+        _probe_thread.join(PROBE_TIMEOUT)
+        if _probe_thread.is_alive():
+            st['error'] = (f'a write to {path} is hanging — the drive '
+                           'is not answering')
+            return st
+    if res.get('error'):
+        st['error'] = res['error']
+        return st
+    if st['free_gb'] is not None and st['free_gb'] < 2:
+        st['error'] = (f"only {st['free_gb']} GB free — recording "
+                       'is about to stop')
+        return st
+    st['ok'] = True
+    return st
 
 
 def journal_tail(lines=20, units=('playcall-encoder',
