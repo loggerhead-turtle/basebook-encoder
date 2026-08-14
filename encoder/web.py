@@ -42,6 +42,9 @@ CSS = provisioning.PORTAL_CSS + """
 .row{display:flex;gap:.6rem;align-items:center;margin:.35rem 0}
 .dot{width:.7rem;height:.7rem;border-radius:50%;background:#444}
 .dot.ok{background:#10b981}.dot.warn{background:#f5b301}
+.dot.bad{background:#ef4444}
+.card.storagefail{border-color:#c62828;background:#2a0d0d}
+.card.storagefail h2{color:#ef9a9a}
 .k{color:#8b949e;font-size:.85rem;min-width:9rem}
 .v{font-size:.9rem}
 pre{background:#0d1117;border:1px solid #30363d;border-radius:6px;
@@ -143,8 +146,27 @@ STATUS_PAGE = """<!doctype html><html><head>
 </div>
 {% endif %}
 
+{% if storage and not storage.ok %}
+<div class="card storagefail">
+  <h2>&#128721; Recording storage failure</h2>
+  <p style="color:#ef9a9a;font-size:.9rem;margin:.3rem 0">
+    {{ storage.error or 'the recording disk is not writable' }}</p>
+  <p class="hint">Nothing is being recorded and no clips can be cut until
+    this is fixed. The stream itself can look perfectly healthy — that is
+    what makes this failure easy to miss. Check the NVMe drive, its
+    ribbon cable and the power supply, then reboot the box.</p>
+</div>
+{% endif %}
+
 <div class="card">
   <h2>Status</h2>
+  {% if storage %}
+  <div class="row"><span class="dot {{ 'ok' if storage.ok else 'bad' }}"></span>
+    <span class="k">Recording disk</span>
+    <span class="v">{{ 'Writable' if storage.ok else (storage.error or 'FAILED') }}
+      {% if storage.free_gb is not none %}· {{ storage.free_gb }} GB free{% endif %}
+    </span></div>
+  {% endif %}
   <div class="row"><span class="dot {{ 'ok' if ingest.connected }}"></span>
     <span class="k">Camera ingest</span>
     <span class="v">{{ 'Receiving' if ingest.connected else 'Waiting for camera' }}
@@ -364,6 +386,10 @@ def log_bundle(cloud=None, lines=200):
               f'status: {red(clips)}',
               f'recordings: {seg_line}',
               '']
+    # Recording-disk health — the "streamed all evening into a dead
+    # NVMe" failure is invisible in every other section.
+    parts += ['── storage ──',
+              json.dumps(system.storage_status(), indent=2), '']
     parts += [f'── last {lines} service log lines ──',
               *config.redact_lines(system.journal_tail(lines), cfg), '']
     try:
@@ -539,6 +565,7 @@ def create_app(cloud=None, sender=None):
             STATUS_PAGE, version=__version__,
             latest=latest if _is_newer(latest, __version__) else None,
             ingest=ingest, push=push,
+            storage=system.storage_status(),
             assignment=cloud.assignment if cloud else None,
             hostname=system.hostname(), ip=system.lan_ip(),
             cpu=system.cpu_percent(), temp=system.cpu_temp(),

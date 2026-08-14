@@ -491,7 +491,10 @@ def test_heartbeat_payload_shape():
     assert hb['state'] == 'pushing'
     assert set(hb) == {'state', 'ingest', 'push', 'cpu', 'temp',
                        'version', 'log_tail', 'hostname', 'ip', 'clips',
-                       'pin', 'rtmp_urls', 'radar', 'temp_max'}
+                       'pin', 'rtmp_urls', 'radar', 'temp_max', 'storage'}
+    # fake mode (conftest) has no recordings mount — storage rides as a
+    # benign stub so a dev laptop never fakes an outage
+    assert hb['storage']['ok'] is True
     # a box with no gun still beats — radar rides as None
     assert hb['radar'] is None
     # camera-facing ingest URLs ride the beat, raw IP first — the
@@ -1085,3 +1088,123 @@ def test_bounced_pin_change_lands_on_settings_not_a_405():
     c.post('/login', data={'pin': '123456'})
     r = c.get('/pin')
     assert r.status_code == 302 and r.headers['Location'].endswith('/')
+
+
+# ── recording-storage watchdog ───────────────────────────────────────────────
+# The outage that motivated this: mid-season, the NVMe controller dropped
+# off the PCIe bus under write load, ext4 went emergency-read-only, and
+# the box streamed a whole game into a dead disk while every card said
+# "pushing". Nothing was recorded, no clips cut, no alarm anywhere.
+
+def test_storage_status_healthy_and_probe_cleans_up(tmp_path):
+    from encoder import system
+    st = system.storage_status(str(tmp_path))
+    assert st['ok'] is True and st['error'] == ''
+    assert st['read_only'] is False
+    assert st['free_gb'] and st['free_gb'] > 0
+    assert list(tmp_path.iterdir()) == []        # probe file removed
+
+
+def test_storage_status_missing_mount_is_a_failure(tmp_path):
+    from encoder import system
+    st = system.storage_status(str(tmp_path / 'never-mounted'))
+    assert st['ok'] is False
+    assert 'missing' in st['error']
+
+
+def test_storage_status_write_error_is_a_failure(tmp_path, monkeypatch):
+    """A dead controller answers EIO even while the mount still says rw."""
+    import errno
+    import os as os_mod
+    from encoder import system
+
+    def eio(fd):
+        raise OSError(errno.EIO, 'Input/output error')
+    monkeypatch.setattr(os_mod, 'fsync', eio)
+    st = system.storage_status(str(tmp_path))
+    assert st['ok'] is False
+    assert 'cannot write' in st['error']
+
+
+def test_storage_status_hanging_write_is_a_failure(tmp_path, monkeypatch):
+    """The other way drives die: the write never returns. The probe runs
+    on a helper thread so the heartbeat loop reporting the failure can
+    never itself be wedged by it."""
+    from encoder import system
+    monkeypatch.setattr(system, 'PROBE_TIMEOUT', 0.05)
+    monkeypatch.setattr(system, '_probe_write',
+                        lambda path, result: time.sleep(0.4))
+    st = system.storage_status(str(tmp_path))
+    assert st['ok'] is False and 'hanging' in st['error']
+    # while the stuck probe is still out there, the next check reports
+    # the hang immediately instead of stacking another thread on it
+    st2 = system.storage_status(str(tmp_path))
+    assert st2['ok'] is False and 'hanging' in st2['error']
+    system._probe_thread.join(1.0)               # let it drain
+
+
+def test_mounted_read_only_sees_emergency_ro(tmp_path):
+    """Real /proc/mounts capture from the failure: the options still led
+    with rw — ext4 flags the shutdown as emergency_ro,shutdown instead of
+    flipping ro, so matching 'ro' alone misses it."""
+    from encoder import system
+    mounts = tmp_path / 'mounts'
+    data = tmp_path / 'data'
+    data.mkdir()
+    mounts.write_text(
+        '/dev/root / ext4 rw,noatime 0 0\n'
+        f'/dev/nvme0n1p1 {data} ext4 rw,noatime,emergency_ro,shutdown 0 0\n')
+    assert system._mounted_read_only(str(data), mounts=str(mounts)) is True
+    mounts.write_text(
+        '/dev/root / ext4 rw,noatime 0 0\n'
+        f'/dev/nvme0n1p1 {data} ext4 rw,noatime 0 0\n')
+    assert system._mounted_read_only(str(data), mounts=str(mounts)) is False
+    # plain ro (post-reboot mount -o ro rescue state) also counts
+    mounts.write_text(f'/dev/nvme0n1p1 {data} ext4 ro,noatime 0 0\n')
+    assert system._mounted_read_only(str(data), mounts=str(mounts)) is True
+
+
+def test_settings_page_screams_about_dead_storage(monkeypatch):
+    """The card must be loud when the disk is gone — and silent when not."""
+    from encoder import system, web
+    c = _pin_app()
+    c.post('/login', data={'pin': '123456'})
+    monkeypatch.setattr(system, 'storage_status', lambda path=None: {
+        'ok': False, 'read_only': True, 'free_gb': None,
+        'path': '/var/lib/playcall-encoder',
+        'error': 'filesystem is read-only — the kernel shut it down '
+                 'after an I/O error (failing drive?)'})
+    html = c.get('/').get_data(as_text=True)
+    assert 'Recording storage failure' in html
+    assert 'read-only' in html
+    assert 'Nothing is being recorded' in html
+    monkeypatch.setattr(system, 'storage_status', lambda path=None: {
+        'ok': True, 'read_only': False, 'free_gb': 440.5, 'path': '/x',
+        'error': ''})
+    html = c.get('/').get_data(as_text=True)
+    assert 'Recording storage failure' not in html
+    assert 'Recording disk' in html and '440.5' in html
+
+
+def test_heartbeat_carries_storage_failure(monkeypatch):
+    """The site's encoder card and Field check read this field — it must
+    ride every beat, dead or alive."""
+    from encoder import system
+    _paired_cfg()
+    monkeypatch.setattr(system, 'storage_status', lambda path=None: {
+        'ok': False, 'read_only': False, 'free_gb': None, 'path': '/v',
+        'error': 'cannot write to /v: Input/output error'})
+    link = cloud_link.CloudLink(http=lambda url, **kw: {'items': []})
+    hb = link.heartbeat_payload()
+    assert hb['storage']['ok'] is False
+    assert 'Input/output error' in hb['storage']['error']
+
+
+def test_support_bundle_has_a_storage_section(monkeypatch):
+    from encoder import system, web
+    monkeypatch.setattr(system, 'storage_status', lambda path=None: {
+        'ok': False, 'read_only': False, 'free_gb': None, 'path': '/v',
+        'error': 'a write to /v is hanging — the drive is not answering'})
+    bundle = web.log_bundle()
+    assert '── storage ──' in bundle
+    assert 'hanging' in bundle
