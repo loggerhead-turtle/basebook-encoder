@@ -1208,3 +1208,84 @@ def test_support_bundle_has_a_storage_section(monkeypatch):
     bundle = web.log_bundle()
     assert '── storage ──' in bundle
     assert 'hanging' in bundle
+
+
+# ── the recordings drive that isn't mounted ──────────────────────────────────
+# Sequel to the outage above. Once the drive was healthy again, the box
+# reported storage "ok" with 113.9 GB free — on a 477 GB drive holding 6 GB.
+# The fstab line had been commented out during the outage and never
+# restored, so /var/lib/playcall-encoder was a plain directory on the SD
+# card: every write succeeded, the probe went green, and the encoder was
+# quietly filling its root filesystem with 72 hours of footage.
+
+def test_storage_flags_a_recordings_drive_that_is_not_mounted(tmp_path,
+                                                              monkeypatch):
+    from encoder import system
+    monkeypatch.setattr(system, '_labeled_device',
+                        lambda label=None: '/dev/nvme0n1p1')
+    monkeypatch.setattr(system, '_mount_device',
+                        lambda path, mounts=None: '/dev/mmcblk0p2')
+    st = system.storage_status(str(tmp_path))
+    assert st['ok'] is False
+    assert st['device'] == '/dev/mmcblk0p2'
+    assert 'not mounted' in st['error'] and 'SD card' in st['error']
+
+
+def test_storage_is_happy_when_the_labeled_drive_is_the_mounted_one(
+        tmp_path, monkeypatch):
+    from encoder import system
+    monkeypatch.setattr(system, '_labeled_device',
+                        lambda label=None: '/dev/nvme0n1p1')
+    monkeypatch.setattr(system, '_mount_device',
+                        lambda path, mounts=None: '/dev/nvme0n1p1')
+    st = system.storage_status(str(tmp_path))
+    assert st['ok'] is True and st['error'] == ''
+    assert st['device'] == '/dev/nvme0n1p1'
+
+
+def test_an_sd_card_only_box_is_not_nagged(tmp_path, monkeypatch):
+    """No recordings drive fitted at all is a supported install (12 h of
+    retention on the SD card) — it must stay quiet, not cry wolf."""
+    from encoder import system
+    monkeypatch.setattr(system, '_labeled_device', lambda label=None: '')
+    monkeypatch.setattr(system, '_mount_device',
+                        lambda path, mounts=None: '/dev/mmcblk0p2')
+    st = system.storage_status(str(tmp_path))
+    assert st['ok'] is True and st['error'] == ''
+
+
+def test_mount_device_picks_the_longest_prefix(tmp_path):
+    """/ and the recordings mount both match the path — the deeper mount
+    is the one actually backing it."""
+    from encoder import system
+    mounts = tmp_path / 'mounts'
+    data = tmp_path / 'data'
+    data.mkdir()
+    mounts.write_text(
+        '/dev/mmcblk0p2 / ext4 rw,noatime 0 0\n'
+        f'/dev/nvme0n1p1 {data} ext4 rw,noatime 0 0\n')
+    assert system._mount_device(str(data), mounts=str(mounts)) \
+        == '/dev/nvme0n1p1'
+    # unmounted: the path falls back to whatever holds it — the SD card
+    mounts.write_text('/dev/mmcblk0p2 / ext4 rw,noatime 0 0\n')
+    assert system._mount_device(str(data), mounts=str(mounts)) \
+        == '/dev/mmcblk0p2'
+
+
+def test_units_exempt_restart_loops_in_the_section_systemd_reads():
+    """systemd parses StartLimitIntervalSec in [Unit]; in [Service] it is
+    ignored with a warning ("Unknown key ... in section [Service]") and
+    the Restart=always units were never actually exempt."""
+    import configparser
+    from pathlib import Path
+    root = Path(__file__).resolve().parent.parent / 'systemd'
+    units = sorted(root.glob('playcall-encoder*.service'))
+    assert units
+    for u in units:
+        cp = configparser.ConfigParser(strict=False)
+        cp.optionxform = str
+        cp.read(u)
+        if not cp.has_option('Service', 'Restart'):
+            continue
+        assert not cp.has_option('Service', 'StartLimitIntervalSec'), u.name
+        assert cp.has_option('Unit', 'StartLimitIntervalSec'), u.name

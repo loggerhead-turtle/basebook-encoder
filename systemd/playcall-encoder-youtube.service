@@ -2,6 +2,7 @@
 Description=PlayCall Encoder - copy-mode YouTube push
 After=playcall-encoder-mediamtx.service network-online.target
 Wants=playcall-encoder-mediamtx.service network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 ExecStart=/usr/bin/python3 -m encoder.youtube_push
@@ -9,7 +10,6 @@ WorkingDirectory=/opt/playcall-encoder
 Environment=PYTHONUNBUFFERED=1
 Restart=always
 RestartSec=3
-StartLimitIntervalSec=0
 # Needs to read /etc/playcall-encoder/config.json (root:playcall 640) and
 # write push status under /run/playcall-encoder.
 User=playcall

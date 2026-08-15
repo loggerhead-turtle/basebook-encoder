@@ -280,6 +280,12 @@ def cpu_temp():
 # "pushing" because the stream itself never touches the disk.
 # (DATA_MOUNT is defined by the power-cut section above)
 PROBE_TIMEOUT = 5.0
+# The filesystem label the recordings volume is created with. When a
+# device carrying it EXISTS but is not the one backing the recordings
+# path, the drive is present and simply not mounted — and recording is
+# silently falling back onto the SD card. A box with no such device is
+# an SD-card-only install, which is supported and must stay quiet.
+DATA_LABEL = 'playcall-video'
 
 _probe_thread = None
 _probe_lock = threading.Lock()
@@ -309,6 +315,36 @@ def _mounted_read_only(path, mounts='/proc/mounts'):
         return ro
     except OSError:
         return False
+
+
+def _mount_device(path, mounts='/proc/mounts'):
+    """The device backing `path` (longest-prefix match over the mount
+    table), '' when it can't be determined."""
+    try:
+        real = os.path.realpath(path)
+        best, dev = '', ''
+        for ln in open(mounts):
+            parts = ln.split()
+            if len(parts) < 4:
+                continue
+            mnt = parts[1].replace('\\040', ' ')
+            if (real == mnt or real.startswith(mnt.rstrip('/') + '/')) \
+                    and len(mnt) >= len(best):
+                best, dev = mnt, parts[0]
+        return dev
+    except OSError:
+        return ''
+
+
+def _labeled_device(label=DATA_LABEL):
+    """The device carrying the recordings-volume label, '' if none."""
+    p = f'/dev/disk/by-label/{label}'
+    try:
+        if os.path.exists(p):
+            return os.path.realpath(p)
+    except OSError:
+        pass
+    return ''
 
 
 def _probe_write(path, result):
@@ -344,10 +380,10 @@ def storage_status(path=None):
     if path is None:
         if fake_mode():            # laptop dev: no /var/lib mount to probe
             return {'ok': True, 'error': '', 'read_only': False,
-                    'free_gb': None, 'path': ''}
+                    'free_gb': None, 'path': '', 'device': ''}
         path = DATA_MOUNT
     st = {'ok': False, 'error': '', 'read_only': False, 'free_gb': None,
-          'path': path}
+          'path': path, 'device': ''}
     if not os.path.isdir(path):
         st['error'] = (f'{path} is missing — is the recordings drive '
                        'mounted?')
@@ -362,6 +398,20 @@ def storage_status(path=None):
         st['free_gb'] = round(s.f_bavail * s.f_frsize / 1e9, 1)
     except OSError:
         pass
+    # Writable is not the same as writing to the RIGHT disk. A recordings
+    # drive that fails to mount (dead controller, an fstab line commented
+    # out during a previous outage and never restored) leaves this path a
+    # plain directory on the SD card: every write succeeds, every check
+    # looks green, and the box quietly fills its root filesystem with
+    # footage until it takes itself down. Seen in the field at 113 GB
+    # "free" on a 477 GB drive.
+    st['device'] = _mount_device(path)
+    want = _labeled_device()
+    if want and st['device'] and os.path.realpath(st['device']) != want:
+        st['error'] = (f"recordings are landing on {st['device']}, not the "
+                       f'recordings drive ({want}) — that drive is not '
+                       'mounted, so this is the SD card filling up')
+        return st
     with _probe_lock:
         if _probe_thread is not None and _probe_thread.is_alive():
             # the previous probe never came back — that IS the diagnosis
