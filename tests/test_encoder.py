@@ -1386,3 +1386,83 @@ def test_the_watcher_runs_on_a_box_that_never_reaches_the_cloud(monkeypatch):
     monkeypatch.setattr(cloud_link.time, 'sleep', stop)
     link.heartbeat_loop()
     assert seen                             # probed anyway
+
+
+# ── recording to the SD card on purpose ──────────────────────────────────────
+# With the NVMe out for repair the box still has to work, and the SD card
+# holds ~12 h of footage. But the unmounted-drive check would then scream
+# on every page load forever, and an alarm that is always on is one nobody
+# reads — which is exactly what this whole feature exists to prevent.
+
+def test_the_sd_fallback_is_a_failure_until_somebody_says_otherwise():
+    from encoder import system
+    cfg = config.load()
+    cfg['record_fallback_ok'] = False
+    config.save(cfg)
+    assert system._fallback_ok() is False
+
+
+def test_a_declared_fallback_reports_where_it_landed_instead_of_failing(
+        tmp_path, monkeypatch):
+    from encoder import system
+    cfg = config.load()
+    cfg['record_fallback_ok'] = True
+    config.save(cfg)
+    monkeypatch.setattr(system, '_labeled_device',
+                        lambda label=None: '/dev/nvme0n1p1')
+    monkeypatch.setattr(system, '_mount_device',
+                        lambda path, mounts=None: '/dev/mmcblk0p2')
+    st = system.storage_status(str(tmp_path))
+    assert st['ok'] is True and st['error'] == ''
+    assert st['fallback'] is True
+    assert st['device'] == '/dev/mmcblk0p2'
+    # still a real probe: a fallback that cannot be written to is a failure
+    assert st['free_gb'] is not None
+
+
+def test_a_declared_fallback_still_fails_when_the_card_is_unwritable(
+        tmp_path, monkeypatch):
+    """Saying 'the SD card is fine' must not switch the check off."""
+    import errno
+    import os as os_mod
+    from encoder import system
+    cfg = config.load()
+    cfg['record_fallback_ok'] = True
+    config.save(cfg)
+    monkeypatch.setattr(system, '_labeled_device',
+                        lambda label=None: '/dev/nvme0n1p1')
+    monkeypatch.setattr(system, '_mount_device',
+                        lambda path, mounts=None: '/dev/mmcblk0p2')
+    monkeypatch.setattr(os_mod, 'fsync', lambda fd: (_ for _ in ()).throw(
+        OSError(errno.EIO, 'Input/output error')))
+    st = system.storage_status(str(tmp_path))
+    assert st['ok'] is False and 'cannot write' in st['error']
+
+
+def test_the_drive_being_back_is_not_a_fallback(tmp_path, monkeypatch):
+    """Flag left on after the NVMe returns must not mislabel a healthy
+    box — the mount matching is what decides, not the flag."""
+    from encoder import system
+    cfg = config.load()
+    cfg['record_fallback_ok'] = True
+    config.save(cfg)
+    monkeypatch.setattr(system, '_labeled_device',
+                        lambda label=None: '/dev/nvme0n1p1')
+    monkeypatch.setattr(system, '_mount_device',
+                        lambda path, mounts=None: '/dev/nvme0n1p1')
+    st = system.storage_status(str(tmp_path))
+    assert st['ok'] is True and st['fallback'] is False
+
+
+def test_the_settings_page_shows_the_fallback_in_amber_not_red(monkeypatch):
+    from encoder import system
+    c = _pin_app()
+    c.post('/login', data={'pin': '123456'})
+    monkeypatch.setattr(system, 'storage_status', lambda path=None: {
+        'ok': True, 'read_only': False, 'free_gb': 107.0, 'error': '',
+        'path': '/var/lib/playcall-encoder', 'device': '/dev/mmcblk0p2',
+        'fallback': True})
+    html = c.get('/').get_data(as_text=True)
+    assert 'Recording storage failure' not in html      # no red banner
+    assert 'SD card' in html and 'fallback' in html
+    assert 'dot warn' in html

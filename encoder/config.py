@@ -38,6 +38,13 @@ DEFAULTS = {
     # for a code taken off the boot partition of a prebuilt image.
     'pending_code': '',
     'bandwidth': 0,
+    # True = recording to the SD card instead of the NVMe is a CHOICE
+    # (the drive is out for repair, or this box never had one). The
+    # storage check then reports the fallback instead of raising a
+    # failure: a red banner that is always on is one nobody reads, and
+    # this box's whole point is that a real storage failure gets
+    # noticed. Turn it back off when the drive returns.
+    'record_fallback_ok': False,
     'version_check': {'url': '', 'enabled': True},
 }
 

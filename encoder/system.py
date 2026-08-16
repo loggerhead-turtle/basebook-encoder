@@ -336,6 +336,15 @@ def _mount_device(path, mounts='/proc/mounts'):
         return ''
 
 
+def _fallback_ok():
+    """Has someone declared recording-to-the-SD-card deliberate?"""
+    try:
+        from . import config
+        return bool(config.load().get('record_fallback_ok'))
+    except Exception:
+        return False
+
+
 def _labeled_device(label=DATA_LABEL):
     """The device carrying the recordings-volume label, '' if none."""
     p = f'/dev/disk/by-label/{label}'
@@ -380,10 +389,11 @@ def storage_status(path=None):
     if path is None:
         if fake_mode():            # laptop dev: no /var/lib mount to probe
             return {'ok': True, 'error': '', 'read_only': False,
-                    'free_gb': None, 'path': '', 'device': ''}
+                    'free_gb': None, 'path': '', 'device': '',
+                    'fallback': False}
         path = DATA_MOUNT
     st = {'ok': False, 'error': '', 'read_only': False, 'free_gb': None,
-          'path': path, 'device': ''}
+          'path': path, 'device': '', 'fallback': False}
     if not os.path.isdir(path):
         st['error'] = (f'{path} is missing — is the recordings drive '
                        'mounted?')
@@ -408,10 +418,15 @@ def storage_status(path=None):
     st['device'] = _mount_device(path)
     want = _labeled_device()
     if want and st['device'] and os.path.realpath(st['device']) != want:
-        st['error'] = (f"recordings are landing on {st['device']}, not the "
-                       f'recordings drive ({want}) — that drive is not '
-                       'mounted, so this is the SD card filling up')
-        return st
+        if _fallback_ok():
+            # Declared deliberate — keep probing writability and free
+            # space, but say WHERE it is landing rather than cry wolf.
+            st['fallback'] = True
+        else:
+            st['error'] = (f"recordings are landing on {st['device']}, not "
+                           f'the recordings drive ({want}) — that drive is '
+                           'not mounted, so this is the SD card filling up')
+            return st
     with _probe_lock:
         if _probe_thread is not None and _probe_thread.is_alive():
             # the previous probe never came back — that IS the diagnosis

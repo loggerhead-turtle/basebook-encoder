@@ -161,9 +161,11 @@ STATUS_PAGE = """<!doctype html><html><head>
 <div class="card">
   <h2>Status</h2>
   {% if storage %}
-  <div class="row"><span class="dot {{ 'ok' if storage.ok else 'bad' }}"></span>
+  <div class="row"><span class="dot {{ 'warn' if storage.fallback else 'ok' if storage.ok else 'bad' }}"></span>
     <span class="k">Recording disk</span>
-    <span class="v">{{ 'Writable' if storage.ok else (storage.error or 'FAILED') }}
+    <span class="v">{% if storage.fallback %}SD card (fallback — the
+      recordings drive is not mounted){% else %}{{ 'Writable' if storage.ok
+      else (storage.error or 'FAILED') }}{% endif %}
       {% if storage.free_gb is not none %}· {{ storage.free_gb }} GB free{% endif %}
     </span></div>
   {% endif %}
