@@ -1289,3 +1289,100 @@ def test_units_exempt_restart_loops_in_the_section_systemd_reads():
             continue
         assert not cp.has_option('Service', 'StartLimitIntervalSec'), u.name
         assert cp.has_option('Unit', 'StartLimitIntervalSec'), u.name
+
+
+# ── the disk failure nobody could hear ───────────────────────────────────────
+# The drive died mid-morning, the box recorded nothing for an entire
+# afternoon game, and the only trace of it anywhere was MediaMTX's own
+# mkdir errors. The alarm worked — but it only spoke through the heartbeat
+# and the settings page, and the box was off the internet at the field with
+# nobody looking at a settings page. It has to reach the journal too.
+
+def test_a_dead_recording_disk_is_logged_loudly(monkeypatch, caplog):
+    import logging
+    from encoder import system
+    _paired_cfg()
+    monkeypatch.setattr(system, 'storage_status', lambda path=None: {
+        'ok': False, 'read_only': False, 'free_gb': None, 'path': '/v',
+        'device': '/dev/mmcblk0p2',
+        'error': 'cannot write to /v: Input/output error'})
+    link = cloud_link.CloudLink(http=lambda url, **kw: {'items': []})
+    with caplog.at_level(logging.WARNING, logger='cloud_link'):
+        link.watch_storage()
+    assert 'RECORDING DISK FAILURE' in caplog.text
+    assert 'Input/output error' in caplog.text
+    assert any(r.levelno >= logging.ERROR for r in caplog.records)
+
+
+def test_the_failure_is_logged_once_not_every_beat(monkeypatch, caplog):
+    """15 s of logging for the hours a drive stays dead buries itself —
+    and buries whatever else happened that game."""
+    import logging
+    from encoder import system
+    _paired_cfg()
+    monkeypatch.setattr(system, 'storage_status', lambda path=None: {
+        'ok': False, 'read_only': True, 'free_gb': None, 'path': '/v',
+        'device': '', 'error': 'filesystem is read-only'})
+    link = cloud_link.CloudLink(http=lambda url, **kw: {'items': []})
+    with caplog.at_level(logging.WARNING, logger='cloud_link'):
+        for _ in range(5):
+            link.watch_storage()
+    assert caplog.text.count('RECORDING DISK FAILURE') == 1
+
+
+def test_recovery_is_logged_too(monkeypatch, caplog):
+    import logging
+    from encoder import system
+    _paired_cfg()
+    state = {'ok': False}
+    monkeypatch.setattr(system, 'storage_status', lambda path=None: {
+        'ok': state['ok'], 'read_only': False, 'free_gb': 440.0,
+        'path': '/v', 'device': '/dev/nvme0n1p1',
+        'error': '' if state['ok'] else 'cannot write'})
+    link = cloud_link.CloudLink(http=lambda url, **kw: {'items': []})
+    with caplog.at_level(logging.WARNING, logger='cloud_link'):
+        link.watch_storage()
+        state['ok'] = True
+        link.watch_storage()
+    assert 'RECORDING DISK FAILURE' in caplog.text
+    assert 'writable again' in caplog.text
+
+
+def test_the_beat_reuses_the_watchers_probe(monkeypatch):
+    """The watcher and the heartbeat must not each write a probe file
+    every cycle — one probe per beat is enough."""
+    from encoder import system
+    _paired_cfg()
+    calls = {'n': 0}
+
+    def probe(path=None):
+        calls['n'] += 1
+        return {'ok': True, 'read_only': False, 'free_gb': 440.0,
+                'path': '/v', 'device': '/dev/nvme0n1p1', 'error': ''}
+    monkeypatch.setattr(system, 'storage_status', probe)
+    link = cloud_link.CloudLink(http=lambda url, **kw: {'items': []})
+    link.watch_storage()
+    hb = link.heartbeat_payload()
+    assert calls['n'] == 1                  # the beat reused it
+    assert hb['storage']['ok'] is True
+
+
+def test_the_watcher_runs_on_a_box_that_never_reaches_the_cloud(monkeypatch):
+    """The offline box at the field is precisely the one whose disk
+    failure would otherwise go unrecorded, so the watch must not sit
+    behind the paired/reachable check."""
+    from encoder import system
+    seen = []
+    monkeypatch.setattr(system, 'storage_status',
+                        lambda path=None: seen.append(1) or {
+                            'ok': True, 'read_only': False, 'free_gb': 1.0,
+                            'path': '/v', 'device': '', 'error': ''})
+    link = cloud_link.CloudLink(http=lambda *a, **kw: {})
+    link.enabled = lambda: False            # unpaired / no cloud
+    link.running = True
+
+    def stop(_):
+        link.running = False
+    monkeypatch.setattr(cloud_link.time, 'sleep', stop)
+    link.heartbeat_loop()
+    assert seen                             # probed anyway
