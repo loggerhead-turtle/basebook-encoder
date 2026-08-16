@@ -244,13 +244,24 @@ def main():
 
     if not a.video:
         sys.exit('--video is required with --game')
-    # --replace also pulls in clips that already uploaded, so a bad test
-    # cut can be re-cut over; without it those stay untouched.
-    q = f'/api/pi/clips/recoverable?game={a.game}'
-    clips = (api(a.base, a.key, q + ('&all=1' if a.replace else ''))
+    # Always ask for the WHOLE game, then decide what to work on. The
+    # anchor has to reference the game's first window even when that
+    # clip already uploaded: a successful test cut would otherwise drop
+    # it from the list, silently move the reference to the second play,
+    # and throw every remaining cut out by the gap between them.
+    every = (api(a.base, a.key,
+                 f'/api/pi/clips/recoverable?game={a.game}&all=1')
              .get('clips') or [])
+    if not every:
+        sys.exit(f'{a.game} has no clip windows — nothing to do.')
+    first_window = min(c['start'] for c in every)
+    # --replace re-cuts over clips this script already uploaded; without
+    # it, good footage is left alone.
+    clips = (every if a.replace
+             else [c for c in every if c.get('status') != 'uploaded'])
     if not clips:
-        sys.exit(f'{a.game} has no uncut clips — nothing to do.')
+        sys.exit(f'{a.game} has no uncut clips left — every window is '
+                 'already filled. Use --replace to re-cut them anyway.')
 
     dur, made = probe(a.video)
     forced = None
@@ -271,7 +282,7 @@ def main():
             pos = parse_pos(a.first_pitch)
         except ValueError as e:
             sys.exit(str(e))
-        forced = clips[0]['start'] + DEFAULT_PRE_ROLL - pos
+        forced = first_window + DEFAULT_PRE_ROLL - pos
         print(f'first pitch {pos / 60:.0f}:{pos % 60:02.0f} into the video')
     anchor, why = choose_anchor(clips, dur, made, forced)
     anchor += a.offset
