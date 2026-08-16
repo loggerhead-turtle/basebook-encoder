@@ -253,6 +253,40 @@ class CloudLink:
             hi = getattr(self, '_temp_hi', None)
             self._temp_hi = t if hi is None else max(hi, t)
 
+    def watch_storage(self):
+        """Probe the recording disk and LOG a change of state.
+
+        The heartbeat carries this to the site, but at a field the uplink
+        is usually down — on the afternoon this was written for, the disk
+        died mid-morning, the box recorded nothing all game, and the only
+        trace anywhere was MediaMTX's own mkdir errors. The journal is the
+        one place a failure can still be found afterwards, so it gets
+        written there too. On the transition only: a line every 15 s for
+        hours buries itself."""
+        st = system.storage_status()
+        was = getattr(self, '_storage_ok', None)
+        now = bool(st.get('ok'))
+        if now != was:
+            if now:
+                log.warning('recording disk is writable again (%s)',
+                            st.get('device') or st.get('path'))
+            else:
+                log.error('RECORDING DISK FAILURE: %s — nothing is being '
+                          'recorded and no clips can be cut from this game',
+                          st.get('error') or 'not writable')
+            self._storage_ok = now
+        self._storage = st
+        self._storage_at = time.monotonic()
+        return st
+
+    def _storage_now(self, max_age=20):
+        """The last probe if it is fresh, else a new one — so the beat and
+        the watcher don't each write a probe file every cycle."""
+        if getattr(self, '_storage', None) is not None and \
+                time.monotonic() - getattr(self, '_storage_at', 0) < max_age:
+            return self._storage
+        return self.watch_storage()
+
     def heartbeat_payload(self):
         ingest = self.ingest_status()
         push = self.push_status()
@@ -267,7 +301,7 @@ class CloudLink:
             # Recording-disk health. The stream never touches the disk,
             # so a box can push a perfect feed into a dead NVMe all
             # evening — this is the field that finally says so.
-            'storage': system.storage_status(),
+            'storage': self._storage_now(),
             'cpu': system.cpu_percent(),
             'temp': system.cpu_temp(),
             # the PEAK since the last beat: a box that spikes to 82 °C
@@ -315,6 +349,14 @@ class CloudLink:
 
     def heartbeat_loop(self):
         while self.running:
+            # Watched every beat whether or not this box is paired, and
+            # whether or not the cloud is reachable — an unpaired or
+            # offline box is exactly the one whose disk failure nobody
+            # would otherwise ever hear about.
+            try:
+                self.watch_storage()
+            except Exception as e:
+                log.debug(f'storage watch failed: {e}')
             try:
                 if self.enabled():
                     self.send_heartbeat_once()
