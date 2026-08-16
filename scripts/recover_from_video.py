@@ -25,6 +25,12 @@ Credentials come from the encoder's own config (--base/--key, or copy
 them out of /etc/playcall-encoder/config.json on the box). Needs ffmpeg
 and ffprobe on PATH.
 
+A camera that already records H.264/AAC — a Mevo, most action cams, OBS
+— is stream-copied: about 15x faster over a whole game and with no
+generation of quality lost. HEVC (what iPhones and iPads shoot by
+default) is transcoded instead, because a clip a browser refuses to
+play is not a recovered clip. --copy / --reencode override the guess.
+
 THE ANCHOR IS THE WHOLE PROBLEM. Clip windows are absolute wall-clock
 times; a video file is just a timeline. Line them up wrongly by twenty
 seconds and every clip catches the wrong pitch. This reads the file's
@@ -102,20 +108,59 @@ def choose_anchor(clips, dur, made, forced=None):
                    f'({n_end}/{len(clips)} plays fall inside the video)'
 
 
-def cut(video, offset, duration, dest):
-    """One clip, re-encoded to H.264/AAC.
+def probe_codecs(video):
+    """(video_codec, audio_codec), lowercased, '' when a track is absent."""
+    out = subprocess.run(
+        ['ffprobe', '-v', 'error', '-print_format', 'json',
+         '-show_streams', str(video)],
+        capture_output=True, text=True, timeout=120)
+    v = a = ''
+    for s in (json.loads(out.stdout or '{}').get('streams') or []):
+        kind, name = s.get('codec_type'), (s.get('codec_name') or '').lower()
+        if kind == 'video' and not v:
+            v = name
+        elif kind == 'audio' and not a:
+            a = name
+    return v, a
 
-    Not a stream copy: phone and iPad footage is usually HEVC, which a
-    fair number of browsers refuse to play, and copying would also snap
-    the start to the nearest keyframe — up to a couple of seconds off,
-    which is a whole pitch."""
-    r = subprocess.run(
-        ['ffmpeg', '-y', '-v', 'error', '-ss', f'{offset:.2f}',
-         '-i', str(video), '-t', f'{duration:.2f}',
-         '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
-         '-c:a', 'aac', '-ac', '2',
-         '-avoid_negative_ts', 'make_zero', '-movflags', '+faststart',
-         str(dest)], capture_output=True, text=True, timeout=900)
+
+def pick_mode(vcodec, acodec, force=None):
+    """(stream_copy?, why). Copy when the source is already what a
+    browser wants.
+
+    A camera that records H.264/AAC — a Mevo, most action cams, OBS —
+    needs no transcode at all: copying is ~15x faster over a whole game
+    and avoids a generation of quality loss. The cost is that a copy can
+    only start on a keyframe, so ffmpeg backs up to the one before the
+    window; the clip runs a beat long at the front, which the pre-roll
+    padding was already there to absorb.
+
+    HEVC (iPhones and iPads default to it) has to be re-encoded — a fair
+    number of browsers refuse to play it, and a clip nobody can watch is
+    not a recovered clip."""
+    if force is not None:
+        return force, 'you asked for it'
+    if vcodec == 'h264' and acodec in ('aac', ''):
+        return True, f'source is already {vcodec}/{acodec or "no audio"}'
+    return False, f'source is {vcodec or "?"}/{acodec or "no audio"} — ' \
+                  'transcoding so every browser can play it'
+
+
+def cut_args(video, offset, duration, dest, copy):
+    """The ffmpeg argv for one clip. Split out so the choice of codec
+    path is testable without running ffmpeg over a whole game."""
+    codec = (['-c', 'copy'] if copy else
+             ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
+              '-c:a', 'aac', '-ac', '2'])
+    return ['ffmpeg', '-y', '-v', 'error', '-ss', f'{offset:.2f}',
+            '-i', str(video), '-t', f'{duration:.2f}', *codec,
+            '-avoid_negative_ts', 'make_zero', '-movflags', '+faststart',
+            str(dest)]
+
+
+def cut(video, offset, duration, dest, copy=False):
+    r = subprocess.run(cut_args(video, offset, duration, dest, copy),
+                       capture_output=True, text=True, timeout=900)
     if r.returncode != 0:
         raise RuntimeError((r.stderr or 'ffmpeg failed').strip()[-300:])
 
@@ -144,6 +189,12 @@ def main():
                    help='stop after N clips — use 1 to check the alignment')
     p.add_argument('--dry-run', action='store_true',
                    help='work out the cuts and print them, upload nothing')
+    g = p.add_mutually_exclusive_group()
+    g.add_argument('--copy', dest='force', action='store_const', const=True,
+                   help='stream-copy even if the codec looks unplayable')
+    g.add_argument('--reencode', dest='force', action='store_const',
+                   const=False, help='always transcode to H.264/AAC')
+    p.set_defaults(force=None)
     a = p.parse_args()
     if not a.key:
         sys.exit('No API key. Pass --key, or set PLAYCALL_KEY. It is the '
@@ -184,10 +235,14 @@ def main():
     anchor, why = choose_anchor(clips, dur, made, forced)
     anchor += a.offset
 
+    vcodec, acodec = probe_codecs(a.video)
+    copy, mode_why = pick_mode(vcodec, acodec, a.force)
+
     print(f'{len(clips)} uncut plays in {a.game}')
     print(f'video     {os.path.basename(a.video)} — {dur / 60:.1f} min')
     print(f'starts at {datetime.fromtimestamp(anchor):%Y-%m-%d %H:%M:%S} '
           f'({why})')
+    print(f'cutting   {"stream copy" if copy else "re-encode"} — {mode_why}')
     if a.offset:
         print(f'offset    {a.offset:+.1f}s applied')
 
@@ -225,7 +280,7 @@ def main():
             print(f'  {when}  {off / 60:6.1f} min in  {label} … ', end='',
                   flush=True)
             try:
-                cut(a.video, off, length, dest)
+                cut(a.video, off, length, dest, copy=copy)
                 with open(dest, 'rb') as fh:
                     body = fh.read()
                 api(a.base, a.key, f'/api/pi/clips/{c["id"]}/upload',
