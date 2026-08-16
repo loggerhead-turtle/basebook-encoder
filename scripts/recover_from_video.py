@@ -31,6 +31,15 @@ generation of quality lost. HEVC (what iPhones and iPads shoot by
 default) is transcoded instead, because a clip a browser refuses to
 play is not a recovered clip. --copy / --reencode override the guess.
 
+A GAME IN SEVERAL FILES (rain, batteries, a suspended game finished the
+next morning) needs no special handling: run it once per file. Plays
+outside whatever video you point at are skipped, so each session picks
+up only its own, and between them they cover the game. Anchor the first
+file with --first-pitch; the later ones have no first pitch in them, so
+use --start or let their own timestamps do it. --dry-run first is worth
+the ten seconds: it prints which plays a file covers without uploading
+anything.
+
 THE ANCHOR IS THE WHOLE PROBLEM. Clip windows are absolute wall-clock
 times; a video file is just a timeline. Line them up wrongly by twenty
 seconds and every clip catches the wrong pitch. This reads the file's
@@ -202,10 +211,13 @@ def main():
                                    '"YYYY-MM-DD HH:MM:SS" — overrides the '
                                    "file's own timestamp")
     p.add_argument('--first-pitch', dest='first_pitch',
-                   help='where the game\'s FIRST PITCH appears in the '
-                        'video, e.g. 25:45. Usually easier to find than '
-                        'the moment recording started, and needs no clock '
-                        'arithmetic')
+                   help='where the GAME\'S first pitch appears in this '
+                        'video, e.g. 25:45. Easier to find than the moment '
+                        'recording started, and needs no clock arithmetic. '
+                        'A game resumed after rain has its first pitch in '
+                        'the FIRST session only — anchor the later files '
+                        'with --start, or let the file\'s own timestamp do '
+                        'it')
     p.add_argument('--replace', action='store_true',
                    help='overwrite clips that already uploaded (use after '
                         'a --limit 1 test cut landed on the wrong play)')
