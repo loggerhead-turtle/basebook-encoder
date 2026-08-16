@@ -60,6 +60,24 @@ def api(base, key, path, data=None, ctype='application/json', timeout=120):
     return json.loads(body) if body.strip() else {}
 
 
+# The clip window opens this far before the at-bat's first pitch — the
+# encoder's own default pre_roll. Only used to turn "first pitch is
+# 25:45 into my video" into an anchor; a team that has tuned pre_roll
+# lands a second or two out, which --offset trims.
+DEFAULT_PRE_ROLL = 12.0
+
+
+def parse_pos(s):
+    """'25:45' → 1545.0. Also takes '1:25:45' and plain seconds."""
+    try:
+        secs = 0.0
+        for part in str(s).strip().split(':'):
+            secs = secs * 60 + float(part)
+        return secs
+    except ValueError:
+        raise ValueError(f'{s!r} is not a position like 25:45')
+
+
 def probe(video):
     """(duration_seconds, creation_epoch or None)."""
     out = subprocess.run(
@@ -183,6 +201,14 @@ def main():
     p.add_argument('--start', help='when recording started, local time, '
                                    '"YYYY-MM-DD HH:MM:SS" — overrides the '
                                    "file's own timestamp")
+    p.add_argument('--first-pitch', dest='first_pitch',
+                   help='where the game\'s FIRST PITCH appears in the '
+                        'video, e.g. 25:45. Usually easier to find than '
+                        'the moment recording started, and needs no clock '
+                        'arithmetic')
+    p.add_argument('--replace', action='store_true',
+                   help='overwrite clips that already uploaded (use after '
+                        'a --limit 1 test cut landed on the wrong play)')
     p.add_argument('--offset', type=float, default=0.0,
                    help='shift every cut by N seconds (negative = earlier)')
     p.add_argument('--limit', type=int, default=0,
@@ -218,20 +244,35 @@ def main():
 
     if not a.video:
         sys.exit('--video is required with --game')
-    clips = (api(a.base, a.key,
-                 f'/api/pi/clips/recoverable?game={a.game}').get('clips')
-             or [])
+    # --replace also pulls in clips that already uploaded, so a bad test
+    # cut can be re-cut over; without it those stay untouched.
+    q = f'/api/pi/clips/recoverable?game={a.game}'
+    clips = (api(a.base, a.key, q + ('&all=1' if a.replace else ''))
+             .get('clips') or [])
     if not clips:
         sys.exit(f'{a.game} has no uncut clips — nothing to do.')
 
     dur, made = probe(a.video)
     forced = None
+    if a.start and a.first_pitch:
+        sys.exit('Use --start or --first-pitch, not both.')
     if a.start:
         try:
             forced = datetime.strptime(a.start,
                                        '%Y-%m-%d %H:%M:%S').timestamp()
         except ValueError:
             sys.exit('--start must look like "2026-08-15 16:05:00"')
+    elif a.first_pitch:
+        # The earliest window opens DEFAULT_PRE_ROLL before that same
+        # first pitch, so the video's t=0 is that instant minus however
+        # far into the file the pitch appears. No clock arithmetic for
+        # the operator, and no reliance on the camera's own timestamp.
+        try:
+            pos = parse_pos(a.first_pitch)
+        except ValueError as e:
+            sys.exit(str(e))
+        forced = clips[0]['start'] + DEFAULT_PRE_ROLL - pos
+        print(f'first pitch {pos / 60:.0f}:{pos % 60:02.0f} into the video')
     anchor, why = choose_anchor(clips, dur, made, forced)
     anchor += a.offset
 
@@ -265,7 +306,7 @@ def main():
         todo = todo[:a.limit]
         print(f'--limit {a.limit}: doing the first {len(todo)}')
 
-    ok = bad = 0
+    ok = bad = dup = 0
     tmp = tempfile.mkdtemp(prefix='recover-')
     try:
         for c, off, length in todo:
@@ -283,10 +324,19 @@ def main():
                 cut(a.video, off, length, dest, copy=copy)
                 with open(dest, 'rb') as fh:
                     body = fh.read()
-                api(a.base, a.key, f'/api/pi/clips/{c["id"]}/upload',
-                    data=body, ctype='video/mp4', timeout=600)
-                print(f'{len(body) / 1e6:.1f} MB uploaded')
-                ok += 1
+                # repair=1 lets a cut land over one this script uploaded
+                # earlier — the way a bad test cut gets corrected, since
+                # there is no delete and re-cutting is the honest fix.
+                path = f'/api/pi/clips/{c["id"]}/upload'
+                r = api(a.base, a.key,
+                        path + ('?repair=1' if a.replace else ''),
+                        data=body, ctype='video/mp4', timeout=600)
+                if r.get('duplicate'):
+                    print('already uploaded — run with --replace to redo it')
+                    dup += 1
+                else:
+                    print(f'{len(body) / 1e6:.1f} MB uploaded')
+                    ok += 1
             except (urllib.error.URLError, RuntimeError, OSError) as e:
                 print(f'FAILED — {e}')
                 bad += 1
@@ -301,7 +351,8 @@ def main():
         except OSError:
             pass
 
-    print(f'\n{ok} recovered, {bad} failed')
+    print(f'\n{ok} recovered, {bad} failed'
+          + (f', {dup} already there (--replace to redo)' if dup else ''))
     if a.limit and ok:
         print('Now open that game on the Videos page and watch the clip.\n'
               'Right play? Re-run without --limit.\n'
