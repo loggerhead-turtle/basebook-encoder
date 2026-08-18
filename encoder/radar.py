@@ -57,6 +57,10 @@ PITCH_MAX_DUR = 1.6           # longer in the beam = a throw, not a pitch
 BAND = (30.0, 110.0)          # plausible pitch band (pref: set the GUN's
                               # LO threshold BELOW the slowest pitcher and
                               # let software filter — see the roadmap doc)
+# Multi-tag RD frames seen on a port that is NOT the claimed gun before
+# the claim moves there. Only a Stalker emits that stream, so three of
+# them are proof the gun is on the other cable — a wrong pin included.
+GUN_TAKEOVER_FRAMES = 3
 
 # ˆRD   34C [live]   5C [peak]   [const]   [6A | 9A<spin>]
 # The letter after 34/5 depends on the gun's format/units setting (34C on
@@ -203,14 +207,20 @@ class BurstEngine:
 
 def find_ports(cfg=None):
     """Candidate USB-RS232 adapters, stable by-id paths preferred. A
-    configured radar.port pins the GUN to one of them."""
+    configured radar.port puts the GUN's adapter FIRST — it no longer
+    hides the rest. A pin used to return exactly one port, which made
+    the box deaf to every other adapter: the day the two plugs got
+    swapped (two identical fresh cables), the pinned port — now the LED
+    board's — opened fine, the keepalive kept the pad's "radar ✓" lit,
+    and the gun streamed all game into a port nobody was reading. The
+    pin is a preference; the loop verifies it against what actually
+    talks like a gun."""
     want = ((cfg or {}).get('radar') or {}).get('port') or ''
-    if want:
-        return [want]
     byid = sorted(glob.glob('/dev/serial/by-id/*'))
-    if byid:
-        return byid
-    return sorted(glob.glob('/dev/ttyUSB*'))
+    ports = byid if byid else sorted(glob.glob('/dev/ttyUSB*'))
+    if want:
+        return [want] + [p for p in ports if p != want]
+    return ports
 
 
 def find_port(cfg=None):
@@ -256,6 +266,18 @@ class RadarService:
         self.cfg_disp_pinned = False
         self._disp_warned = 0.0
         self.last_frame = None         # newest parse result, for the board
+        # When the GUN was last actually heard (a line that parsed), on
+        # whatever clock handle_line was fed. This is what the keepalive
+        # carries: "alive" alone only ever meant "some adapter is open",
+        # and with the LED board cabled in that is ALWAYS true — the pad
+        # said "radar ✓" through an entire no-velo game on the strength
+        # of a heartbeat from the wrong cable.
+        self.last_gun_t = None
+        # A pinned radar.port that turned out to be the board — set when
+        # the claim moves off the pin, cleared on each reopen, surfaced
+        # in health() so the wrong pin is fixed in config, not
+        # rediscovered at the next field.
+        self.pin_overridden = False
 
     # ── cloud ────────────────────────────────────────────────────────────────
     def _post(self, payload):
@@ -289,7 +311,15 @@ class RadarService:
             or now - self._last_alive_post >= ALIVE_INTERVAL
         if not (want_live or self.pending or want_alive):
             return
-        payload = {'alive': True}
+        # The keepalive says WHO is alive. 'alive' is the service with an
+        # open adapter; 'gun.heard_s' is how long since a line actually
+        # parsed. The cloud shows "radar ✓" off the latter — an open
+        # LED-board adapter can no longer impersonate a working gun.
+        payload = {'alive': True,
+                   'gun': {'heard_s': (round(now - self.last_gun_t, 1)
+                                       if self.last_gun_t is not None
+                                       else None),
+                           'connected': bool(self.connected)}}
         if want_live:
             payload['live'] = {'velo': live[0], 'rpm': live[1]}
         if self.pending:
@@ -350,6 +380,14 @@ class RadarService:
             'baud': self.gun_baud,
             'lines': lines,
             'parsed': parsed,
+            # seconds since a line last PARSED — the difference between
+            # "an adapter is open" and "the gun is talking", which is
+            # the whole ✓-but-no-velo outage class
+            'gun_heard_s': (round(time.monotonic() - self.last_gun_t, 1)
+                            if self.last_gun_t is not None else None),
+            # the pinned gun port turned out not to be the gun — fix
+            # radar.port/display_port in config
+            'pin_overridden': bool(self.pin_overridden),
             # the number that would have named the glued-field bug in
             # one glance instead of a log dive
             'parse_pct': (round(100.0 * parsed / lines, 1)
@@ -436,6 +474,7 @@ class RadarService:
                             f'{self.lines_seen} — wrong format/baud?')
             return None
         self.frames_parsed += 1
+        self.last_gun_t = time.monotonic() if t is None else t
         if self.frames_parsed % 500 == 0:
             log.info(f'radar: {self.frames_parsed} frames parsed '
                      f'({self.lines_seen} lines, {self.unparsed} unparsed)')
@@ -509,12 +548,14 @@ class RadarService:
             self.gun_baud = gun_baud
             self.cfg_pinned = bool((cfg.get('radar') or {}).get('port'))
             self.cfg_disp_pinned = bool(disp_pin)
+            self.pin_overridden = False
             disp_baud = int((cfg.get('radar') or {}).get('display_baud')
                             or gun_baud)
             disp_fmt = ((cfg.get('radar') or {}).get('display_format')
                         or 'speed')
             handles, bufs = {}, {}
             claims = {'lines': 0, 'ok': 0}
+            probes = {}                 # port → RD frames heard off-claim
             try:
                 for p in ports:
                     try:
@@ -565,6 +606,37 @@ class RadarService:
                         for raw in lines:
                             if not raw.strip():
                                 continue
+                            if gun is not None and p != gun:
+                                # PROBE the ports the claim ignores. A
+                                # pinned radar.port used to be absolute:
+                                # with the plugs swapped, the box read
+                                # the LED board all game — keepalive up,
+                                # pad "radar ✓", zero velo — while the
+                                # gun streamed into a port nobody
+                                # listened to. Only multi-tag RD frames
+                                # count as evidence: a bare number here
+                                # can be the board echoing the very
+                                # speeds we write to it, and an echo
+                                # must never steal the claim.
+                                if _FRAME.search(
+                                        raw.decode('ascii', 'replace')):
+                                    probes[p] = probes.get(p, 0) + 1
+                                    if probes[p] >= GUN_TAKEOVER_FRAMES:
+                                        log.warning(
+                                            f'gun frames are streaming on '
+                                            f'{p}, not the claimed '
+                                            f'{gun} — moving the gun '
+                                            'there (radar.port in config '
+                                            'points at the wrong '
+                                            'adapter; update or clear '
+                                            'it)')
+                                        self.pin_overridden = True
+                                        gun = p
+                                        self.port = p
+                                        claims = {'lines': 0, 'ok': 0}
+                                        probes = {}
+                                else:
+                                    continue
                             if gun is None or p == gun:
                                 before = self.frames_parsed
                                 self.handle_line(
@@ -605,8 +677,14 @@ class RadarService:
                                         claims = {'lines': 0, 'ok': 0}
                             if gun == p:
                                 others = [q for q in handles if q != p]
-                                tgt = disp_pin or (others[0] if others
-                                                   else None)
+                                # a display pin that names the GUN's own
+                                # port (both pins swapped, claim moved)
+                                # falls back to the other adapter — the
+                                # board must never be "the gun itself"
+                                tgt = (disp_pin
+                                       if disp_pin and disp_pin != p
+                                       else (others[0] if others
+                                             else None))
                                 # 'speed' (default) drives the board in
                                 # the display protocol it understands;
                                 # radar.display_format='raw' restores
