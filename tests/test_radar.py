@@ -274,12 +274,16 @@ def test_closed_pitch_events_land_in_the_log(caplog):
     assert any('radar rx sample' in r.message for r in caplog.records)
 
 
-def test_find_ports_lists_all_candidates_and_config_pins_one(monkeypatch,
-                                                             tmp_path):
-    """REGRESSION: two adapters were present and the service silently
-    picked the alphabetically-first (wrong) one for a whole game. The
-    port finder now returns every candidate so the loop can rotate off
-    a silent one; an explicit radar.port config pins exactly one."""
+def test_find_ports_lists_all_candidates_and_config_prefers_one(monkeypatch,
+                                                                tmp_path):
+    """REGRESSION, twice. Two adapters were present and the service
+    silently picked the alphabetically-first (wrong) one for a whole
+    game — so the finder returns every candidate. Then a PIN did the
+    same thing one layer up: radar.port used to return exactly one
+    port, so a pin gone stale (fresh cables, swapped plugs) made the
+    box deaf to the port the gun was actually on while the wrong port
+    kept the keepalive — "radar ✓", zero velo. A pin now puts its port
+    FIRST and keeps the rest visible."""
     from encoder import radar as radar_mod
     fake = {'/dev/serial/by-id/usb-FTDI_A9': None,
             '/dev/serial/by-id/usb-FTDI_BG': None}
@@ -288,7 +292,15 @@ def test_find_ports_lists_all_candidates_and_config_pins_one(monkeypatch,
     assert radar_mod.find_ports({}) == sorted(fake)
     assert radar_mod.find_port({}) == '/dev/serial/by-id/usb-FTDI_A9'
     pinned = {'radar': {'port': '/dev/serial/by-id/usb-FTDI_BG'}}
-    assert radar_mod.find_ports(pinned) == ['/dev/serial/by-id/usb-FTDI_BG']
+    assert radar_mod.find_ports(pinned) == [
+        '/dev/serial/by-id/usb-FTDI_BG', '/dev/serial/by-id/usb-FTDI_A9']
+    assert radar_mod.find_port(pinned) == '/dev/serial/by-id/usb-FTDI_BG'
+    # a stale pin (adapter replaced, by-id path gone) still lists the
+    # real adapters after it instead of hiding them
+    stale = {'radar': {'port': '/dev/serial/by-id/usb-FTDI_OLD'}}
+    assert radar_mod.find_ports(stale) == [
+        '/dev/serial/by-id/usb-FTDI_OLD',
+        '/dev/serial/by-id/usb-FTDI_A9', '/dev/serial/by-id/usb-FTDI_BG']
 
 
 # ── LED display board passthrough ────────────────────────────────────────────
@@ -373,6 +385,105 @@ def test_loop_discards_a_stale_backlog(monkeypatch):
     monkeypatch.setattr(radar_mod.time, 'sleep', _sleep)
     svc.loop()
     assert svc.frames_parsed == 5           # the newest 5, not all 100
+
+
+def test_a_wrong_pin_releases_to_the_port_streaming_gun_frames(monkeypatch):
+    """THE ✓-but-no-velo day: radar.port and radar.display_port both
+    pinned, then the two identical cables landed on swapped adapters.
+    The pinned "gun" port (really the board) opened fine, keepalives
+    kept the pad's "radar ✓" lit, and the gun streamed into a port the
+    old code never opened at all. Now the pin only sorts first: RD
+    frames on the other adapter take the claim, capture flows, and the
+    board is driven on the remaining port — with the override flagged
+    in health so the config gets fixed instead of rediscovered."""
+    import sys
+    import types
+    from encoder import radar as radar_mod
+    board_p = '/dev/serial/by-id/usb-FTDI_BOARD'   # pinned as the "gun"
+    gun_p = '/dev/serial/by-id/usb-FTDI_GUN'       # pinned as the "board"
+    frames = (FIELD_LIVE + '\r' + FIELD_LIVE + '\r' + FIELD_LIVE + '\r'
+              + FIELD_SPIN + '\r').encode()
+    _FakePort.SCRIPT = {board_p: [], gun_p: [frames]}
+    _FakePort.OPEN = {}
+    monkeypatch.setitem(sys.modules, 'serial',
+                        types.SimpleNamespace(Serial=_FakePort))
+    monkeypatch.setattr(radar_mod, 'find_ports',
+                        lambda cfg=None: [board_p, gun_p])
+    cfg = {'radar': {'port': board_p, 'display_port': gun_p}}
+    svc = RadarService(_FakeLink(), cfg_load=lambda: cfg)
+    sleeps = {'n': 0}
+
+    def _sleep(s):
+        sleeps['n'] += 1
+        if sleeps['n'] > 3:
+            svc.running = False
+    monkeypatch.setattr(radar_mod.time, 'sleep', _sleep)
+    svc.loop()
+    assert svc.port == gun_p                # the claim moved to the gun
+    assert svc.pin_overridden is True       # and said so in health
+    assert svc.health()['pin_overridden'] is True
+    # the first two frames were spent as takeover evidence; from the
+    # third on, capture flows
+    assert svc.frames_parsed == 2
+    # the display pin names the gun's own port — the board is driven on
+    # the OTHER adapter (where it actually is), never the gun itself
+    disp = _FakePort.OPEN.get(board_p)
+    assert disp and disp.written == [b' 58.6\r', b' 53.7\r']
+
+
+def test_board_echo_of_our_own_speeds_never_steals_the_claim(monkeypatch):
+    """The speeds we write to the board are format-A lines — exactly
+    what the parser accepts. A board (or a looped-back cable) echoing
+    them must not count as gun evidence, or the claim would chase its
+    own output. Only multi-tag RD frames move the claim."""
+    import sys
+    import types
+    from encoder import radar as radar_mod
+    gun_p = '/dev/serial/by-id/usb-FTDI_GUN'
+    board_p = '/dev/serial/by-id/usb-FTDI_BOARD'
+    echoes = b' 58.6\r' * 5
+    _FakePort.SCRIPT = {gun_p: [(FIELD_LIVE + '\r' + FIELD_SPIN
+                                 + '\r').encode()],
+                        board_p: [echoes]}
+    _FakePort.OPEN = {}
+    monkeypatch.setitem(sys.modules, 'serial',
+                        types.SimpleNamespace(Serial=_FakePort))
+    monkeypatch.setattr(radar_mod, 'find_ports',
+                        lambda cfg=None: [gun_p, board_p])
+    cfg = {'radar': {'port': gun_p, 'display_port': board_p}}
+    svc = RadarService(_FakeLink(), cfg_load=lambda: cfg)
+    sleeps = {'n': 0}
+
+    def _sleep(s):
+        sleeps['n'] += 1
+        if sleeps['n'] > 3:
+            svc.running = False
+    monkeypatch.setattr(radar_mod.time, 'sleep', _sleep)
+    svc.loop()
+    assert svc.port == gun_p                # the echo changed nothing
+    assert svc.pin_overridden is False
+    assert svc.frames_parsed == 2           # only the gun's frames
+
+
+def test_keepalive_reports_whether_the_gun_was_heard():
+    """'alive' proves the service has an open adapter — with the LED
+    board cabled in, that is always true. The keepalive now carries how
+    long since a line PARSED, so the cloud can tell a talking gun from
+    a lit heartbeat on the wrong cable."""
+    link = _FakeLink()
+    svc = RadarService(link)
+    svc.push(force_alive=True, now=50.0)
+    assert link.posts[-1][1]['gun']['heard_s'] is None   # never heard
+    svc.handle_line(FIELD_LIVE, t=100.0)
+    svc.push(force_alive=True, now=104.5)
+    assert link.posts[-1][1]['gun']['heard_s'] == 4.5
+
+
+def test_health_reports_gun_heard_and_pin_override():
+    svc = RadarService(_DeadLink())
+    h = svc.health()
+    assert h['gun_heard_s'] is None
+    assert h['pin_overridden'] is False
 
 
 def test_display_board_vanishing_never_touches_capture():
