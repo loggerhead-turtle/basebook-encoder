@@ -274,26 +274,33 @@ def test_closed_pitch_events_land_in_the_log(caplog):
     assert any('radar rx sample' in r.message for r in caplog.records)
 
 
-def test_find_ports_lists_all_candidates_and_config_pins_one(monkeypatch,
-                                                             tmp_path):
-    """REGRESSION: two adapters were present and the service silently
-    picked the alphabetically-first (wrong) one for a whole game. The
-    port finder now returns every candidate so the loop can rotate off
-    a silent one; an explicit radar.port config pins exactly one."""
+def test_find_ports_lists_all_candidates_and_config_prefers_one(monkeypatch,
+                                                                tmp_path):
+    """REGRESSION, twice. Two adapters were present and the service
+    silently picked the alphabetically-first (wrong) one for a whole
+    game — so the finder returns every candidate. Then a PIN did the
+    same thing one layer up: radar.port used to return exactly one
+    port, so a pin gone stale (fresh cables, swapped plugs) made the
+    box deaf to the port the gun was actually on while the wrong port
+    kept the keepalive — "radar ✓", zero velo. A pin now puts its port
+    FIRST and keeps the rest visible."""
     from encoder import radar as radar_mod
-    # Real files, because a pin now only wins while its adapter is still
-    # THERE — a by-id path carries the adapter's serial number, and one
-    # that has been unplugged used to be returned anyway, for ever.
-    a9 = tmp_path / 'usb-FTDI_A9'
-    bg = tmp_path / 'usb-FTDI_BG'
-    a9.write_text('')
-    bg.write_text('')
-    fake = sorted([str(a9), str(bg)])
+    fake = {'/dev/serial/by-id/usb-FTDI_A9': None,
+            '/dev/serial/by-id/usb-FTDI_BG': None}
     monkeypatch.setattr(radar_mod.glob, 'glob',
-                        lambda pat: (fake if 'by-id' in pat else []))
-    assert radar_mod.find_ports({}) == fake
-    assert radar_mod.find_port({}) == fake[0]
-    assert radar_mod.find_ports({'radar': {'port': str(bg)}}) == [str(bg)]
+                        lambda pat: (sorted(fake) if 'by-id' in pat else []))
+    assert radar_mod.find_ports({}) == sorted(fake)
+    assert radar_mod.find_port({}) == '/dev/serial/by-id/usb-FTDI_A9'
+    pinned = {'radar': {'port': '/dev/serial/by-id/usb-FTDI_BG'}}
+    assert radar_mod.find_ports(pinned) == [
+        '/dev/serial/by-id/usb-FTDI_BG', '/dev/serial/by-id/usb-FTDI_A9']
+    assert radar_mod.find_port(pinned) == '/dev/serial/by-id/usb-FTDI_BG'
+    # a stale pin (adapter replaced, by-id path gone) still lists the
+    # real adapters after it instead of hiding them
+    stale = {'radar': {'port': '/dev/serial/by-id/usb-FTDI_OLD'}}
+    assert radar_mod.find_ports(stale) == [
+        '/dev/serial/by-id/usb-FTDI_OLD',
+        '/dev/serial/by-id/usb-FTDI_A9', '/dev/serial/by-id/usb-FTDI_BG']
 
 
 # ── LED display board passthrough ────────────────────────────────────────────
@@ -378,6 +385,105 @@ def test_loop_discards_a_stale_backlog(monkeypatch):
     monkeypatch.setattr(radar_mod.time, 'sleep', _sleep)
     svc.loop()
     assert svc.frames_parsed == 5           # the newest 5, not all 100
+
+
+def test_a_wrong_pin_releases_to_the_port_streaming_gun_frames(monkeypatch):
+    """THE ✓-but-no-velo day: radar.port and radar.display_port both
+    pinned, then the two identical cables landed on swapped adapters.
+    The pinned "gun" port (really the board) opened fine, keepalives
+    kept the pad's "radar ✓" lit, and the gun streamed into a port the
+    old code never opened at all. Now the pin only sorts first: RD
+    frames on the other adapter take the claim, capture flows, and the
+    board is driven on the remaining port — with the override flagged
+    in health so the config gets fixed instead of rediscovered."""
+    import sys
+    import types
+    from encoder import radar as radar_mod
+    board_p = '/dev/serial/by-id/usb-FTDI_BOARD'   # pinned as the "gun"
+    gun_p = '/dev/serial/by-id/usb-FTDI_GUN'       # pinned as the "board"
+    frames = (FIELD_LIVE + '\r' + FIELD_LIVE + '\r' + FIELD_LIVE + '\r'
+              + FIELD_SPIN + '\r').encode()
+    _FakePort.SCRIPT = {board_p: [], gun_p: [frames]}
+    _FakePort.OPEN = {}
+    monkeypatch.setitem(sys.modules, 'serial',
+                        types.SimpleNamespace(Serial=_FakePort))
+    monkeypatch.setattr(radar_mod, 'find_ports',
+                        lambda cfg=None: [board_p, gun_p])
+    cfg = {'radar': {'port': board_p, 'display_port': gun_p}}
+    svc = RadarService(_FakeLink(), cfg_load=lambda: cfg)
+    sleeps = {'n': 0}
+
+    def _sleep(s):
+        sleeps['n'] += 1
+        if sleeps['n'] > 3:
+            svc.running = False
+    monkeypatch.setattr(radar_mod.time, 'sleep', _sleep)
+    svc.loop()
+    assert svc.port == gun_p                # the claim moved to the gun
+    assert svc.pin_overridden is True       # and said so in health
+    assert svc.health()['pin_overridden'] is True
+    # the first two frames were spent as takeover evidence; from the
+    # third on, capture flows
+    assert svc.frames_parsed == 2
+    # the display pin names the gun's own port — the board is driven on
+    # the OTHER adapter (where it actually is), never the gun itself
+    disp = _FakePort.OPEN.get(board_p)
+    assert disp and disp.written == [b' 58.6\r', b' 53.7\r']
+
+
+def test_board_echo_of_our_own_speeds_never_steals_the_claim(monkeypatch):
+    """The speeds we write to the board are format-A lines — exactly
+    what the parser accepts. A board (or a looped-back cable) echoing
+    them must not count as gun evidence, or the claim would chase its
+    own output. Only multi-tag RD frames move the claim."""
+    import sys
+    import types
+    from encoder import radar as radar_mod
+    gun_p = '/dev/serial/by-id/usb-FTDI_GUN'
+    board_p = '/dev/serial/by-id/usb-FTDI_BOARD'
+    echoes = b' 58.6\r' * 5
+    _FakePort.SCRIPT = {gun_p: [(FIELD_LIVE + '\r' + FIELD_SPIN
+                                 + '\r').encode()],
+                        board_p: [echoes]}
+    _FakePort.OPEN = {}
+    monkeypatch.setitem(sys.modules, 'serial',
+                        types.SimpleNamespace(Serial=_FakePort))
+    monkeypatch.setattr(radar_mod, 'find_ports',
+                        lambda cfg=None: [gun_p, board_p])
+    cfg = {'radar': {'port': gun_p, 'display_port': board_p}}
+    svc = RadarService(_FakeLink(), cfg_load=lambda: cfg)
+    sleeps = {'n': 0}
+
+    def _sleep(s):
+        sleeps['n'] += 1
+        if sleeps['n'] > 3:
+            svc.running = False
+    monkeypatch.setattr(radar_mod.time, 'sleep', _sleep)
+    svc.loop()
+    assert svc.port == gun_p                # the echo changed nothing
+    assert svc.pin_overridden is False
+    assert svc.frames_parsed == 2           # only the gun's frames
+
+
+def test_keepalive_reports_whether_the_gun_was_heard():
+    """'alive' proves the service has an open adapter — with the LED
+    board cabled in, that is always true. The keepalive now carries how
+    long since a line PARSED, so the cloud can tell a talking gun from
+    a lit heartbeat on the wrong cable."""
+    link = _FakeLink()
+    svc = RadarService(link)
+    svc.push(force_alive=True, now=50.0)
+    assert link.posts[-1][1]['gun']['heard_s'] is None   # never heard
+    svc.handle_line(FIELD_LIVE, t=100.0)
+    svc.push(force_alive=True, now=104.5)
+    assert link.posts[-1][1]['gun']['heard_s'] == 4.5
+
+
+def test_health_reports_gun_heard_and_pin_override():
+    svc = RadarService(_DeadLink())
+    h = svc.health()
+    assert h['gun_heard_s'] is None
+    assert h['pin_overridden'] is False
 
 
 def test_display_board_vanishing_never_touches_capture():
@@ -517,59 +623,59 @@ def test_the_plate_reading_is_the_last_live_speed_not_a_zero():
     assert evs[0]['plate'] == 75.0
 
 
-# ── a pin that outlived its adapter ──────────────────────────────────────────
-# FIELD REPORT: radar.port was pinned to a by-id path carrying one
-# adapter's serial number. The adapter was not plugged in, so the path did
-# not exist — and find_ports returned it anyway, unconditionally. The open
-# failed, no handles were left, the service slept five seconds and tried
-# the same missing path again. The box logged that line every five seconds
-# all night and never once looked at the adapter that WAS present.
-
-def test_a_pin_that_exists_still_wins(tmp_path):
-    from encoder import radar
-    real = tmp_path / 'ttyGUN'
-    real.write_text('')
-    cfg = {'radar': {'port': str(real)}}
-    assert radar.find_ports(cfg) == [str(real)]
-
-
-def test_a_pin_that_is_gone_falls_back_to_scanning(monkeypatch):
-    """A preference, not a suicide pact."""
-    from encoder import radar
-    monkeypatch.setattr(radar.glob, 'glob', lambda pat: (
-        ['/dev/serial/by-id/usb-REAL-if00-port0']
-        if 'by-id' in pat else []))
-    ports = radar.find_ports({'radar': {'port': '/dev/serial/by-id/usb-GONE'}})
-    assert ports == ['/dev/serial/by-id/usb-REAL-if00-port0']
-
+# ── a gun on the far end of Bluetooth ────────────────────────────────────────
+# An rfcomm binding is an ordinary tty — it just lives nowhere near
+# /dev/serial/by-id, so the scan above could never see one.
 
 def test_a_bluetooth_gun_is_found_like_any_other(monkeypatch):
-    """An rfcomm binding is an ordinary tty — it just lives nowhere near
-    /dev/serial/by-id, so the old scan could never see it."""
     from encoder import radar
-    monkeypatch.setattr(radar.glob, 'glob', lambda pat: (
-        ['/dev/rfcomm0'] if 'rfcomm' in pat else []))
+    monkeypatch.setattr(radar.glob, 'glob',
+                        lambda pat: ['/dev/rfcomm0'] if 'rfcomm' in pat else [])
     assert radar.find_ports({}) == ['/dev/rfcomm0']
 
 
 def test_a_cabled_gun_and_a_bluetooth_one_can_both_be_present(monkeypatch):
     from encoder import radar
+
     def fake(pat):
         if 'by-id' in pat:
             return ['/dev/serial/by-id/usb-FTDI-if00-port0']
-        if 'rfcomm' in pat:
-            return ['/dev/rfcomm0']
-        return []
+        return ['/dev/rfcomm0'] if 'rfcomm' in pat else []
     monkeypatch.setattr(radar.glob, 'glob', fake)
     assert radar.find_ports({}) == ['/dev/serial/by-id/usb-FTDI-if00-port0',
                                     '/dev/rfcomm0']
 
 
-def test_nothing_plugged_in_is_an_empty_list_not_a_ghost(monkeypatch):
+def test_a_bluetooth_port_can_be_pinned_like_a_cabled_one(monkeypatch):
+    from encoder import radar
+
+    def fake(pat):
+        if 'by-id' in pat:
+            return ['/dev/serial/by-id/usb-FTDI-if00-port0']
+        return ['/dev/rfcomm0'] if 'rfcomm' in pat else []
+    monkeypatch.setattr(radar.glob, 'glob', fake)
+    assert radar.find_ports({'radar': {'port': '/dev/rfcomm0'}})[0] \
+        == '/dev/rfcomm0'
+
+
+def test_nothing_plugged_in_is_an_empty_list(monkeypatch):
     from encoder import radar
     monkeypatch.setattr(radar.glob, 'glob', lambda pat: [])
     assert radar.find_ports({}) == []
-    assert radar.find_ports({'radar': {'port': '/dev/nope'}}) == []
+
+
+def test_a_pin_whose_adapter_is_gone_says_so_once(monkeypatch, caplog):
+    """It still lists the pin first (the loop decides what really talks
+    like a gun) — but silently retrying a path that cannot exist is how
+    a box spends a night logging the same line every five seconds."""
+    import logging
+    from encoder import radar
+    monkeypatch.setattr(radar.glob, 'glob', lambda pat: (
+        ['/dev/serial/by-id/usb-REAL-if00-port0'] if 'by-id' in pat else []))
+    with caplog.at_level(logging.WARNING, logger='radar'):
+        ports = radar.find_ports({'radar': {'port': '/dev/serial/by-id/GONE'}})
+    assert '/dev/serial/by-id/usb-REAL-if00-port0' in ports
+    assert 'is not there' in caplog.text
 
 
 # ── the shipped Bluetooth plumbing ───────────────────────────────────────────
@@ -594,8 +700,8 @@ def test_the_bt_unit_binds_before_the_radar_service_looks():
     cp.read(_repo('systemd', 'playcall-encoder-radarbt.service'))
     assert cp.get('Unit', 'Before') == 'playcall-encoder.service'
     assert cp.get('Service', 'Type') == 'oneshot'
-    # same start-limit placement as its siblings (systemd ignores it in
-    # [Service], which cost the other four units their crash protection)
+    # systemd ignores this key in [Service] — which already cost the
+    # other four units their crash protection
     assert cp.has_option('Unit', 'StartLimitIntervalSec')
     assert not cp.has_option('Service', 'StartLimitIntervalSec')
 
@@ -604,7 +710,7 @@ def test_the_installer_ships_bluetooth_and_quicksync():
     sh = open(_repo('install.sh')).read()
     assert 'bluez' in sh
     assert 'playcall-encoder-radarbt.service' in sh
-    # x86 only: the Pi has no encoder to give permissions to
     assert 'x86_64' in sh and 'intel-media-va-driver' in sh
-    # and the render-group grant must come AFTER the user exists
+    # the render-group grant has to come AFTER the user exists, or it
+    # fails silently and every hardware encode looks like a codec bug
     assert sh.index('useradd --system') < sh.index('usermod -aG')
