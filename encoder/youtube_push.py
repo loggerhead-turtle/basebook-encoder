@@ -55,16 +55,52 @@ def probe_audio_codec(cfg, runner=None):
     return (r.stdout or '').strip() if r.returncode == 0 else ''
 
 
-def build_ffmpeg_cmd(cfg, acodec, push_url):
+def push_bitrate(cfg, hw=None):
+    """The kbps this box should TRANSCODE the push to, or 0 for copy.
+
+    Non-zero only when both halves are true: somebody configured a
+    bitrate AND this box owns a hardware encoder. A Pi 5 has none — its
+    push is a stream copy by necessity — so a bitrate configured there
+    (a setting synced from the cloud to a mixed fleet, say) degrades to
+    copy with one log line, never an ffmpeg error loop. The local
+    recording is untouched either way: MediaMTX records the camera's own
+    stream, so clips keep full quality while YouTube gets a rate the
+    field uplink can carry."""
+    try:
+        kbps = int(cfg.get('push_bitrate_kbps') or 0)
+    except (TypeError, ValueError):
+        kbps = 0
+    if kbps <= 0:
+        return 0
+    kbps = max(1000, min(12000, kbps))
+    hw = system.hw_encoder() if hw is None else hw
+    if hw != 'vaapi':
+        return 0
+    return kbps
+
+
+def build_ffmpeg_cmd(cfg, acodec, push_url, hw=None):
     if not acodec or acodec == 'aac':
         input_args = ['-rw_timeout', '10000000', '-i', rtmp_in(cfg)]
         audio_args = ['-c:a', 'copy']
     else:
         input_args = ['-rtsp_transport', 'tcp', '-i', rtsp_in(cfg)]
         audio_args = ['-c:a', 'aac', '-b:a', '128k', '-ar', '48000']
+    kbps = push_bitrate(cfg, hw=hw)
+    if kbps:
+        # QuickSync via VA-API: decode on CPU (cheap), upload frames to
+        # the GPU, encode there. CBR-ish with a 2x buffer and a 2 s GOP —
+        # what YouTube's ingest guidance wants for live.
+        video_args = ['-vaapi_device', '/dev/dri/renderD128',
+                      '-vf', 'format=nv12,hwupload',
+                      '-c:v', 'h264_vaapi',
+                      '-b:v', f'{kbps}k', '-maxrate', f'{kbps}k',
+                      '-bufsize', f'{kbps * 2}k', '-g', '60']
+    else:
+        video_args = ['-c:v', 'copy']
     return (['ffmpeg', '-hide_banner', '-loglevel', 'warning',
              '-progress', 'pipe:1', '-nostats']
-            + input_args + ['-c:v', 'copy'] + audio_args
+            + input_args + video_args + audio_args
             + ['-f', 'flv', push_url])
 
 
@@ -135,7 +171,15 @@ class YouTubePusher:
             return 0
         acodec = probe_audio_codec(cfg, self.runner)
         cmd = build_ffmpeg_cmd(cfg, acodec, url)
-        log.info(f"push start (audio={acodec or 'assume-aac'})")
+        kbps = push_bitrate(cfg)
+        want = int(cfg.get('push_bitrate_kbps') or 0)
+        if want > 0 and not kbps:
+            # configured for a box class this box is not — say so once
+            # per attempt, then do the right thing anyway
+            log.info(f'push_bitrate_kbps={want} configured but this box '
+                     'has no hardware encoder — pushing source copy')
+        log.info(f"push start (audio={acodec or 'assume-aac'}, video="
+                 + (f'{kbps}k transcode' if kbps else 'copy') + ')')
         started = time.monotonic()
         state = {}
         self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,

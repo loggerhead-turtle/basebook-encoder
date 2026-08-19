@@ -453,6 +453,36 @@ def storage_status(path=None):
     return st
 
 
+_HW_ENCODER = None
+
+
+def hw_encoder():
+    """'vaapi' when this box can hardware-encode H.264, else ''.
+
+    The whole reason to run the encoder on an Intel N100/N150 instead of
+    a Pi 5: the Pi has NO video encoder at all (its push is a stream
+    copy by necessity), while QuickSync encodes 1080p for single-digit
+    watts. Detection is two facts checked once per process: the render
+    node exists and this ffmpeg build knows h264_vaapi. Either missing →
+    copy mode, exactly the Pi behavior, never an error."""
+    global _HW_ENCODER
+    if _HW_ENCODER is not None:
+        return _HW_ENCODER
+    if fake_mode():
+        _HW_ENCODER = os.environ.get('SCOREBUG_FAKE_HW', '')
+        return _HW_ENCODER
+    found = ''
+    try:
+        if os.path.exists('/dev/dri/renderD128'):
+            r = run(['ffmpeg', '-hide_banner', '-encoders'], timeout=20)
+            if 'h264_vaapi' in (r.stdout or ''):
+                found = 'vaapi'
+    except Exception:
+        found = ''
+    _HW_ENCODER = found
+    return found
+
+
 def journal_tail(lines=20, units=('playcall-encoder',
                                   'playcall-encoder-youtube',
                                   'playcall-encoder-mediamtx',

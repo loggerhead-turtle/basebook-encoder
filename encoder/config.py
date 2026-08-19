@@ -38,6 +38,13 @@ DEFAULTS = {
     # for a code taken off the boot partition of a prebuilt image.
     'pending_code': '',
     'bandwidth': 0,
+    # YouTube push bitrate, kbps. 0 = push the camera's own stream
+    # untouched (the only mode a Pi 5 has — it owns no video encoder).
+    # On a box with QuickSync (N100/N150), a non-zero value transcodes
+    # the push down while the LOCAL recording keeps the camera's full
+    # quality: send the box 1080p at 10 Mbps for crisp clips, hand
+    # YouTube 3 Mbps the field uplink can actually carry.
+    'push_bitrate_kbps': 0,
     # True = recording to the SD card instead of the NVMe is a CHOICE
     # (the drive is out for repair, or this box never had one). The
     # storage check then reports the fallback instead of raising a

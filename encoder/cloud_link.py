@@ -119,7 +119,7 @@ class CloudLink:
         (feed repointed / push target rewritten / service restarted)."""
         sig = (bool(a.get('assigned')), a.get('team_id'),
                a.get('bug_feed_url'), a.get('youtube_rtmp_url'),
-               a.get('game_id'))
+               a.get('game_id'), a.get('push_bitrate_kbps'))
         if sig == self.last_assignment:
             return False
         self.last_assignment = sig
@@ -143,6 +143,23 @@ class CloudLink:
             if cfg['youtube'].get('key'):
                 cfg['youtube']['key'] = ''
                 restart_push = True
+
+        # YouTube quality, set from the site's encoder card. None means
+        # the cloud has no opinion (older cloud, or never set) — the
+        # box's local setting stands. An int, INCLUDING 0 (= source
+        # copy), is authoritative: the selector must be able to turn
+        # transcoding off again.
+        pk = a.get('push_bitrate_kbps')
+        if pk is not None:
+            try:
+                pk = max(0, min(12000, int(pk)))
+            except (TypeError, ValueError):
+                pk = None
+        if pk is not None and pk != int(cfg.get('push_bitrate_kbps') or 0):
+            cfg['push_bitrate_kbps'] = pk
+            restart_push = True
+            log.info(f'push quality set from the cloud: '
+                     + (f'{pk} kbps transcode' if pk else 'source copy'))
 
         self.cfg_save(cfg)
         if restart_push:
@@ -288,6 +305,7 @@ class CloudLink:
         return self.watch_storage()
 
     def heartbeat_payload(self):
+        cfg = self.cfg_load()
         ingest = self.ingest_status()
         push = self.push_status()
         state = ('pushing' if push['connected']
@@ -302,6 +320,13 @@ class CloudLink:
             # so a box can push a perfect feed into a dead NVMe all
             # evening — this is the field that finally says so.
             'storage': self._storage_now(),
+            # Can this box transcode the push, and to what target? The
+            # site's quality selector only shows for capable boxes — a
+            # Pi 5 owns no video encoder and stays copy-mode for life.
+            'transcode': {
+                'capable': bool(system.hw_encoder()),
+                'target_kbps': int(cfg.get('push_bitrate_kbps') or 0),
+            },
             'cpu': system.cpu_percent(),
             'temp': system.cpu_temp(),
             # the PEAK since the last beat: a box that spikes to 82 °C
