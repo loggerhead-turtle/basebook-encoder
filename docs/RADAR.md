@@ -72,6 +72,26 @@ itself and logs `learned the cables`. Replace a cable and it re-learns
 on the first trigger pull. Plug into different USB ports every game and
 nothing changes at all.
 
+**Same-model cables: check whether your adapters have real serials.**
+With both cables plugged in:
+
+```bash
+ls -l /dev/serial/by-id/; ls /dev/ttyUSB*
+```
+
+Two by-id entries with **different** serial strings = trustworthy names;
+the box remembers its cables and everything above applies. **One by-id
+entry while two ttyUSB devices exist, or two entries whose serial
+strings match** = clone chips sharing a serial. Those names point at
+whichever cable enumerated last — the gun on one boot, the board on the
+next — so the box refuses to remember them (it logs `same-model clone
+cables`) and instead identifies the gun by listening on every boot:
+both ports are watched in silence, the first one producing radar frames
+is the gun, the other is therefore the board, and only then is anything
+written to it. That works regardless of names; the only cost is a few
+seconds of listening after each boot. Cables with genuine unique
+serials are worth the money for a product build.
+
 **A pin is a preference, not a requirement.** A by-id path carries the
 adapter's serial number, so an adapter that is unplugged, swapped or
 dead takes the pin with it. When a pinned port is missing the box logs
