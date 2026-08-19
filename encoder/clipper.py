@@ -119,8 +119,35 @@ class Clipper:
         req = urllib.request.Request(
             base + path, data=data,
             headers={'X-Api-Key': key, 'content-type': ctype})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode() or '{}')
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode() or '{}')
+        except urllib.error.HTTPError as e:
+            # urllib's own message is the status line and nothing else, so
+            # a support bundle read "HTTP Error 400: Bad Request" for a
+            # response whose body said exactly what was wrong. The
+            # throttled upload path has always quoted the body; this one
+            # is what a box with no bandwidth cap uses, which is most of
+            # them. Carry the server's sentence into the error.
+            detail = body = ''
+            try:
+                body = e.read().decode(errors='replace').strip()
+            except Exception:
+                pass
+            try:
+                detail = (json.loads(body or '{}') or {}).get('error') or ''
+            except Exception:
+                detail = ''          # not JSON — a proxy's HTML or plain text
+            detail = detail or body[:200]
+            if not detail:
+                raise
+            # Re-raise as the SAME class, with the server's sentence as the
+            # reason. Every caller still sees an HTTPError with its code —
+            # the poll loop's "cloud unreachable" branch and the 404
+            # no-recording check both keep working — it just finally says
+            # what the server said.
+            raise urllib.error.HTTPError(
+                e.url, e.code, detail[:200], e.headers, None) from None
 
     def _mark_failed(self, base, key, cid, why):
         try:

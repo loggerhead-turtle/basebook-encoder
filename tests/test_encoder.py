@@ -491,7 +491,10 @@ def test_heartbeat_payload_shape():
     assert hb['state'] == 'pushing'
     assert set(hb) == {'state', 'ingest', 'push', 'cpu', 'temp',
                        'version', 'log_tail', 'hostname', 'ip', 'clips',
-                       'pin', 'rtmp_urls', 'radar', 'temp_max', 'storage'}
+                       'pin', 'rtmp_urls', 'radar', 'temp_max', 'storage',
+                       'transcode'}
+    # a Pi (no hardware encoder) reports not-capable, copy target
+    assert hb['transcode'] == {'capable': False, 'target_kbps': 0}
     # fake mode (conftest) has no recordings mount — storage rides as a
     # benign stub so a dev laptop never fakes an outage
     assert hb['storage']['ok'] is True
@@ -1466,3 +1469,142 @@ def test_the_settings_page_shows_the_fallback_in_amber_not_red(monkeypatch):
     assert 'Recording storage failure' not in html      # no red banner
     assert 'SD card' in html and 'fallback' in html
     assert 'dot warn' in html
+
+
+def test_api_errors_quote_what_the_server_said():
+    """A support bundle read 'HTTP Error 400: Bad Request' for a response
+    whose body said exactly what was wrong. The throttled upload path had
+    always quoted the body; this is the path a box with no bandwidth cap
+    uses, which is most of them."""
+    import io
+    import json as _json
+    import urllib.error
+    import urllib.request
+    from encoder.clipper import Clipper
+
+    def _raise(body, code=400):
+        def boom(req, timeout=None):
+            raise urllib.error.HTTPError('http://x/api', code, 'Bad Request',
+                                         {}, io.BytesIO(body))
+        return boom
+
+    c = Clipper()
+    real = urllib.request.urlopen
+    try:
+        urllib.request.urlopen = _raise(_json.dumps(
+            {'error': 'the encoder sent an empty clip'}).encode())
+        try:
+            c._api('http://x', 'k', '/api/pi/clips/jobs')
+            assert False, 'should have raised'
+        except urllib.error.HTTPError as e:
+            # SAME class and code, so the poll loop's "cloud unreachable"
+            # branch and the 404 no-recording check both still work
+            assert e.code == 400
+            assert 'the encoder sent an empty clip' in str(e)
+        # a non-JSON body still beats the status line
+        urllib.request.urlopen = _raise(b'nginx: request entity too large')
+        try:
+            c._api('http://x', 'k', '/api/pi/clips/jobs')
+        except urllib.error.HTTPError as e:
+            assert 'entity too large' in str(e)
+        # …and an empty body falls back to the original error untouched
+        urllib.request.urlopen = _raise(b'')
+        try:
+            c._api('http://x', 'k', '/api/pi/clips/jobs')
+        except urllib.error.HTTPError as e:
+            assert e.code == 400
+    finally:
+        urllib.request.urlopen = real
+
+
+# ── the transcode ladder ─────────────────────────────────────────────────────
+# The whole reason to run this box on an N100/N150: the camera sends
+# 1080p at 10 Mbps, the LOCAL recording keeps every bit of it (MediaMTX
+# records the camera's own stream — clips stay crisp), and QuickSync
+# hands YouTube 2–4 Mbps the field uplink can actually carry. A Pi 5
+# owns no video encoder, so the same setting there degrades to copy
+# with a log line — never an ffmpeg error loop.
+
+def test_no_bitrate_means_copy_everywhere():
+    from encoder import youtube_push as yp
+    assert yp.push_bitrate({'push_bitrate_kbps': 0}, hw='vaapi') == 0
+    assert yp.push_bitrate({}, hw='vaapi') == 0
+    cmd = yp.build_ffmpeg_cmd({'local_ingest_key': 'k', 'push_bitrate_kbps': 0},
+                              'aac', 'rtmp://yt/x', hw='vaapi')
+    assert ['-c:v', 'copy'] == cmd[cmd.index('-c:v'):cmd.index('-c:v') + 2]
+
+
+def test_a_bitrate_on_capable_hardware_transcodes():
+    from encoder import youtube_push as yp
+    cfg = {'local_ingest_key': 'k', 'push_bitrate_kbps': 3000}
+    assert yp.push_bitrate(cfg, hw='vaapi') == 3000
+    cmd = yp.build_ffmpeg_cmd(cfg, 'aac', 'rtmp://yt/x', hw='vaapi')
+    assert 'h264_vaapi' in cmd
+    assert '-b:v' in cmd and cmd[cmd.index('-b:v') + 1] == '3000k'
+    assert cmd[cmd.index('-maxrate') + 1] == '3000k'
+    assert cmd[cmd.index('-bufsize') + 1] == '6000k'
+    assert '-vaapi_device' in cmd
+    # audio path untouched by the video ladder
+    assert ['-c:a', 'copy'] == cmd[cmd.index('-c:a'):cmd.index('-c:a') + 2]
+
+
+def test_a_bitrate_on_a_pi_degrades_to_copy():
+    """Fleet-synced setting on a box with no encoder: right thing, no
+    error loop."""
+    from encoder import youtube_push as yp
+    cfg = {'local_ingest_key': 'k', 'push_bitrate_kbps': 3000}
+    assert yp.push_bitrate(cfg, hw='') == 0
+    cmd = yp.build_ffmpeg_cmd(cfg, 'aac', 'rtmp://yt/x', hw='')
+    assert 'h264_vaapi' not in cmd and '-c:v' in cmd
+    assert cmd[cmd.index('-c:v') + 1] == 'copy'
+
+
+def test_bitrate_is_clamped_to_sanity():
+    from encoder import youtube_push as yp
+    assert yp.push_bitrate({'push_bitrate_kbps': 50}, hw='vaapi') == 1000
+    assert yp.push_bitrate({'push_bitrate_kbps': 99999}, hw='vaapi') == 12000
+    assert yp.push_bitrate({'push_bitrate_kbps': 'junk'}, hw='vaapi') == 0
+
+
+def test_transcode_keeps_the_opus_audio_path():
+    """Phone audio (Opus) still comes in over RTSP and transcodes to
+    AAC — the video ladder must not disturb that fork."""
+    from encoder import youtube_push as yp
+    cfg = {'local_ingest_key': 'k', 'push_bitrate_kbps': 2500}
+    cmd = yp.build_ffmpeg_cmd(cfg, 'opus', 'rtmp://yt/x', hw='vaapi')
+    assert '-rtsp_transport' in cmd and 'h264_vaapi' in cmd
+    assert 'aac' in cmd
+
+
+def test_the_cloud_can_set_and_unset_push_quality(monkeypatch):
+    """The site's selector rides the assignment poll: an int applies
+    (and restarts the push), 0 turns transcoding back off, and None —
+    an older cloud — leaves the box's local setting alone."""
+    _paired_cfg()
+    cmds = []
+    link = cloud_link.CloudLink(
+        on_feed_change=lambda f: None,
+        runner=lambda cmd, **kw: cmds.append(cmd),
+        http=lambda *a, **kw: {})
+    base = {'assigned': True, 'team_id': 't1', 'team_name': 'W',
+            'bug_feed_url': 'https://cloud/bug.json',
+            'youtube_rtmp_url': 'rtmps://a.rtmps.youtube.com/live2/kkk',
+            'game_id': None}
+    assert link.handle_assignment(dict(base, push_bitrate_kbps=3000))
+    assert config.load()['push_bitrate_kbps'] == 3000
+    assert any('restart' in c for c in cmds)
+    cmds.clear()
+    # same value again → no change, no restart
+    assert link.handle_assignment(dict(base, push_bitrate_kbps=3000)) is False
+    assert cmds == []
+    # 0 is authoritative: back to source copy
+    assert link.handle_assignment(dict(base, push_bitrate_kbps=0))
+    assert config.load()['push_bitrate_kbps'] == 0
+    assert any('restart' in c for c in cmds)
+    cmds.clear()
+    # None (older cloud) leaves the local setting alone
+    cfg = config.load()
+    cfg['push_bitrate_kbps'] = 2500
+    config.save(cfg)
+    link.handle_assignment(dict(base))
+    assert config.load()['push_bitrate_kbps'] == 2500

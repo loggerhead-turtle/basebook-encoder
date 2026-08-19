@@ -252,6 +252,29 @@ STATUS_PAGE = """<!doctype html><html><head>
   </form>
 </div>
 
+{% if hw_encoder %}
+<div class="card">
+  <h2>YouTube quality</h2>
+  <p class="hint">This box has a hardware encoder: it records the
+    camera's full quality locally (clips stay crisp) and can transcode
+    the YouTube push down to a rate the field internet can carry. Set
+    from the site's encoder card too — the site's setting wins when both
+    are used.</p>
+  <form method="post" action="/pushrate">
+    <select name="kbps">
+      {% for k, label in [(0, 'Source quality (no transcode)'),
+                          (2500, '2.5 Mbps — rough field internet'),
+                          (3000, '3 Mbps — typical field internet'),
+                          (4000, '4 Mbps — good uplink'),
+                          (6000, '6 Mbps — great uplink')] %}
+      <option value="{{ k }}" {{ 'selected' if k == push_kbps }}>{{ label }}</option>
+      {% endfor %}
+    </select>
+    <button class="btn" type="submit">Save quality</button>
+  </form>
+</div>
+{% endif %}
+
 <div class="card">
   <h2>Scorebug bandwidth</h2>
   <form method="post" action="/bandwidth">
@@ -579,6 +602,8 @@ def create_app(cloud=None, sender=None):
             else 'xxxx-xxxx-xxxx-xxxx',
             bandwidth=cfg.get('bandwidth', 0),
             record_hours=int(cfg.get('record_hours') or 12),
+            hw_encoder=bool(system.hw_encoder()),
+            push_kbps=int(cfg.get('push_bitrate_kbps') or 0),
             bandwidth_levels=BANDWIDTH_LEVELS,
             logs='\n'.join(config.redact_lines(system.journal_tail(60), cfg))
                  or '(no logs)')
@@ -690,6 +715,22 @@ def create_app(cloud=None, sender=None):
         log.info(f'recording retention set to {hours}h')
         return redirect(url_for('index',
                                 msg=f'Recording retention: {hours} hours'))
+
+    @app.route('/pushrate', methods=['POST'])
+    def pushrate():
+        try:
+            kbps = max(0, min(12000, int(request.form.get('kbps', 0))))
+        except (TypeError, ValueError):
+            kbps = 0
+        cfg = config.load()
+        cfg['push_bitrate_kbps'] = kbps
+        config.save(cfg)
+        system.systemctl('restart', 'playcall-encoder-youtube')
+        log.info('push quality set locally: '
+                 + (f'{kbps} kbps transcode' if kbps else 'source copy'))
+        return redirect(url_for('index', msg=(
+            f'YouTube push: {kbps / 1000:.1f} Mbps transcode' if kbps
+            else 'YouTube push: source quality')))
 
     @app.route('/bandwidth', methods=['POST'])
     def bandwidth():
