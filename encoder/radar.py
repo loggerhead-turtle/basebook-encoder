@@ -405,6 +405,38 @@ class RadarService:
         return ('%5.1f\r' % v).encode('ascii')
 
     @staticmethod
+    def _ids_trustworthy():
+        """Can by-id names be trusted to mean ONE physical cable?
+
+        The by-id name is built from the serial number burned into the
+        adapter's chip. Genuine FTDI chips get unique serials; clone
+        chips — common in same-model budget cables — often ship with the
+        SAME serial in every unit, or none at all. A shared serial means
+        both cables produce one by-id name and udev points it at
+        whichever enumerated last: the same name is the gun on one boot
+        and the board on the next. Remembering such a name would BE the
+        bouncing, laundered through config.
+
+        The tell is countable: every /dev/ttyUSB* should be reachable
+        through its own by-id alias. A ttyUSB with no alias (serial-less
+        clone) or two ttyUSBs behind one alias (shared serial) means the
+        names cannot carry identity — so nothing is persisted, and the
+        box decides by listening, every boot, which always works."""
+        try:
+            ttys = set(glob.glob('/dev/ttyUSB*'))
+            if not ttys:
+                return True          # nothing USB-serial to confuse
+            covered = set()
+            for link in glob.glob('/dev/serial/by-id/*'):
+                real = os.path.realpath(link)
+                if real in covered:
+                    return False     # two links → one tty: shared serial
+                covered.add(real)
+            return ttys <= covered
+        except OSError:
+            return False
+
+    @staticmethod
     def _stable_path(port):
         """A name worth remembering across reboots and replugs.
 
@@ -432,6 +464,18 @@ class RadarService:
         Best-effort and once per run: a config that cannot be written
         (dev checkout, read-only /etc) must never touch capture."""
         if self.roles_learned or not self._stable_path(gun):
+            return False
+        if gun.startswith('/dev/serial/by-id/') and \
+                not self._ids_trustworthy():
+            if not getattr(self, '_clones_logged', False):
+                self._clones_logged = True
+                log.warning(
+                    'these serial adapters share a chip serial (or have '
+                    'none) — same-model clone cables. Their names cannot '
+                    'carry identity, so nothing is written to config; '
+                    'the gun is identified by listening on every boot, '
+                    'which works regardless. Cables with unique serials '
+                    'would let the box remember.')
             return False
         # a config that cannot be written must not be retried at frame
         # rate — three shots per boot, then identity stays runtime-only

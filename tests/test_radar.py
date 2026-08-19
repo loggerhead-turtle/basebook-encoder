@@ -863,3 +863,92 @@ def test_a_broken_config_write_is_not_retried_at_frame_rate():
     for _ in range(50):
         svc.persist_roles(gun, {gun: None})
     assert len(calls) == 3
+
+
+# ── same-model cables: when the ID itself lies ───────────────────────────────
+# The by-id name is built from the serial burned into the adapter's chip.
+# Clone chips — common in same-model budget cables — often share one
+# serial across every unit, or have none: then the same name points at
+# the gun on one boot and the board on the next, and remembering it
+# would BE the bouncing, laundered through config. The tell is
+# countable, and when names can't carry identity the box persists
+# nothing and decides by listening every boot — which always works.
+
+def _fake_dev(monkeypatch, byid_to_tty):
+    """Wire glob+realpath to a fabricated /dev."""
+    from encoder import radar
+    ttys = sorted(set(byid_to_tty.values()))
+
+    def fake_glob(pat):
+        if 'by-id' in pat:
+            return sorted(byid_to_tty)
+        if 'ttyUSB' in pat:
+            return ttys
+        return []
+    monkeypatch.setattr(radar.glob, 'glob', fake_glob)
+    monkeypatch.setattr(radar.os.path, 'realpath',
+                        lambda p: byid_to_tty.get(p, p))
+    return radar
+
+
+def test_unique_serials_are_trustworthy(monkeypatch):
+    radar = _fake_dev(monkeypatch, {
+        '/dev/serial/by-id/usb-FTDI_A9-if00-port0': '/dev/ttyUSB0',
+        '/dev/serial/by-id/usb-FTDI_BG-if00-port0': '/dev/ttyUSB1'})
+    assert radar.RadarService._ids_trustworthy() is True
+
+
+def test_a_serial_less_clone_poisons_the_names(monkeypatch):
+    """Two ttyUSBs, one alias: the un-aliased cable is invisible to
+    by-id, so a remembered name may silently mean the other cable."""
+    radar = _fake_dev(monkeypatch, {
+        '/dev/serial/by-id/usb-FTDI_A9-if00-port0': '/dev/ttyUSB0'})
+    radar.glob.glob('/dev/ttyUSB*')
+    monkeypatch.setattr(radar.glob, 'glob', lambda pat: (
+        ['/dev/serial/by-id/usb-FTDI_A9-if00-port0'] if 'by-id' in pat
+        else ['/dev/ttyUSB0', '/dev/ttyUSB1']))
+    assert radar.RadarService._ids_trustworthy() is False
+
+
+def test_a_shared_serial_poisons_the_names(monkeypatch):
+    """Two by-id links resolving to one tty = udev collision."""
+    radar = _fake_dev(monkeypatch, {
+        '/dev/serial/by-id/usb-FTDI_CLONE-if00-port0': '/dev/ttyUSB0',
+        '/dev/serial/by-id/usb-FTDI_CLONE-if00-port1': '/dev/ttyUSB0'})
+    monkeypatch.setattr(radar.glob, 'glob', lambda pat: (
+        sorted(['/dev/serial/by-id/usb-FTDI_CLONE-if00-port0',
+                '/dev/serial/by-id/usb-FTDI_CLONE-if00-port1'])
+        if 'by-id' in pat else ['/dev/ttyUSB0', '/dev/ttyUSB1']))
+    monkeypatch.setattr(radar.os.path, 'realpath', lambda p: '/dev/ttyUSB0')
+    assert radar.RadarService._ids_trustworthy() is False
+
+
+def test_untrustworthy_names_are_never_persisted(monkeypatch):
+    """Clone cables: identity by listening, config untouched."""
+    from encoder import radar
+    monkeypatch.setattr(radar.RadarService, '_ids_trustworthy',
+                        staticmethod(lambda: False))
+    saved = {}
+    svc = _svc(cfg={}, saved=saved)
+    gun = '/dev/serial/by-id/usb-FTDI_CLONE-if00-port0'
+    assert svc.persist_roles(gun, {gun: None}) is False
+    assert saved == {}
+    assert svc.roles_learned is False
+
+
+def test_a_bluetooth_gun_is_immune_to_the_clone_problem(monkeypatch):
+    """rfcomm names are bound to a Bluetooth MAC, not a chip serial —
+    clone USB cables in the same box must not block remembering it."""
+    from encoder import radar
+    monkeypatch.setattr(radar.RadarService, '_ids_trustworthy',
+                        staticmethod(lambda: False))
+    saved = {}
+    svc = _svc(cfg={}, saved=saved)
+    assert svc.persist_roles('/dev/rfcomm0', {'/dev/rfcomm0': None}) is True
+    assert saved['radar']['port'] == '/dev/rfcomm0'
+
+
+def test_no_usb_serial_hardware_is_trustworthy_by_default(monkeypatch):
+    from encoder import radar
+    monkeypatch.setattr(radar.glob, 'glob', lambda pat: [])
+    assert radar.RadarService._ids_trustworthy() is True
