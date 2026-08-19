@@ -394,8 +394,10 @@ def test_a_wrong_pin_releases_to_the_port_streaming_gun_frames(monkeypatch):
     kept the pad's "radar ✓" lit, and the gun streamed into a port the
     old code never opened at all. Now the pin only sorts first: RD
     frames on the other adapter take the claim, capture flows, and the
-    board is driven on the remaining port — with the override flagged
-    in health so the config gets fixed instead of rediscovered."""
+    board is driven on the remaining port — and the box now FIXES the
+    config itself: the cables cannot trade roles (male vs female serial
+    ends), so a port proven to be the gun is the gun's cable for ever.
+    Learning it ends the bouncing instead of flagging homework."""
     import sys
     import types
     from encoder import radar as radar_mod
@@ -410,7 +412,9 @@ def test_a_wrong_pin_releases_to_the_port_streaming_gun_frames(monkeypatch):
     monkeypatch.setattr(radar_mod, 'find_ports',
                         lambda cfg=None: [board_p, gun_p])
     cfg = {'radar': {'port': board_p, 'display_port': gun_p}}
-    svc = RadarService(_FakeLink(), cfg_load=lambda: cfg)
+    saved = {}
+    svc = RadarService(_FakeLink(), cfg_load=lambda: cfg,
+                       cfg_save=lambda c: saved.update(c))
     sleeps = {'n': 0}
 
     def _sleep(s):
@@ -420,8 +424,15 @@ def test_a_wrong_pin_releases_to_the_port_streaming_gun_frames(monkeypatch):
     monkeypatch.setattr(radar_mod.time, 'sleep', _sleep)
     svc.loop()
     assert svc.port == gun_p                # the claim moved to the gun
-    assert svc.pin_overridden is True       # and said so in health
-    assert svc.health()['pin_overridden'] is True
+    # …and the box rewrote its own config: the proven gun persisted as
+    # radar.port, the only other adapter as the board. The override nag
+    # clears — there is nothing left for a human to fix.
+    assert saved['radar']['port'] == gun_p
+    assert saved['radar']['display_port'] == board_p
+    assert svc.roles_learned is True
+    assert svc.health()['learned'] is True
+    assert svc.pin_overridden is False
+    assert svc.health()['pin_overridden'] is False
     # the first two frames were spent as takeover evidence; from the
     # third on, capture flows
     assert svc.frames_parsed == 2
@@ -714,3 +725,141 @@ def test_the_installer_ships_bluetooth_and_quicksync():
     # the render-group grant has to come AFTER the user exists, or it
     # fails silently and every hardware encode looks like a codec bug
     assert sh.index('useradd --system') < sh.index('usermod -aG')
+
+
+# ── the box learns its cables ────────────────────────────────────────────────
+# The gun's cable ends in a male serial plug, the board's in a female —
+# each adapter is physically married to its device for life. What DOES
+# change on a portable box is which USB socket each lands in, and the
+# cables themselves being replaced (new adapter = new serial number =
+# every stored pin stale: the failure that silently killed a week of
+# radar). So identity is proven once per CABLE and written to config,
+# and the stable by-id name makes USB sockets irrelevant.
+
+def _svc(cfg=None, saved=None):
+    from encoder.radar import RadarService
+    return RadarService(_FakeLink(), cfg_load=lambda: dict(cfg or {}),
+                        cfg_save=(saved.update if saved is not None
+                                  else None))
+
+
+def test_a_proven_gun_is_written_to_config(monkeypatch):
+    saved = {}
+    svc = _svc(cfg={}, saved=saved)
+    gun = '/dev/serial/by-id/usb-FTDI_GUNCABLE-if00-port0'
+    board = '/dev/serial/by-id/usb-FTDI_BOARDCABLE-if00-port0'
+    assert svc.persist_roles(gun, {gun: None, board: None}) is True
+    assert saved['radar']['port'] == gun
+    assert saved['radar']['display_port'] == board
+    assert svc.roles_learned is True
+
+
+def test_learning_happens_once_not_every_frame(monkeypatch):
+    calls = []
+    svc = _svc(cfg={}, saved=None)
+    svc.cfg_save = lambda c: calls.append(c)
+    gun = '/dev/serial/by-id/usb-FTDI_G-if00-port0'
+    assert svc.persist_roles(gun, {gun: None}) is True
+    assert svc.persist_roles(gun, {gun: None}) is False
+    assert len(calls) == 1
+
+
+def test_an_enumeration_order_name_is_never_remembered():
+    """/dev/ttyUSB0 names whichever adapter got lucky at boot — exactly
+    the different-USB-socket hazard. Persisting it would pin the gun to
+    a coin flip."""
+    saved = {}
+    svc = _svc(cfg={}, saved=saved)
+    assert svc.persist_roles('/dev/ttyUSB0',
+                             {'/dev/ttyUSB0': None}) is False
+    assert saved == {}
+    assert svc.roles_learned is False
+
+
+def test_a_bluetooth_gun_is_remembered():
+    """rfcomm bindings are keyed on the adapter's Bluetooth MAC — as
+    socket-proof as a by-id path."""
+    saved = {}
+    svc = _svc(cfg={}, saved=saved)
+    assert svc.persist_roles('/dev/rfcomm0', {'/dev/rfcomm0': None}) is True
+    assert saved['radar']['port'] == '/dev/rfcomm0'
+
+
+def test_gun_only_setups_do_not_invent_a_board():
+    """Sometimes the board stays home. Learning the gun must not write a
+    display_port that does not exist."""
+    saved = {}
+    svc = _svc(cfg={}, saved=saved)
+    gun = '/dev/serial/by-id/usb-FTDI_G-if00-port0'
+    assert svc.persist_roles(gun, {gun: None}) is True
+    assert 'display_port' not in saved['radar']
+
+
+def test_three_adapters_leave_the_board_a_runtime_decision():
+    saved = {}
+    svc = _svc(cfg={}, saved=saved)
+    gun = '/dev/serial/by-id/usb-FTDI_G-if00-port0'
+    handles = {gun: None,
+               '/dev/serial/by-id/usb-FTDI_X-if00-port0': None,
+               '/dev/serial/by-id/usb-FTDI_Y-if00-port0': None}
+    assert svc.persist_roles(gun, handles) is True
+    assert saved['radar']['port'] == gun
+    assert 'display_port' not in saved['radar']
+
+
+def test_stale_pins_from_replaced_cables_are_overwritten():
+    """THE regression: new cables during the case rebuild meant new
+    adapter serials, and the old pins pointed at hardware that no longer
+    existed. The box now converges on the truth by itself."""
+    old_cfg = {'radar': {
+        'port': '/dev/serial/by-id/usb-FTDI_OLD_A9UMFYC5-if00-port0',
+        'display_port': '/dev/serial/by-id/usb-FTDI_OLD_BG03Q3GU-if00-port0',
+        'display_baud': 9600}}
+    saved = {}
+    svc = _svc(cfg=old_cfg, saved=saved)
+    gun = '/dev/serial/by-id/usb-FTDI_NEW_GUN-if00-port0'
+    board = '/dev/serial/by-id/usb-FTDI_NEW_BOARD-if00-port0'
+    assert svc.persist_roles(gun, {gun: None, board: None}) is True
+    assert saved['radar']['port'] == gun
+    assert saved['radar']['display_port'] == board
+    # sibling settings survive the rewrite
+    assert saved['radar']['display_baud'] == 9600
+
+
+def test_a_correct_pin_is_left_alone():
+    """Nothing to change → nothing written, but the box stops
+    re-evaluating for the rest of the run."""
+    gun = '/dev/serial/by-id/usb-FTDI_G-if00-port0'
+    board = '/dev/serial/by-id/usb-FTDI_B-if00-port0'
+    calls = []
+    svc = _svc(cfg={'radar': {'port': gun, 'display_port': board}})
+    svc.cfg_save = lambda c: calls.append(c)
+    assert svc.persist_roles(gun, {gun: None, board: None}) is False
+    assert calls == []
+    assert svc.roles_learned is True
+
+
+def test_a_config_that_cannot_be_written_never_touches_capture():
+    def boom(c):
+        raise OSError('read-only /etc')
+    svc = _svc(cfg={})
+    svc.cfg_save = boom
+    gun = '/dev/serial/by-id/usb-FTDI_G-if00-port0'
+    assert svc.persist_roles(gun, {gun: None}) is False
+    assert svc.roles_learned is False       # retried next threshold hit
+
+
+def test_a_broken_config_write_is_not_retried_at_frame_rate():
+    """The persist runs inside the read loop: a read-only /etc must cost
+    three log lines per boot, not one per frame."""
+    calls = []
+
+    def boom(c):
+        calls.append(1)
+        raise OSError('read-only /etc')
+    svc = _svc(cfg={})
+    svc.cfg_save = boom
+    gun = '/dev/serial/by-id/usb-FTDI_G-if00-port0'
+    for _ in range(50):
+        svc.persist_roles(gun, {gun: None})
+    assert len(calls) == 3
