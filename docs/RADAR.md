@@ -61,6 +61,17 @@ To settle it permanently, pin both:
 }
 ```
 
+**You should never need to write these by hand: the box learns its
+cables.** The gun's cable ends in a male serial plug and the board's in
+a female, so each adapter is physically married to its device for life
+— and the by-id name encodes the adapter's own serial number, so it
+does not care which USB socket it lands in. The first time a port
+proves what it is (multi-tag RD frames that only a Stalker emits, or
+sustained parses on a lone adapter), the box writes the roles to config
+itself and logs `learned the cables`. Replace a cable and it re-learns
+on the first trigger pull. Plug into different USB ports every game and
+nothing changes at all.
+
 **A pin is a preference, not a requirement.** A by-id path carries the
 adapter's serial number, so an adapter that is unplugged, swapped or
 dead takes the pin with it. When a pinned port is missing the box logs
@@ -125,6 +136,31 @@ automatically, but you can pin it like any other port:
 ```json
 "radar": { "port": "/dev/rfcomm0" }
 ```
+
+### The BT578 V3 specifically
+
+The adapter this was built against: an RS-232↔Bluetooth brick with both
+male and female serial heads and Type-C for power.
+
+* **The Type-C port is power only.** It charges/feeds the module; it is
+  not a data path. The serial data rides Bluetooth.
+* **Which head you use mirrors the cable rule**: the gun end wants the
+  head that mates the gun's connector. The module doesn't care — it
+  forwards whatever arrives.
+* **Its own serial rate is a setting, and it ships at 9600.** This is
+  the trap: the module has an internal UART rate (changed over AT
+  commands from a paired terminal — see its leaflet), independent of
+  Bluetooth. A module at its factory 9600 in front of a gun talking
+  19200 delivers perfectly-paired, perfectly-connected **garbage** —
+  which on the test page reads as "lines seen, nothing parses". Either
+  set the module to 19200, or set the gun AND `radar.baud` to 9600.
+  `radar.baud` describes the rate on the tty, which for Bluetooth is
+  whatever the module was told to speak.
+* **Pairing PIN** is typically `1234` (sometimes `0000`) — the leaflet
+  wins.
+* Battery bricks sleep: if readings stop between innings and resume on
+  the next trigger pull, the module's power saving is dozing — keep it
+  on Type-C power at the gun end.
 
 ### Bluetooth notes worth knowing
 

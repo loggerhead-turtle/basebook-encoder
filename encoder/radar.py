@@ -62,6 +62,12 @@ BAND = (30.0, 110.0)          # plausible pitch band (pref: set the GUN's
 # the claim moves there. Only a Stalker emits that stream, so three of
 # them are proof the gun is on the other cable — a wrong pin included.
 GUN_TAKEOVER_FRAMES = 3
+# Parsed format-A lines (bare numbers — no RD tags to lean on) before a
+# LONE adapter is trusted enough to remember as the gun. Higher bar than
+# RD frames because a bare number is weak evidence; on one adapter the
+# board can only echo what WE write, and with no gun nothing is written,
+# so sustained parses can only be the gun.
+GUN_LEARN_FMT_A = 30
 
 # ˆRD   34C [live]   5C [peak]   [const]   [6A | 9A<spin>]
 # The letter after 34/5 depends on the gun's format/units setting (34C on
@@ -252,9 +258,10 @@ class RadarService:
     idles when no adapter is plugged in or pyserial is missing, and
     re-scans so plugging the gun in mid-game just works."""
 
-    def __init__(self, link, cfg_load=None):
+    def __init__(self, link, cfg_load=None, cfg_save=None):
         self.link = link                    # CloudLink (auth + http)
         self.cfg_load = cfg_load or (lambda: {})
+        self.cfg_save = cfg_save            # None → encoder.config
         self.engine = BurstEngine()
         self.running = True
         self.pending = deque(maxlen=200)    # events awaiting a good POST
@@ -296,6 +303,19 @@ class RadarService:
         # in health() so the wrong pin is fixed in config, not
         # rediscovered at the next field.
         self.pin_overridden = False
+        # THE BOX LEARNS ITS CABLES. The gun's cable and the board's
+        # cable can never trade places — one end is a male serial plug,
+        # the other female, so each adapter is physically married to its
+        # device for life. What CAN change is which USB socket each
+        # lands in (a portable box is re-plugged every game) and the
+        # cables themselves being replaced (new adapter = new serial
+        # number = every stored pin stale — the failure that killed a
+        # week of radar). So once a port proves what it is, its STABLE
+        # name (by-id, which encodes the adapter's own serial and does
+        # not care about USB sockets; or an rfcomm binding, keyed on
+        # Bluetooth MAC) is written back to config. Reboots, replugs and
+        # new cables all converge on the truth by themselves.
+        self.roles_learned = False          # persisted something this run
 
     # ── cloud ────────────────────────────────────────────────────────────────
     def _post(self, payload):
@@ -384,6 +404,81 @@ class RadarService:
             return None
         return ('%5.1f\r' % v).encode('ascii')
 
+    @staticmethod
+    def _stable_path(port):
+        """A name worth remembering across reboots and replugs.
+
+        by-id paths encode the ADAPTER's own serial number, so they name
+        the same cable whichever USB socket it lands in. rfcomm devices
+        are bound to a Bluetooth MAC, same property. A bare /dev/ttyUSB0
+        is the opposite — it names an enumeration ORDER, which changes
+        with sockets and boot timing, so persisting one would pin the
+        gun to whichever adapter got lucky. Never remember those."""
+        return bool(port) and ('/serial/by-id/' in port
+                               or port.startswith('/dev/rfcomm'))
+
+    def persist_roles(self, gun, handles):
+        """Write the proven gun (and, when unambiguous, the board) back
+        to config, so identity is decided once per CABLE rather than
+        once per boot.
+
+        Called only on strong evidence — multi-tag RD frames that only a
+        Stalker emits, or sustained parses on a lone adapter. The board
+        is remembered only when exactly one OTHER adapter is present:
+        with the gun known and the cables physically unable to trade
+        roles, the other cable IS the board. Three or more adapters stay
+        a runtime decision.
+
+        Best-effort and once per run: a config that cannot be written
+        (dev checkout, read-only /etc) must never touch capture."""
+        if self.roles_learned or not self._stable_path(gun):
+            return False
+        # a config that cannot be written must not be retried at frame
+        # rate — three shots per boot, then identity stays runtime-only
+        if getattr(self, '_learn_attempts', 0) >= 3:
+            return False
+        self._learn_attempts = getattr(self, '_learn_attempts', 0) + 1
+        others = [p for p in handles if p != gun]
+        disp = others[0] if (len(others) == 1
+                             and self._stable_path(others[0])) else None
+        try:
+            if self.cfg_save is not None:
+                save = self.cfg_save
+                cfg = dict(self.cfg_load() or {})
+            else:
+                from . import config as _config
+                cfg = _config.load()
+                save = _config.save
+            rad = dict(cfg.get('radar') or {})
+            changed = []
+            if rad.get('port') != gun:
+                rad['port'] = gun
+                changed.append(f'gun={gun}')
+            if disp and rad.get('display_port') != disp:
+                rad['display_port'] = disp
+                changed.append(f'board={disp}')
+            if not changed:
+                self.roles_learned = True
+                return False
+            cfg['radar'] = rad
+            save(cfg)
+            self.roles_learned = True
+            self.cfg_pinned = True
+            if disp:
+                self.cfg_disp_pinned = True
+            # the stored pin was wrong and is now fixed — stop waving
+            # the "fix your config" flag at the site
+            self.pin_overridden = False
+            log.warning('learned the cables and wrote them to config: '
+                        + ', '.join(changed)
+                        + ' — this survives reboots, replugs and USB '
+                        'socket changes')
+            return True
+        except Exception as e:
+            log.warning(f'could not persist learned radar roles ({e}) — '
+                        'identity stays runtime-only this boot')
+            return False
+
     def health(self):
         """One dict the heartbeat carries so the SITE can show whether
         the gun and the board are actually working — today's whole
@@ -423,6 +518,9 @@ class RadarService:
             # discovered at a field.
             'pinned': bool(self.cfg_pinned),
             'display_pinned': bool(self.cfg_disp_pinned),
+            # the box wrote its proven cable roles to config this run —
+            # the site can say "learned" instead of nagging about pins
+            'learned': bool(self.roles_learned),
         }
 
     def forward_display(self, raw, target, baud=BAUD):
@@ -580,6 +678,7 @@ class RadarService:
             handles, bufs = {}, {}
             claims = {'lines': 0, 'ok': 0}
             probes = {}                 # port → RD frames heard off-claim
+            proof = {'rd': 0, 'ok': 0}  # evidence on the CLAIMED gun
             try:
                 for p in ports:
                     try:
@@ -659,6 +758,11 @@ class RadarService:
                                         self.port = p
                                         claims = {'lines': 0, 'ok': 0}
                                         probes = {}
+                                        proof = {'rd': 0, 'ok': 0}
+                                        # RD frames only come from a
+                                        # Stalker: that IS the gun's
+                                        # cable, for ever — remember it
+                                        self.persist_roles(p, handles)
                                 else:
                                     continue
                             if gun is None or p == gun:
@@ -670,8 +774,32 @@ class RadarService:
                                     gun = p
                                     self.port = p
                                     claims = {'lines': 0, 'ok': 0}
+                                    proof = {'rd': 0, 'ok': 0}
                                     log.info(f'gun identified on {p}')
                                 elif gun == p:
+                                    # Evidence that the claim is REAL,
+                                    # strong enough to remember: RD
+                                    # frames are Stalker-only, so a few
+                                    # settle it on any topology; bare
+                                    # format-A numbers are weak (a board
+                                    # can echo them), so they only count
+                                    # when this is the lone adapter —
+                                    # where an echo is impossible, since
+                                    # with no gun nothing is written for
+                                    # the board to echo.
+                                    if self.frames_parsed > before:
+                                        if _FRAME.search(raw.decode(
+                                                'ascii', 'replace')):
+                                            proof['rd'] += 1
+                                        else:
+                                            proof['ok'] += 1
+                                    if not self.roles_learned and (
+                                            proof['rd'] >=
+                                            GUN_TAKEOVER_FRAMES
+                                            or (len(handles) == 1
+                                                and proof['ok'] >=
+                                                GUN_LEARN_FMT_A)):
+                                        self.persist_roles(p, handles)
                                     # A WRONG claim is self-correcting: a
                                     # display board chatters status back
                                     # up its own cable, and one lucky
@@ -699,6 +827,7 @@ class RadarService:
                                             'this permanently)')
                                         gun = None
                                         claims = {'lines': 0, 'ok': 0}
+                                        proof = {'rd': 0, 'ok': 0}
                             if gun == p:
                                 others = [q for q in handles if q != p]
                                 # a display pin that names the GUN's own
