@@ -1,0 +1,23 @@
+[Unit]
+Description=PlayCall Encoder - bind the radar gun's Bluetooth serial adapter
+After=bluetooth.target network.target
+Wants=bluetooth.target
+# Bound before the radar service looks for ports, so a Bluetooth gun is
+# already a tty by the time the first scan runs.
+Before=playcall-encoder.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Exits 0 with no MAC configured: a cabled box installs this unit and
+# never notices it.
+ExecStart=/opt/playcall-encoder/scripts/radar_bt_bind.sh
+ExecStop=-/usr/bin/rfcomm release /dev/rfcomm0
+# The controller may not be ready on a cold boot; retry rather than
+# leave the gun silent for the game.
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

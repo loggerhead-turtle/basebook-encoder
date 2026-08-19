@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import glob
 import logging
+import os
 import re
 import threading
 import time
@@ -206,7 +207,7 @@ class BurstEngine:
 
 
 def find_ports(cfg=None):
-    """Candidate USB-RS232 adapters, stable by-id paths preferred. A
+    """Candidate serial adapters, stable by-id paths preferred. A
     configured radar.port puts the GUN's adapter FIRST — it no longer
     hides the rest. A pin used to return exactly one port, which made
     the box deaf to every other adapter: the day the two plugs got
@@ -214,11 +215,28 @@ def find_ports(cfg=None):
     board's — opened fine, the keepalive kept the pad's "radar ✓" lit,
     and the gun streamed all game into a port nobody was reading. The
     pin is a preference; the loop verifies it against what actually
-    talks like a gun."""
+    talks like a gun.
+
+    Keeping the rest also survives a pin whose adapter is simply GONE.
+    A by-id path carries that adapter's serial number, so unplugging it
+    takes the pin with it — and returning only the pin meant the open
+    failed, no handles were left, and the service retried the same dead
+    path every five seconds all night while ignoring the adapter that
+    WAS plugged in.
+
+    /dev/rfcomm* joins the scan so a gun on the far end of a Bluetooth
+    serial adapter is found the same way a cabled one is: an rfcomm
+    binding is an ordinary tty, it just lives nowhere near
+    /dev/serial/by-id."""
     want = ((cfg or {}).get('radar') or {}).get('port') or ''
     byid = sorted(glob.glob('/dev/serial/by-id/*'))
     ports = byid if byid else sorted(glob.glob('/dev/ttyUSB*'))
+    ports = ports + sorted(glob.glob('/dev/rfcomm*'))
     if want:
+        if not os.path.exists(want):
+            log.warning('pinned radar port %s is not there — using whatever '
+                        'else is plugged in (plug it back in, or clear '
+                        'radar.port)', want)
         return [want] + [p for p in ports if p != want]
     return ports
 
@@ -539,6 +557,12 @@ class RadarService:
                 continue
             missing_logged = False
             disp_pin = (cfg.get('radar') or {}).get('display_port') or None
+            # Same rule for the board: a pinned port that has gone away
+            # must not send every frame into a path that cannot open.
+            if disp_pin and not os.path.exists(disp_pin):
+                log.warning('pinned display port %s is not there — falling '
+                            'back to the other adapter', disp_pin)
+                disp_pin = None
             # The GUN's rate (radar.baud) and the BOARD's rate
             # (radar.display_baud) are independent: a Stalker set to LO
             # talks 9600 while its display board may want something

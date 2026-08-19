@@ -621,3 +621,96 @@ def test_the_plate_reading_is_the_last_live_speed_not_a_zero():
     evs = _stream(BurstEngine(), 10.0, [(75.0, 2000.0)])
     assert len(evs) == 1
     assert evs[0]['plate'] == 75.0
+
+
+# ── a gun on the far end of Bluetooth ────────────────────────────────────────
+# An rfcomm binding is an ordinary tty — it just lives nowhere near
+# /dev/serial/by-id, so the scan above could never see one.
+
+def test_a_bluetooth_gun_is_found_like_any_other(monkeypatch):
+    from encoder import radar
+    monkeypatch.setattr(radar.glob, 'glob',
+                        lambda pat: ['/dev/rfcomm0'] if 'rfcomm' in pat else [])
+    assert radar.find_ports({}) == ['/dev/rfcomm0']
+
+
+def test_a_cabled_gun_and_a_bluetooth_one_can_both_be_present(monkeypatch):
+    from encoder import radar
+
+    def fake(pat):
+        if 'by-id' in pat:
+            return ['/dev/serial/by-id/usb-FTDI-if00-port0']
+        return ['/dev/rfcomm0'] if 'rfcomm' in pat else []
+    monkeypatch.setattr(radar.glob, 'glob', fake)
+    assert radar.find_ports({}) == ['/dev/serial/by-id/usb-FTDI-if00-port0',
+                                    '/dev/rfcomm0']
+
+
+def test_a_bluetooth_port_can_be_pinned_like_a_cabled_one(monkeypatch):
+    from encoder import radar
+
+    def fake(pat):
+        if 'by-id' in pat:
+            return ['/dev/serial/by-id/usb-FTDI-if00-port0']
+        return ['/dev/rfcomm0'] if 'rfcomm' in pat else []
+    monkeypatch.setattr(radar.glob, 'glob', fake)
+    assert radar.find_ports({'radar': {'port': '/dev/rfcomm0'}})[0] \
+        == '/dev/rfcomm0'
+
+
+def test_nothing_plugged_in_is_an_empty_list(monkeypatch):
+    from encoder import radar
+    monkeypatch.setattr(radar.glob, 'glob', lambda pat: [])
+    assert radar.find_ports({}) == []
+
+
+def test_a_pin_whose_adapter_is_gone_says_so_once(monkeypatch, caplog):
+    """It still lists the pin first (the loop decides what really talks
+    like a gun) — but silently retrying a path that cannot exist is how
+    a box spends a night logging the same line every five seconds."""
+    import logging
+    from encoder import radar
+    monkeypatch.setattr(radar.glob, 'glob', lambda pat: (
+        ['/dev/serial/by-id/usb-REAL-if00-port0'] if 'by-id' in pat else []))
+    with caplog.at_level(logging.WARNING, logger='radar'):
+        ports = radar.find_ports({'radar': {'port': '/dev/serial/by-id/GONE'}})
+    assert '/dev/serial/by-id/usb-REAL-if00-port0' in ports
+    assert 'is not there' in caplog.text
+
+
+# ── the shipped Bluetooth plumbing ───────────────────────────────────────────
+
+def _repo(*parts):
+    import os
+    return os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), *parts)
+
+
+def test_the_bt_binder_is_quiet_when_no_gun_is_configured():
+    """Every box installs this unit; a cabled box must never see it fail."""
+    src = open(_repo('scripts', 'radar_bt_bind.sh')).read()
+    assert 'bluetooth_mac' in src
+    assert 'nothing to bind' in src and 'exit 0' in src
+
+
+def test_the_bt_unit_binds_before_the_radar_service_looks():
+    import configparser
+    cp = configparser.ConfigParser(strict=False)
+    cp.optionxform = str
+    cp.read(_repo('systemd', 'playcall-encoder-radarbt.service'))
+    assert cp.get('Unit', 'Before') == 'playcall-encoder.service'
+    assert cp.get('Service', 'Type') == 'oneshot'
+    # systemd ignores this key in [Service] — which already cost the
+    # other four units their crash protection
+    assert cp.has_option('Unit', 'StartLimitIntervalSec')
+    assert not cp.has_option('Service', 'StartLimitIntervalSec')
+
+
+def test_the_installer_ships_bluetooth_and_quicksync():
+    sh = open(_repo('install.sh')).read()
+    assert 'bluez' in sh
+    assert 'playcall-encoder-radarbt.service' in sh
+    assert 'x86_64' in sh and 'intel-media-va-driver' in sh
+    # the render-group grant has to come AFTER the user exists, or it
+    # fails silently and every hardware encode looks like a codec bug
+    assert sh.index('useradd --system') < sh.index('usermod -aG')
