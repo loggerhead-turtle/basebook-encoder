@@ -80,7 +80,23 @@ fi
 # only used for the first-boot setup hotspot.
 apt-get update -qq
 apt-get install -y -qq ffmpeg curl git avahi-daemon hostapd dnsmasq \
-  python3 python3-pil python3-flask python3-numpy python3-serial >/dev/null
+  python3 python3-pil python3-flask python3-numpy python3-serial \
+  bluez >/dev/null
+# bluez: a radar gun on a serial→Bluetooth adapter becomes /dev/rfcomm0
+# and is read exactly like a cabled one. Costs nothing on a box that
+# never uses it — see scripts/radar_bt_bind.sh and docs/RADAR.md.
+
+# ── Hardware video encoding (x86 only) ───────────────────────────────────────
+# The Pi 5 has no video ENCODER at all — its push is a stream copy, which
+# is why an $80 board can relay a game. An Intel N100/N150 does have one
+# (QuickSync), and that is the whole reason to run this on x86: record the
+# camera at full quality locally while pushing YouTube a bitrate a field
+# uplink can actually carry. Needs the VA-API driver; ffmpeg already
+# speaks VA-API on Debian.
+if [[ "$(uname -m)" == "x86_64" ]]; then
+  apt-get install -y -qq vainfo intel-media-va-driver >/dev/null 2>&1 || \
+    echo "note: VA-API driver not installed — transcoding will fall back to CPU"
+fi
 # hostapd/dnsmasq must NOT run as daemons — provisioning spawns them ad hoc.
 # On an ADOPTED box we leave existing services strictly alone: this Pi's
 # network stack (possibly Speedify-bonded) is not ours to manage.
@@ -95,6 +111,14 @@ mkdir -p "$CONFIG_DIR" "$INSTALL_DIR" /var/lib/playcall-encoder/segments \
          /var/lib/playcall-encoder/clips
 chown -R playcall:playcall /var/lib/playcall-encoder
 chgrp playcall "$CONFIG_DIR"
+# x86 hardware encoding: the service user has to reach /dev/dri/renderD128
+# or every QuickSync encode fails as a permission error that reads like a
+# codec problem. Has to happen AFTER the user exists.
+if [[ "$(uname -m)" == "x86_64" ]]; then
+  for g in render video; do
+    getent group "$g" >/dev/null && usermod -aG "$g" playcall 2>/dev/null || true
+  done
+fi
 
 # ── Package files → /opt/playcall-encoder ─────────────────────────────────────
 # Prefer the files next to this script (checkout install); fall back to a
@@ -196,10 +220,15 @@ install -m 644 "$SRC/systemd/playcall-encoder-mediamtx.service" /etc/systemd/sys
 install -m 644 "$SRC/systemd/playcall-encoder-youtube.service"  /etc/systemd/system/
 install -m 644 "$SRC/systemd/playcall-encoder-clipper.service"  /etc/systemd/system/
 install -m 644 "$SRC/systemd/playcall-encoder-activate.service" /etc/systemd/system/
+install -m 644 "$SRC/systemd/playcall-encoder-radarbt.service"  /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable playcall-encoder playcall-encoder-mediamtx \
                  playcall-encoder-youtube playcall-encoder-clipper \
                  playcall-encoder-activate >/dev/null
+# Bluetooth radar binder: enabled on every box, exits 0 immediately when
+# no radar.bluetooth_mac is set. Enabling it here means a gun added later
+# needs one config value and a reboot, not an install.
+systemctl enable playcall-encoder-radarbt >/dev/null 2>&1 || true
 systemctl restart playcall-encoder-mediamtx playcall-encoder-youtube \
                   playcall-encoder-clipper playcall-encoder
 
