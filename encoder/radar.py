@@ -509,6 +509,14 @@ class RadarService:
             if disp and rad.get('display_port') != disp:
                 rad['display_port'] = disp
                 changed.append(f'board={disp}')
+            elif rad.get('display_port') == gun:
+                # the port just proven to be the GUN must not stay
+                # pinned as the board too — two pins on one tty would
+                # feed the board its own input. No other adapter to
+                # reassign it to, so unpin and let the next session
+                # re-learn the board when one appears.
+                del rad['display_port']
+                changed.append("board unpinned (it was the gun's port)")
             if not changed:
                 self.roles_learned = True
                 return False
@@ -845,12 +853,41 @@ class RadarService:
                                             proof['rd'] += 1
                                         else:
                                             proof['ok'] += 1
+                                    # Lone-adapter learning has two more
+                                    # gates, both from the night a
+                                    # wedged rfcomm binding took the
+                                    # Bluetooth gun's port away: the
+                                    # LED board became "the lone
+                                    # adapter", chattered enough bare
+                                    # numbers to pass the weak-evidence
+                                    # bar, and the box PERSISTED the
+                                    # board as the gun — overwriting a
+                                    # correct pin. A configured gun
+                                    # port that is merely absent right
+                                    # now (a BT binding down, a cable
+                                    # out for a minute) still names the
+                                    # gun; and the configured
+                                    # display_port is affirmative
+                                    # evidence this adapter is the
+                                    # BOARD. Neither may be overruled
+                                    # by bare numbers — RD frames (the
+                                    # takeover path above) still can.
+                                    _rad = cfg.get('radar') or {}
+                                    _pin_away = bool(
+                                        _rad.get('port')
+                                        and _rad.get('port')
+                                        not in handles)
+                                    _lone_ok = (
+                                        len(handles) == 1
+                                        and proof['ok'] >=
+                                        GUN_LEARN_FMT_A
+                                        and not _pin_away
+                                        and p != (_rad.get('display_port')
+                                                  or None))
                                     if not self.roles_learned and (
                                             proof['rd'] >=
                                             GUN_TAKEOVER_FRAMES
-                                            or (len(handles) == 1
-                                                and proof['ok'] >=
-                                                GUN_LEARN_FMT_A)):
+                                            or _lone_ok):
                                         self.persist_roles(p, handles)
                                     # A WRONG claim is self-correcting: a
                                     # display board chatters status back

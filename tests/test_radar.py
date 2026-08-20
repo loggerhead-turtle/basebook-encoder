@@ -816,6 +816,96 @@ def test_gun_only_setups_do_not_invent_a_board():
     assert 'display_port' not in saved['radar']
 
 
+def test_a_chattering_board_never_steals_an_absent_guns_pin(monkeypatch):
+    """FIELD REPORT 2026-08-19, ~23:40: the Bluetooth gun's rfcomm
+    binding wedged after a dongle hot-replug, so for thirteen minutes
+    the LED board's adapter was "the lone adapter". It chattered enough
+    bare numbers to pass the weak-evidence bar, and the box PERSISTED
+    the board as the gun — overwriting the correct /dev/rfcomm0 pin.
+    A configured gun port that is merely absent right now still names
+    the gun; bare numbers must not overrule it (RD frames still can)."""
+    import sys
+    import types
+    from encoder import radar as radar_mod
+    from encoder.radar import RadarService
+    gun_pin = '/dev/rfcomm0'                       # bound to the gun; DOWN
+    board_p = '/dev/serial/by-id/usb-FTDI_BOARD'   # chatters bare numbers
+
+    class _NoRfcomm(_FakePort):
+        def __init__(self, port, baud, timeout=0, write_timeout=None):
+            if port == gun_pin:
+                raise FileNotFoundError(2, 'No such file or directory',
+                                        gun_pin)
+            super().__init__(port, baud, timeout, write_timeout)
+    # 7 drains of 5 numbers each — 35 parses, past GUN_LEARN_FMT_A (30),
+    # small enough per-drain to dodge the stale-backlog trim
+    _FakePort.SCRIPT = {board_p: [b' 12.4\r' * 5] * 7}
+    _FakePort.OPEN = {}
+    monkeypatch.setitem(sys.modules, 'serial',
+                        types.SimpleNamespace(Serial=_NoRfcomm))
+    monkeypatch.setattr(radar_mod, 'find_ports',
+                        lambda cfg=None: [gun_pin, board_p])
+    saved = {}
+    svc = RadarService(_FakeLink(),
+                       cfg_load=lambda: {'radar': {'port': gun_pin}},
+                       cfg_save=lambda c: saved.update(c))
+    sleeps = {'n': 0}
+
+    def _sleep(s):
+        sleeps['n'] += 1
+        if sleeps['n'] > 10:
+            svc.running = False
+    monkeypatch.setattr(radar_mod.time, 'sleep', _sleep)
+    svc.loop()
+    assert svc.frames_parsed >= 30          # the bar was genuinely passed
+    assert saved == {}                      # …and NOTHING was persisted
+    assert svc.roles_learned is False
+
+
+def test_the_configured_board_is_never_lone_learned_as_the_gun(monkeypatch):
+    """The other half of the same gate: an adapter the config already
+    names as display_port is affirmatively the BOARD — bare numbers on
+    it can never rewrite it into the gun."""
+    import sys
+    import types
+    from encoder import radar as radar_mod
+    from encoder.radar import RadarService
+    board_p = '/dev/serial/by-id/usb-FTDI_BOARD'
+    _FakePort.SCRIPT = {board_p: [b' 12.4\r' * 5] * 7}
+    _FakePort.OPEN = {}
+    monkeypatch.setitem(sys.modules, 'serial',
+                        types.SimpleNamespace(Serial=_FakePort))
+    monkeypatch.setattr(radar_mod, 'find_ports',
+                        lambda cfg=None: [board_p])
+    saved = {}
+    svc = RadarService(_FakeLink(),
+                       cfg_load=lambda: {'radar':
+                                         {'display_port': board_p}},
+                       cfg_save=lambda c: saved.update(c))
+    sleeps = {'n': 0}
+
+    def _sleep(s):
+        sleeps['n'] += 1
+        if sleeps['n'] > 10:
+            svc.running = False
+    monkeypatch.setattr(radar_mod.time, 'sleep', _sleep)
+    svc.loop()
+    assert svc.frames_parsed >= 30
+    assert saved == {} and svc.roles_learned is False
+
+
+def test_learning_the_gun_unpins_a_display_port_that_named_it():
+    """A gun proven on the port the config calls the BOARD (both pins
+    stale after a recable) must not leave radar.port == display_port —
+    two pins on one tty would feed the board its own input."""
+    saved = {}
+    gun = '/dev/rfcomm0'
+    svc = _svc(cfg={'radar': {'display_port': gun}}, saved=saved)
+    assert svc.persist_roles(gun, {gun: None}) is True
+    assert saved['radar']['port'] == gun
+    assert 'display_port' not in saved['radar']
+
+
 def test_three_adapters_leave_the_board_a_runtime_decision():
     saved = {}
     svc = _svc(cfg={}, saved=saved)
