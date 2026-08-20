@@ -529,6 +529,27 @@ def test_peak_and_constant_glued_together_still_parse():
         'live': 53.7, 'peak': 58.9, 'rpm': 1565.0, 'alive': True}
 
 
+def test_four_digit_values_glue_onto_their_own_tags_and_still_parse():
+    """FIELD REPORT 2026-08-19 (first Bluetooth session): values are
+    right-aligned in a four-wide column, so 1000+ fills it and runs into
+    the TAG itself — '34C1051', '5G10511051'. The old pattern demanded a
+    space after the tag, so every such frame was rejected: no reading of
+    100.0 mph or more could ever parse, and the parse rate collapsed to
+    62% mid-session ('200 unparsed lines of 528 — wrong format/baud?')."""
+    f = parse_frame('RD   34C1051         5G10511051     6A             ')
+    assert f == {'live': 105.1, 'peak': 105.1, 'rpm': None, 'alive': True}
+    # 4-digit live with a still-spaced peak/const pair
+    f = parse_frame('RD   34C1013         5G1015 984     6A             ')
+    assert f == {'live': 101.3, 'peak': 101.5, 'rpm': None, 'alive': True}
+    # 3-digit peak glued to a 4-digit const (the original glue) unchanged
+    f = parse_frame('RD   34C 824         5G 8571024     6A             ')
+    assert f == {'live': 82.4, 'peak': 85.7, 'rpm': None, 'alive': True}
+    # idle keepalives — where the tags legitimately sit next to spaces
+    # and each other — stay idle, never a phantom value
+    assert parse_frame('ˆRD   34C             5C     869     6A') == {
+        'live': None, 'peak': None, 'rpm': None, 'alive': True}
+
+
 # ── constant-on guns: the failure that ate a game's velocities ─────────────
 #
 # FIELD REPORT. 66 pitches charted, 22,500 frames parsed at 100%, the

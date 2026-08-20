@@ -77,8 +77,16 @@ GUN_LEARN_FMT_A = 30
 # ambiguous: C-idle's constant, or A-live's peak. parse_frame settles it
 # by the 34 field: a frame with a live speed is a reading (lone number =
 # peak); a frame with an empty 34 field is idle (lone number = const).
+#
+# The whitespace after the 34/5 tags is OPTIONAL: values are written
+# right-aligned in a four-wide column, so a value of 1000+ (100.0 mph —
+# or the const counter growing past 999) fills it completely and GLUES
+# onto its own tag: '34C1051', '5G10511051'. The old \s+ rejected every
+# such frame — a triple-digit reading could never parse, and the night
+# the const crossed four digits the parse rate collapsed mid-session
+# ('200 unparsed lines of 528 — wrong format/baud?', 2026-08-19).
 _FRAME = re.compile(
-    r'RD\s+34[A-Z]\s+(?:(\d{2,5})\s+)?5[A-Z]\s+(?:(\d{2,9})\s+)?'
+    r'RD\s+34[A-Z]\s*(?:(\d{2,5})\s+)?5[A-Z]\s*(?:(\d{2,9})\s+)?'
     r'(?:(\d{2,5})\s+)?(?:6A|9A(\d{3,7}))')
 # Format A: one space-padded speed per line; idle = spaces + '.'
 _FMT_A = re.compile(r'^\s*(\d{1,3}(?:\.\d)?)\s*$')
