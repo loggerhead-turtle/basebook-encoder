@@ -94,8 +94,31 @@ apt-get install -y -qq ffmpeg curl git avahi-daemon hostapd dnsmasq \
 # uplink can actually carry. Needs the VA-API driver; ffmpeg already
 # speaks VA-API on Debian.
 if [[ "$(uname -m)" == "x86_64" ]]; then
-  apt-get install -y -qq vainfo intel-media-va-driver >/dev/null 2>&1 || \
-    echo "note: VA-API driver not installed — transcoding will fall back to CPU"
+  # The H.264 ENCODE entrypoints on N100/N150-class iGPUs live in the
+  # NON-FREE driver build — the free intel-media-va-driver decodes but
+  # cannot encode there, which shows up later as a push that dies
+  # mid-stream. Debian's default sources carry non-free-firmware but not
+  # non-free, so enable that component if the first install attempt
+  # can't find the package, and only then settle for the free driver.
+  if ! apt-get install -y -qq vainfo intel-media-va-driver-non-free \
+       firmware-misc-nonfree >/dev/null 2>&1; then
+    if [[ -f /etc/apt/sources.list.d/debian.sources ]] && \
+       ! (grep '^Components:' /etc/apt/sources.list.d/debian.sources \
+          | grep -Eq '(^| )non-free( |$)'); then
+      sed -i '/^Components:/ s/$/ non-free/' \
+        /etc/apt/sources.list.d/debian.sources
+      apt-get update -qq || true
+    elif [[ -f /etc/apt/sources.list ]] && \
+         ! grep -Eq '^deb[[:space:]].*[[:space:]]non-free([[:space:]]|$)' \
+             /etc/apt/sources.list; then
+      sed -i -E '/^deb (http|https)/ s/$/ non-free/' /etc/apt/sources.list
+      apt-get update -qq || true
+    fi
+    apt-get install -y -qq vainfo intel-media-va-driver-non-free \
+      firmware-misc-nonfree >/dev/null 2>&1 || \
+    apt-get install -y -qq vainfo intel-media-va-driver >/dev/null 2>&1 || \
+      echo "note: VA-API driver not installed — the YouTube push will stay in copy mode"
+  fi
 fi
 # hostapd/dnsmasq must NOT run as daemons — provisioning spawns them ad hoc.
 # On an ADOPTED box we leave existing services strictly alone: this Pi's
@@ -234,6 +257,25 @@ systemctl restart playcall-encoder-mediamtx playcall-encoder-youtube \
 
 echo
 echo "── Done ─────────────────────────────────────────────────"
+
+# ── QuickSync verdict (x86) ──────────────────────────────────────────────────
+# One honest line about the whole reason to buy an N100/N150: can this box
+# actually hardware-encode H.264? Probed the same way the encoder itself
+# does (a real five-frame test encode), so what prints here is exactly
+# what the game page's quality selector will be able to do.
+if [[ "$(uname -m)" == "x86_64" ]]; then
+  if ffmpeg -hide_banner -v error -vaapi_device /dev/dri/renderD128 \
+       -f lavfi -i color=black:s=320x240:d=0.2 -vf format=nv12,hwupload \
+       -c:v h264_vaapi -f null - >/dev/null 2>&1; then
+    echo "QuickSync: H.264 hardware encode WORKS — pick the YouTube quality"
+    echo "on the game page's encoder card (📺) once the box shows online."
+  else
+    echo "⚠ QuickSync H.264 encode NOT working — the YouTube push will run"
+    echo "  in copy mode. Usually the driver: sudo apt install \\"
+    echo "    intel-media-va-driver-non-free firmware-misc-nonfree"
+    echo "  then reboot and re-run this installer to check again."
+  fi
+fi
 
 # ── What to do next ──────────────────────────────────────────────────────────
 # Exactly one instruction, chosen by what actually happened. The old banner

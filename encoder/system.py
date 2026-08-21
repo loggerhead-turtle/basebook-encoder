@@ -476,7 +476,22 @@ def hw_encoder():
         if os.path.exists('/dev/dri/renderD128'):
             r = run(['ffmpeg', '-hide_banner', '-encoders'], timeout=20)
             if 'h264_vaapi' in (r.stdout or ''):
-                found = 'vaapi'
+                # The encoder being COMPILED IN proves nothing about the
+                # driver: the free intel-media build on N100/N150-class
+                # iGPUs decodes but exposes no H.264 ENCODE entrypoint
+                # (that lives in intel-media-va-driver-non-free), and
+                # ffmpeg only finds out mid-stream. Prove it here with a
+                # five-frame test encode, so a box that can't really do
+                # it stays honestly in copy mode instead of crash-looping
+                # the push. Runs once per process; the result is cached.
+                p = run(['ffmpeg', '-hide_banner', '-v', 'error',
+                         '-vaapi_device', '/dev/dri/renderD128',
+                         '-f', 'lavfi', '-i', 'color=black:s=320x240:d=0.2',
+                         '-vf', 'format=nv12,hwupload',
+                         '-c:v', 'h264_vaapi', '-f', 'null', '-'],
+                        timeout=20)
+                if p.returncode == 0:
+                    found = 'vaapi'
     except Exception:
         found = ''
     _HW_ENCODER = found

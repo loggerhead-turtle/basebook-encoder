@@ -1608,3 +1608,37 @@ def test_the_cloud_can_set_and_unset_push_quality(monkeypatch):
     config.save(cfg)
     link.handle_assignment(dict(base))
     assert config.load()['push_bitrate_kbps'] == 2500
+
+
+def test_hw_encoder_requires_a_real_test_encode(monkeypatch):
+    """h264_vaapi being COMPILED INTO ffmpeg proves nothing: the free
+    intel-media driver on N100/N150-class iGPUs decodes but exposes no
+    encode entrypoint, and the push would die mid-stream. hw_encoder()
+    must run an actual test encode and believe only its exit code."""
+    from encoder import system
+
+    class _R:
+        pass
+
+    def runner(probe_rc):
+        def _run(cmd, **kw):
+            r = _R()
+            if '-encoders' in cmd:
+                r.stdout, r.returncode = 'V..... h264_vaapi', 0
+            else:                       # the five-frame probe encode
+                assert 'h264_vaapi' in cmd and 'lavfi' in cmd
+                r.stdout, r.returncode = '', probe_rc
+            return r
+        return _run
+
+    monkeypatch.setattr(system, 'fake_mode', lambda: False)
+    monkeypatch.setattr(system.os.path, 'exists', lambda p: True)
+    # free driver: encoder listed, probe encode FAILS -> copy mode
+    monkeypatch.setattr(system, '_HW_ENCODER', None)
+    monkeypatch.setattr(system, 'run', runner(probe_rc=1))
+    assert system.hw_encoder() == ''
+    # non-free driver: probe encode succeeds -> vaapi (and cached)
+    monkeypatch.setattr(system, '_HW_ENCODER', None)
+    monkeypatch.setattr(system, 'run', runner(probe_rc=0))
+    assert system.hw_encoder() == 'vaapi'
+    assert system.hw_encoder() == 'vaapi'
