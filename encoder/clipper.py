@@ -47,6 +47,7 @@ log = logging.getLogger('clipper')
 
 PLAYBACK_URL = os.environ.get('PLAYBACK_URL',
                               'http://127.0.0.1:9996').rstrip('/')
+MTX_API = os.environ.get('MEDIAMTX_API', 'http://127.0.0.1:9997').rstrip('/')
 POLL_SECONDS = float(os.environ.get('POLL_SECONDS', '5'))
 CLIPS_DIR = Path(os.environ.get('CLIPS_DIR',
                                 '/var/lib/playcall-encoder/clips'))
@@ -111,6 +112,8 @@ class Clipper:
         self.running = True
         self._last_unpaired_log = 0.0
         self._last_hot_log = 0.0
+        self._ingest_checked = 0.0     # _ingest_live cache (10 s TTL)
+        self._ingest_last = False
 
     # ── cloud ────────────────────────────────────────────────────────────
 
@@ -156,10 +159,34 @@ class Clipper:
         except Exception:
             log.warning('could not report failure for %s', cid)
 
+    def _ingest_live(self, now=None):
+        """Is a camera publishing into MediaMTX right now? Only then can
+        the live YouTube push be using the uplink — which is the whole
+        reason the upload cap exists. Hours after the game the cap was
+        still on, and a 50-clip drain at 250 KB/s took all evening.
+        Cached for 10 s so a burst of uploads costs one API call. When
+        MediaMTX itself is unreachable the push cannot be running either,
+        so the answer is honestly no."""
+        now = time.time() if now is None else now
+        if now - self._ingest_checked < 10:
+            return self._ingest_last
+        self._ingest_checked = now
+        live = False
+        try:
+            with urllib.request.urlopen(f'{MTX_API}/v3/paths/list',
+                                        timeout=5) as r:
+                items = (json.loads(r.read().decode()) or {}).get('items')
+            live = any(p.get('ready') for p in items or [])
+        except Exception:
+            live = False
+        self._ingest_last = live
+        return live
+
     def _throttled_upload(self, base, key, cid, data):
-        """POST the MP4, capped at UPLOAD_BPS bytes/second so a mid-game
-        upload never competes with the live push for the uplink."""
-        if not UPLOAD_BPS:
+        """POST the MP4 — capped at UPLOAD_BPS bytes/second while the
+        camera is live (a mid-game upload must never compete with the
+        push for the uplink), full speed the rest of the time."""
+        if not UPLOAD_BPS or not self._ingest_live():
             return self._api(base, key, f'/api/pi/clips/{cid}/upload',
                              data=data, ctype='video/mp4', timeout=600)
         u = urllib.parse.urlsplit(base)
