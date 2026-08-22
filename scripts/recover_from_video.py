@@ -51,10 +51,12 @@ first and look at it before committing to the batch.
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
@@ -196,6 +198,28 @@ def human(ts):
     return datetime.fromtimestamp(ts).strftime('%H:%M:%S')
 
 
+# The camera page names its saved files
+#   PlayCall_<team>_<YYYYMMDD>_g<gid4>_FULL_<HHMMSS>_<cam>.mp4
+# and that HHMMSS is the SERVER-clock moment recording started — the
+# synced game clock, stamped exactly so a file like this one can be cut
+# later. When the file still wears that name, it is the best anchor
+# there is: no camera-timestamp guesswork at all.
+_FULL_NAME = re.compile(r'_(\d{8})_(?:g\w{1,8}_)?FULL_(\d{6})_')
+
+
+def filename_anchor(video):
+    """Recording-start epoch parsed from a PlayCall camera filename
+    (local time, same zone the phone was in), or None."""
+    m = _FULL_NAME.search(os.path.basename(str(video)))
+    if not m:
+        return None
+    try:
+        return datetime.strptime(m.group(1) + m.group(2),
+                                 '%Y%m%d%H%M%S').timestamp()
+    except ValueError:
+        return None
+
+
 def main():
     p = argparse.ArgumentParser(
         description='Rebuild a game\'s clips from a whole-game video.')
@@ -218,6 +242,12 @@ def main():
                         'the FIRST session only — anchor the later files '
                         'with --start, or let the file\'s own timestamp do '
                         'it')
+    p.add_argument('--angle', help='upload the cuts as a named camera '
+                   'ANGLE (e.g. --angle iphone) instead of as the primary '
+                   'clip. Adds this footage BESIDE clips that already '
+                   'uploaded from another camera — the primary is never '
+                   'touched, and a play with no primary yet gets this cut '
+                   'as both. With --replace, redoes THIS angle only')
     p.add_argument('--replace', action='store_true',
                    help='overwrite clips that already uploaded (use after '
                         'a --limit 1 test cut landed on the wrong play)')
@@ -267,13 +297,21 @@ def main():
     if not every:
         sys.exit(f'{a.game} has no clip windows — nothing to do.')
     first_window = min(c['start'] for c in every)
-    # --replace re-cuts over clips this script already uploaded; without
-    # it, good footage is left alone.
-    clips = (every if a.replace
-             else [c for c in every if c.get('status') != 'uploaded'])
+    if a.angle:
+        # Angle mode works EVERY window: this footage goes in beside
+        # whatever already uploaded (the server refuses only the same
+        # angle twice, and --replace redoes this angle alone).
+        clips = every
+    else:
+        # --replace re-cuts over clips this script already uploaded;
+        # without it, good footage is left alone.
+        clips = (every if a.replace
+                 else [c for c in every if c.get('status') != 'uploaded'])
     if not clips:
         sys.exit(f'{a.game} has no uncut clips left — every window is '
-                 'already filled. Use --replace to re-cut them anyway.')
+                 'already filled. Use --replace to re-cut them anyway, or '
+                 '--angle <name> to add this footage as another camera '
+                 'angle.')
 
     dur, made = probe(a.video)
     forced = None
@@ -296,6 +334,12 @@ def main():
             sys.exit(str(e))
         forced = first_window + DEFAULT_PRE_ROLL - pos
         print(f'first pitch {pos / 60:.0f}:{pos % 60:02.0f} into the video')
+    if forced is None:
+        named = filename_anchor(a.video)
+        if named is not None:
+            forced = named
+            print('filename carries the synced recording start '
+                  '(PlayCall camera file) — anchoring on it')
     anchor, why = choose_anchor(clips, dur, made, forced)
     anchor += a.offset
 
@@ -350,12 +394,21 @@ def main():
                 # repair=1 lets a cut land over one this script uploaded
                 # earlier — the way a bad test cut gets corrected, since
                 # there is no delete and re-cutting is the honest fix.
+                # In angle mode the cut is filed under its camera name
+                # (the primary stays untouched) with the cut's real
+                # wall-clock start riding as t0 for multi-angle sync.
                 path = f'/api/pi/clips/{c["id"]}/upload'
+                q = ['repair=1'] if a.replace else []
+                if a.angle:
+                    q.append('angle=' + urllib.parse.quote(a.angle))
+                    q.append(f't0={c["start"]:.3f}')
                 r = api(a.base, a.key,
-                        path + ('?repair=1' if a.replace else ''),
+                        path + ('?' + '&'.join(q) if q else ''),
                         data=body, ctype='video/mp4', timeout=600)
                 if r.get('duplicate'):
-                    print('already uploaded — run with --replace to redo it')
+                    print(('this angle already has it'
+                           if a.angle else 'already uploaded')
+                          + ' — run with --replace to redo it')
                     dup += 1
                 else:
                     print(f'{len(body) / 1e6:.1f} MB uploaded')
