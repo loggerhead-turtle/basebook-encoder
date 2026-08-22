@@ -973,3 +973,70 @@ def test_no_usb_serial_hardware_is_trustworthy_by_default(monkeypatch):
     from encoder import radar
     monkeypatch.setattr(radar.glob, 'glob', lambda pat: [])
     assert radar.RadarService._ids_trustworthy() is True
+
+
+def test_the_serial_thread_never_posts_while_the_sender_runs():
+    """The 8-second velocity lag, root cause: the cloud POST (6 s HTTP
+    timeout) ran on the SERIAL thread, so one slow post on a saturated
+    field hotspot froze frame reading until the backlog guard threw the
+    pitch away as stale history. With the sender thread up, push() only
+    records intent and sets the wake flag — zero network on this
+    thread — and the sender delivers the same payload."""
+    link = _FakeLink()
+    svc = RadarService(link)
+
+    class _Alive:
+        @staticmethod
+        def is_alive():
+            return True
+
+    svc._sender = _Alive()
+    svc.handle_line(WITH_SPIN, t=5.0)
+    assert link.posts == []                    # no HTTP on the serial thread
+    assert svc._send_wake.is_set()             # sender woken instead
+    assert svc._live_out is not None
+    assert svc._send_now(5.1) is True          # the sender's unit of work
+    assert link.posts[-1][1]['live']['velo'] == 58.9
+
+
+def test_live_readings_coalesce_to_the_newest():
+    """Two readings between sender passes must post once, with the
+    NEWEST value — the tile shows the pitch that just happened, never a
+    replay of the queue."""
+    link = _FakeLink()
+    svc = RadarService(link)
+
+    class _Alive:
+        @staticmethod
+        def is_alive():
+            return True
+
+    svc._sender = _Alive()
+    svc.push(live=(80.0, None), now=5.0)
+    svc.push(live=(82.5, None), now=5.5)
+    assert svc._send_now(5.6) is True
+    lives = [p for _u, p in link.posts if p.get('live')]
+    assert len(lives) == 1 and lives[0]['live']['velo'] == 82.5
+
+
+def test_sender_failure_keeps_events_and_mid_post_arrivals_survive():
+    """Events leave `pending` only after a good POST, and only the ones
+    that were actually IN that post — an event landing while the POST is
+    in flight stays queued for the next pass."""
+    link = _FakeLink()
+    svc = RadarService(link)
+    svc.pending.append({'kind': 'pitch', 'peak': 77.0})
+    real = link.http
+    link.http = lambda *a, **k: (_ for _ in ()).throw(OSError('down'))
+    assert svc._send_now(100.0) is False
+    assert [e['peak'] for e in svc.pending] == [77.0]    # kept for retry
+
+    def tricky(url, headers=None, payload=None):
+        svc.pending.append({'kind': 'pitch', 'peak': 81.0})
+        return real(url, headers=headers, payload=payload)
+
+    link.http = tricky
+    assert svc._send_now(101.0) is True
+    sent = [p for _u, p in link.posts if p.get('events')][-1]['events']
+    assert [e['peak'] for e in sent] == [77.0]
+    assert [e['peak'] for e in svc.pending] == [81.0]    # mid-POST arrival
