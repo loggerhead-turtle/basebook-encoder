@@ -276,6 +276,20 @@ class RadarService:
         self._last_live_post = 0.0
         self._last_alive_post = 0.0
         self._last_live = (None, None)
+        # The cloud POST must NEVER run on the serial thread. It did: a
+        # 6-second HTTP timeout inside the frame loop froze reading for
+        # whole seconds per post on a saturated field hotspot, the gun's
+        # frames piled into the OS buffer, and the backlog guard then
+        # threw the pitch away as "stale history" — the pad showed the
+        # velocity 8–10 s late, if at all. The serial thread now only
+        # records intent (newest live reading, queued events, keepalive
+        # due) and wakes a sender thread that owns all HTTP. When the
+        # sender isn't running (unit tests, one-shot callers), a kick
+        # sends inline — same synchronous contract as before.
+        self._live_out = None               # newest unsent live reading
+        self._force_alive = False
+        self._send_wake = threading.Event()
+        self._sender = None
         self.port = None
         self.connected = False
         # Observability: "no velo showed up" was undiagnosable from the
@@ -347,16 +361,36 @@ class RadarService:
             return False
 
     def push(self, live=None, event=None, force_alive=False, now=None):
+        """Record what the cloud should hear; never blocks on the network.
+        Called from the serial thread on every frame — the actual HTTP
+        happens on the sender thread (or inline when none is running,
+        which keeps unit tests and one-shot callers synchronous)."""
         now = time.monotonic() if now is None else now
         if event:
             self.pending.append(event)
-        want_live = (live is not None
-                     and now - self._last_live_post >= LIVE_MIN_INTERVAL
-                     and live != self._last_live)
-        want_alive = force_alive \
+        if (live is not None and live != self._last_live
+                and now - self._last_live_post >= LIVE_MIN_INTERVAL):
+            self._live_out = live           # newest wins — coalesce
+        if force_alive:
+            self._force_alive = True
+        if (self._live_out is not None or self.pending or self._force_alive
+                or now - self._last_alive_post >= ALIVE_INTERVAL):
+            if self._sender is not None and self._sender.is_alive():
+                self._send_wake.set()
+            else:
+                self._send_now(now)
+
+    def _send_now(self, now):
+        """Build and POST one payload; the sender thread's unit of work.
+        Events leave `pending` only after a good POST — a failure keeps
+        them queued for the next attempt (cloud-outage buffering)."""
+        live = self._live_out
+        want_live = live is not None
+        want_alive = self._force_alive \
             or now - self._last_alive_post >= ALIVE_INTERVAL
-        if not (want_live or self.pending or want_alive):
-            return
+        evs = list(self.pending)
+        if not (want_live or evs or want_alive):
+            return False
         # The keepalive says WHO is alive. 'alive' is the service with an
         # open adapter; 'gun.heard_s' is how long since a line actually
         # parsed. The cloud shows "radar ✓" off the latter — an open
@@ -368,15 +402,41 @@ class RadarService:
                            'connected': bool(self.connected)}}
         if want_live:
             payload['live'] = {'velo': live[0], 'rpm': live[1]}
-        if self.pending:
-            payload['events'] = list(self.pending)
-        if self._post(payload):
-            if want_live:
-                self._last_live_post = now
-                self._last_live = live
-            self._last_alive_post = now
-            if 'events' in payload:
-                self.pending.clear()
+        if evs:
+            payload['events'] = evs
+        if not self._post(payload):
+            return False
+        if want_live:
+            self._last_live_post = now
+            self._last_live = live
+            if self._live_out == live:      # a newer reading may have landed
+                self._live_out = None       # mid-POST — never drop it
+        self._force_alive = False
+        self._last_alive_post = now
+        for _ in evs:                       # remove exactly what was sent;
+            try:                            # events appended mid-POST stay
+                self.pending.popleft()
+            except IndexError:
+                break
+        return True
+
+    def _send_loop(self):
+        while self.running:
+            self._send_wake.wait(timeout=1.0)
+            self._send_wake.clear()
+            try:
+                self._send_now(time.monotonic())
+            except Exception:
+                log.debug('radar sender pass failed', exc_info=True)
+
+    def ensure_sender(self):
+        """Start the network thread (idempotent). loop() calls this so
+        production posting is always off the serial thread; anything
+        driving handle_line() without loop() keeps the inline path."""
+        if self._sender is None or not self._sender.is_alive():
+            self._sender = threading.Thread(target=self._send_loop,
+                                            daemon=True, name='radar-sender')
+            self._sender.start()
 
     # ── display board passthrough ────────────────────────────────────────────
     def _close_display(self):
@@ -681,6 +741,7 @@ class RadarService:
             log.info('pyserial not installed — radar capture disabled')
             return
         self._serial_cls = serial.Serial
+        self.ensure_sender()     # all HTTP off this thread — see push()
         # A box can carry more than one USB-serial adapter (the gun AND
         # its LED display board). The old design ROTATED to the next
         # adapter after 60s of silence — but a Stalker SLEEPS between
