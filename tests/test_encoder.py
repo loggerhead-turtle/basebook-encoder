@@ -1642,3 +1642,51 @@ def test_hw_encoder_requires_a_real_test_encode(monkeypatch):
     monkeypatch.setattr(system, 'run', runner(probe_rc=0))
     assert system.hw_encoder() == 'vaapi'
     assert system.hw_encoder() == 'vaapi'
+
+
+def test_upload_cap_lifts_when_no_camera_is_publishing(monkeypatch):
+    """The 250 KB/s upload cap exists so a mid-game upload never fights
+    the live push for the uplink. Hours after the game the cap was
+    still on and a 50-clip drain took all evening — the cap must apply
+    only while a camera is actually publishing into MediaMTX."""
+    import json as _json
+    import io
+    import urllib.request as _rq
+    from encoder import clipper as clip_mod
+
+    svc = clip_mod.Clipper(cfg_load=lambda: {})
+    calls = []
+
+    def fake_open(url, timeout=0):
+        calls.append(url)
+
+        class _R(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+        return _R(_json.dumps(
+            {'items': [{'name': 'live/x', 'ready': fake_open.ready}]}
+        ).encode())
+
+    fake_open.ready = False
+    monkeypatch.setattr(_rq, 'urlopen', fake_open)
+    # idle box → not live → the plain full-speed upload path is chosen
+    assert svc._ingest_live(now=1000.0) is False
+    # cached: a second ask inside 10 s costs no API call
+    n = len(calls)
+    assert svc._ingest_live(now=1005.0) is False and len(calls) == n
+    # camera starts publishing → live again after the cache expires
+    fake_open.ready = True
+    assert svc._ingest_live(now=1011.0) is True
+    # MediaMTX unreachable = the push cannot be running either
+
+    def boom(url, timeout=0):
+        raise OSError('down')
+    monkeypatch.setattr(_rq, 'urlopen', boom)
+    assert svc._ingest_live(now=1022.0) is False
+    # and _throttled_upload consults it before choosing the slow path
+    import inspect
+    src = inspect.getsource(clip_mod.Clipper._throttled_upload)
+    assert 'not UPLOAD_BPS or not self._ingest_live()' in src
