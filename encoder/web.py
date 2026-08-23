@@ -371,11 +371,14 @@ STATUS_PAGE = """<!doctype html><html><head>
 <div class="card">
   <h2>🎧 Coach comms</h2>
   {% if comms['state'] == 'absent' %}
-  <p class="hint">Not installed on this box. Comms turns the box into
-    the catcher's &amp; pitcher's ear — called pitches spoken into
-    paired Bluetooth buds, plus the coach's live voice. One-time
-    install on the box: <code>sudo bash comms/install_comms.sh</code>
-    (from the release repo checkout).</p>
+  <p class="hint">Not installed on this box yet. Comms turns the box
+    into the catcher's &amp; pitcher's ear — called pitches spoken into
+    paired Bluetooth buds, plus the coach's live voice. It is bundled
+    with the encoder installer: re-run the install one-liner (safe —
+    it never touches pairing) and comms comes along:<br>
+    <code>wget -qO- https://basebook.org/i | sudo bash</code><br>
+    or, on a box that already has the files:
+    <code>sudo bash /opt/playcall-encoder/comms/install_comms.sh</code></p>
   {% else %}
   <p class="hint">
     {{ '🟢 running' if comms['state'] == 'active' else '🔴 ' + comms['state'] }}

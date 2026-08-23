@@ -814,6 +814,10 @@ def _fake_release_tree(root):
     (root / 'scripts' / 'youtube_push.sh').write_text('#!/bin/bash\n')
     (root / 'systemd').mkdir()
     (root / 'systemd' / 'playcall-encoder.service').write_text('[Unit]\n')
+    (root / 'comms').mkdir()
+    (root / 'comms' / 'comms_ear.py').write_text('# ear\n')
+    (root / 'comms' / 'install_comms.sh').write_text('#!/bin/bash\n')
+    (root / 'comms' / 'README.md').write_text('# comms\n')
 
 
 def test_self_update_lays_installer_payload(tmp_path, monkeypatch):
@@ -846,6 +850,10 @@ def test_self_update_lays_installer_payload(tmp_path, monkeypatch):
     assert push.exists() and push.stat().st_mode & 0o111
     # Stale bytecode purged so old .pyc can't shadow the new tree.
     assert not (install / 'encoder' / '__pycache__').exists()
+    # 🎧 comms is bundled — the ear's code updates with the encoder
+    ear = install / 'comms' / 'comms_ear.py'
+    assert ear.exists() and ear.stat().st_mode & 0o111
+    assert (install / 'comms' / 'install_comms.sh').exists()
 
 
 def test_self_update_reports_download_failure(tmp_path, monkeypatch):
@@ -898,13 +906,14 @@ def test_web_update_button_and_route(monkeypatch):
     assert r.status_code == 302
     assert 'msg=' in r.headers['Location'] and '9.9.9' in r.headers['Location']
     for _ in range(300):                           # restart thread finishes
-        if len(restarted) == 4:
+        if len(restarted) == 5:
             break
         time.sleep(0.01)
-    # Siblings first; the unit hosting this web app restarts LAST.
+    # Siblings first (comms rides along); this web app's unit LAST.
     assert restarted == [('restart', 'playcall-encoder-mediamtx'),
                          ('restart', 'playcall-encoder-youtube'),
                          ('restart', 'playcall-encoder-clipper'),
+                         ('restart', 'playcall-comms'),
                          ('restart', 'playcall-encoder')]
 
 
@@ -1906,3 +1915,20 @@ def test_comms_status_reads_systemd_and_buds(monkeypatch):
         return _R(4, '')
     monkeypatch.setattr(web.system, 'run', fake_run_absent)
     assert web.comms_status() == {'state': 'absent', 'buds': []}
+
+
+def test_comms_is_bundled_with_the_encoder():
+    """One box, one install: the installer lays the comms payload and —
+    on a PAIRED box — runs the comms installer too, never failing the
+    encoder install over it. Updates restart playcall-comms before the
+    encoder itself (harmlessly absent on boxes without it)."""
+    import os as _os
+    from encoder import system
+    root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    sh = open(_os.path.join(root, 'install.sh')).read()
+    assert 'comms/install_comms.sh' in sh
+    assert '$SRC/comms' in sh
+    assert 'comms install did not finish — the encoder is unaffected' in sh
+    units = list(system.UPDATE_UNITS)
+    assert 'playcall-comms' in units
+    assert units.index('playcall-comms') < units.index('playcall-encoder')
