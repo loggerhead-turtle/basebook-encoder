@@ -1787,3 +1787,122 @@ def test_the_cloud_can_set_the_push_codec(monkeypatch):
     config.save(cfg)
     link.handle_assignment(dict(base))
     assert config.load()['push_codec'] == 'hevc'
+
+
+def _settings_client(monkeypatch, cloud=None):
+    from encoder import web
+    monkeypatch.setattr(web.system, 'journal_tail', lambda *a, **k: [])
+    monkeypatch.setattr(web, 'comms_status',
+                        lambda: {'state': 'absent', 'buds': []})
+    calls = []
+    monkeypatch.setattr(web.system, 'systemctl',
+                        lambda *a: calls.append(a))
+    monkeypatch.setattr(web.time, 'sleep', lambda s: None)
+    provisioning.headless_setup()
+    cfg = config.load()
+    cfg['device']['pin'] = '123456'
+    config.save(cfg)
+    app = web.create_app(cloud=cloud)
+    app.config['TESTING'] = True
+    c = app.test_client()
+    c.post('/login', data={'pin': '123456'})
+    return c, calls
+
+
+def _wait_for(calls, want, tries=100):
+    import time as _t
+    for _ in range(tries):
+        if want in calls:
+            return True
+        _t.sleep(0.02)
+    return False
+
+
+def test_radar_settings_save_from_the_page(monkeypatch):
+    """The settings page owns the radar knobs now: capture on/off, gun
+    baud, the Bluetooth adapter MAC, board output — saved to config,
+    the rfcomm binder re-run when the MAC changes, and the encoder
+    service restarted so the radar loop reopens on the new settings."""
+    c, calls = _settings_client(monkeypatch)
+    r = c.post('/radar', data={'enabled': 'auto', 'baud': '9600',
+                               'bluetooth_mac': 'aa:bb:cc:dd:ee:ff',
+                               'display_format': 'raw'})
+    assert r.status_code == 302 and 'err=' not in r.headers['Location']
+    rd = config.load()['radar']
+    assert rd['baud'] == 9600
+    assert rd['bluetooth_mac'] == 'AA:BB:CC:DD:EE:FF'
+    assert rd['display_format'] == 'raw'
+    assert ('restart', 'playcall-encoder-radarbt') in calls
+    assert _wait_for(calls, ('restart', 'playcall-encoder'))
+    # junk MAC is refused with a human sentence, nothing saved
+    r = c.post('/radar', data={'bluetooth_mac': 'not-a-mac'})
+    assert 'err=' in r.headers['Location']
+    assert config.load()['radar']['bluetooth_mac'] == 'AA:BB:CC:DD:EE:FF'
+
+
+def test_forget_learned_cables_clears_the_pins(monkeypatch):
+    c, calls = _settings_client(monkeypatch)
+    cfg = config.load()
+    cfg['radar'] = {'port': '/dev/serial/by-id/usb-x', 'display_port':
+                    '/dev/serial/by-id/usb-y', 'baud': 19200}
+    config.save(cfg)
+    r = c.post('/radar/forget')
+    assert r.status_code == 302
+    rd = config.load()['radar']
+    assert 'port' not in rd and 'display_port' not in rd
+    assert rd['baud'] == 19200                    # the rest survives
+    assert _wait_for(calls, ('restart', 'playcall-encoder'))
+
+
+def test_settings_page_shows_radar_and_comms_cards(monkeypatch):
+    from encoder import web
+
+    class _Cloud:
+        assignment = None
+        latest_version = None
+
+        def ingest_status(self):
+            return {'connected': False, 'kbps': None}
+
+        def push_status(self):
+            return {'connected': False, 'kbps': None, 'reconnects_5m': 0}
+
+        def radar_health(self):
+            return {'connected': True, 'port': '/dev/rfcomm0',
+                    'baud': 19200, 'gun_heard_s': 4.2, 'learned': True,
+                    'pin_overridden': False, 'lines': 10, 'parsed': 9}
+    c, _calls = _settings_client(monkeypatch, cloud=_Cloud())
+    html = c.get('/').get_data(as_text=True)
+    assert '🔫 Radar' in html and 'listening on /dev/rfcomm0' in html
+    assert 'cables learned ✓' in html
+    assert 'Forget learned cables' in html
+    assert '🎧 Coach comms' in html
+    assert 'install_comms.sh' in html             # absent → install hint
+
+
+def test_comms_status_reads_systemd_and_buds(monkeypatch):
+    from encoder import web
+
+    class _R:
+        def __init__(self, rc, out):
+            self.returncode, self.stdout = rc, out
+
+    def fake_run(cmd, **kw):
+        if cmd[:2] == ['systemctl', 'cat']:
+            return _R(0, 'unit file')
+        if cmd[:2] == ['systemctl', 'is-active']:
+            return _R(0, 'active\n')
+        if cmd[0] == 'bluetoothctl':
+            return _R(0, 'Device AA:BB:CC:DD:EE:FF Catcher buds\n'
+                         'garbage line\n')
+        raise AssertionError(cmd)
+    monkeypatch.setattr(web.system, 'run', fake_run)
+    st = web.comms_status()
+    assert st['state'] == 'active'
+    assert st['buds'] == [{'mac': 'AA:BB:CC:DD:EE:FF',
+                           'name': 'Catcher buds'}]
+
+    def fake_run_absent(cmd, **kw):
+        return _R(4, '')
+    monkeypatch.setattr(web.system, 'run', fake_run_absent)
+    assert web.comms_status() == {'state': 'absent', 'buds': []}
