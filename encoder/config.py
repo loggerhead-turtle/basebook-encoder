@@ -45,6 +45,12 @@ DEFAULTS = {
     # quality: send the box 1080p at 10 Mbps for crisp clips, hand
     # YouTube 3 Mbps the field uplink can actually carry.
     'push_bitrate_kbps': 0,
+    # 'h264' (default — every YouTube ingest and every box accepts it)
+    # or 'hevc': ~35% better quality per bit via enhanced RTMP. Only
+    # honored when transcoding (push_bitrate_kbps > 0) on a box whose
+    # hardware AND ffmpeg both prove HEVC capable; everywhere else it
+    # degrades to H.264 with a log line, never an error loop.
+    'push_codec': 'h264',
     # True = recording to the SD card instead of the NVMe is a CHOICE
     # (the drive is out for repair, or this box never had one). The
     # storage check then reports the fallback instead of raising a
