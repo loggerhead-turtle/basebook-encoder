@@ -29,6 +29,21 @@ from . import __version__, config, provisioning, system
 _MAC_RE = re.compile(r'^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$')
 
 
+def comms_token(cfg=None):
+    """The 5-minute pass the comms admin accepts from this box's own
+    settings page (comms_ear._enc_token_ok): hmac of the shared
+    activation key over the current 5-minute bucket. Whoever opened
+    THIS page already proved themselves (PIN or one-click site link),
+    so comms opens without asking again."""
+    cfg = cfg or config.load()
+    key = (cfg.get('cloud') or {}).get('api_key') or ''
+    if not key:
+        return ''
+    bucket = int(time.time() // 300)
+    return 'enc-' + hmac.new(key.encode(), f'enc:{bucket}'.encode(),
+                             'sha256').hexdigest()[:32]
+
+
 def comms_status():
     """The coach-comms box, best-effort: installed? running? which buds
     are connected right now? Comms manages itself on :8790 (pairing,
@@ -386,12 +401,25 @@ STATUS_PAGE = """<!doctype html><html><head>
       {% for b in comms['buds'] %}<b>{{ b['name'] }}</b>{{ ', ' if not loop.last }}{% endfor %}
     {% else %} — no buds connected right now{% endif %}
   </p>
+  {% if comms_tok %}
+  {# the whole comms manager, embedded and pre-signed-in: this page's
+     auth mints a short-lived pass comms accepts, so there is exactly
+     one PIN in this box's life — this page's #}
+  <iframe src="http://{{ request.host.split(':')[0] }}:8790/login?token={{ comms_tok }}"
+          style="width:100%;height:70vh;border:1px solid #ccc;
+                 border-radius:8px;background:#fff"></iframe>
+  <p class="hint">
+    <a href="http://{{ request.host.split(':')[0] }}:8790/login?token={{ comms_tok }}"
+       target="_blank">open full-screen ↗</a>
+    — pair &amp; label buds (🧢 catcher / ⚾ pitcher), lock Bluetooth,
+    test the earpiece. If it ever asks for a PIN, refresh this page —
+    the pass lasts ~10 minutes.</p>
+  {% else %}
   <p>
     <a class="btn" href="http://{{ request.host.split(':')[0] }}:8790">🎧
       Open the comms manager</a>
-    <span class="hint">pair &amp; label buds (🧢 catcher / ⚾ pitcher),
-      lock Bluetooth, name the box — comms' own phone-friendly page</span>
   </p>
+  {% endif %}
   {% endif %}
 </div>
 
@@ -731,6 +759,7 @@ def create_app(cloud=None, sender=None):
                    else None),
             radar_cfg=(cfg.get('radar') or {}),
             comms=comms_status(),
+            comms_tok=comms_token(cfg),
             cloud_base=(cfg.get('cloud') or {}).get('base_url', ''),
             bandwidth_levels=BANDWIDTH_LEVELS,
             logs='\n'.join(config.redact_lines(system.journal_tail(60), cfg))

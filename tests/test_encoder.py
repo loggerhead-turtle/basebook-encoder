@@ -1932,3 +1932,57 @@ def test_comms_is_bundled_with_the_encoder():
     units = list(system.UPDATE_UNITS)
     assert 'playcall-comms' in units
     assert units.index('playcall-comms') < units.index('playcall-encoder')
+
+
+def test_comms_manager_embeds_without_a_second_pin(monkeypatch):
+    """One PIN per box: the settings page mints a 5-minute pass (hmac
+    of the shared activation key over a time bucket — see
+    comms_ear._enc_token_ok) and embeds the whole comms manager
+    pre-signed-in. No key paired yet → no token, plain link."""
+    import hmac as _hmac
+    from encoder import web
+    monkeypatch.setattr(web.time, 'time', lambda: 1_000_000.0)
+    tok = web.comms_token({'cloud': {'api_key': 'pce_secret'}})
+    want = 'enc-' + _hmac.new(
+        b'pce_secret', f'enc:{int(1_000_000 // 300)}'.encode(),
+        'sha256').hexdigest()[:32]
+    assert tok == want
+    assert web.comms_token({'cloud': {}}) == ''
+
+
+def test_settings_page_embeds_comms_when_installed(monkeypatch):
+    from encoder import web
+    c, _calls = _settings_client(monkeypatch)
+    monkeypatch.setattr(web, 'comms_status',
+                        lambda: {'state': 'active',
+                                 'buds': [{'mac': 'M', 'name': 'Buds'}]})
+    cfg = config.load()
+    cfg['cloud']['api_key'] = 'pce_k123'
+    cfg['cloud']['base_url'] = 'https://basebook.org'
+    config.save(cfg)
+    html = c.get('/').get_data(as_text=True)
+    assert '<iframe' in html and ':8790/login?token=enc-' in html
+    assert 'open full-screen' in html
+
+
+def test_comms_ear_accepts_the_encoders_pass(monkeypatch):
+    """The two halves of the handshake actually shake: a token minted
+    by encoder.web.comms_token is accepted by comms_ear._enc_token_ok
+    when both hold the same activation key, refused with a different
+    key or junk. (Both windows are accepted, so a bucket flip between
+    mint and check cannot flake this.)"""
+    import importlib.util
+    import os as _os
+    from encoder import web
+    root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    spec = importlib.util.spec_from_file_location(
+        'comms_ear_test', _os.path.join(root, 'comms', 'comms_ear.py'))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    monkeypatch.setenv('PLAYCALL_API_KEY', 'pce_secret')
+    tok = web.comms_token({'cloud': {'api_key': 'pce_secret'}})
+    assert mod._enc_token_ok(tok) is True
+    assert mod._enc_token_ok('enc-junk') is False
+    assert mod._enc_token_ok('') is False
+    monkeypatch.setenv('PLAYCALL_API_KEY', 'different')
+    assert mod._enc_token_ok(tok) is False
