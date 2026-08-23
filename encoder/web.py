@@ -270,6 +270,14 @@ STATUS_PAGE = """<!doctype html><html><head>
       <option value="{{ k }}" {{ 'selected' if k == push_kbps }}>{{ label }}</option>
       {% endfor %}
     </select>
+    {% if hw_hevc %}
+    <select name="codec">
+      <option value="h264" {{ 'selected' if push_codec != 'hevc' }}>H.264
+        (safe default)</option>
+      <option value="hevc" {{ 'selected' if push_codec == 'hevc' }}>HEVC
+        (~35% more quality per bit)</option>
+    </select>
+    {% endif %}
     <button class="btn" type="submit">Save quality</button>
   </form>
 </div>
@@ -603,6 +611,8 @@ def create_app(cloud=None, sender=None):
             bandwidth=cfg.get('bandwidth', 0),
             record_hours=int(cfg.get('record_hours') or 12),
             hw_encoder=bool(system.hw_encoder()),
+            hw_hevc=bool(system.hw_encoders().get('hevc')),
+            push_codec=cfg.get('push_codec') or 'h264',
             push_kbps=int(cfg.get('push_bitrate_kbps') or 0),
             bandwidth_levels=BANDWIDTH_LEVELS,
             logs='\n'.join(config.redact_lines(system.journal_tail(60), cfg))
@@ -724,6 +734,9 @@ def create_app(cloud=None, sender=None):
             kbps = 0
         cfg = config.load()
         cfg['push_bitrate_kbps'] = kbps
+        codec = request.form.get('codec')
+        if codec in ('h264', 'hevc'):
+            cfg['push_codec'] = codec
         config.save(cfg)
         system.systemctl('restart', 'playcall-encoder-youtube')
         log.info('push quality set locally: '

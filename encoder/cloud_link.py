@@ -119,7 +119,8 @@ class CloudLink:
         (feed repointed / push target rewritten / service restarted)."""
         sig = (bool(a.get('assigned')), a.get('team_id'),
                a.get('bug_feed_url'), a.get('youtube_rtmp_url'),
-               a.get('game_id'), a.get('push_bitrate_kbps'))
+               a.get('game_id'), a.get('push_bitrate_kbps'),
+               a.get('push_codec'))
         if sig == self.last_assignment:
             return False
         self.last_assignment = sig
@@ -160,6 +161,15 @@ class CloudLink:
             restart_push = True
             log.info(f'push quality set from the cloud: '
                      + (f'{pk} kbps transcode' if pk else 'source copy'))
+        # Push codec, same contract: None = no cloud opinion; 'h264' or
+        # 'hevc' is authoritative. An incapable box stores it and
+        # degrades at push time with a log line (see youtube_push).
+        pc = a.get('push_codec')
+        if pc in ('h264', 'hevc') \
+                and pc != (cfg.get('push_codec') or 'h264'):
+            cfg['push_codec'] = pc
+            restart_push = True
+            log.info(f'push codec set from the cloud: {pc}')
 
         self.cfg_save(cfg)
         if restart_push:
@@ -325,7 +335,9 @@ class CloudLink:
             # Pi 5 owns no video encoder and stays copy-mode for life.
             'transcode': {
                 'capable': bool(system.hw_encoder()),
+                'hevc': bool(system.hw_encoders().get('hevc')),
                 'target_kbps': int(cfg.get('push_bitrate_kbps') or 0),
+                'codec': cfg.get('push_codec') or 'h264',
             },
             'cpu': system.cpu_percent(),
             'temp': system.cpu_temp(),

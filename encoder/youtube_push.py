@@ -79,7 +79,18 @@ def push_bitrate(cfg, hw=None):
     return kbps
 
 
-def build_ffmpeg_cmd(cfg, acodec, push_url, hw=None):
+def push_codec(cfg, caps=None):
+    """'hevc' only when it was ASKED FOR and this box PROVED it can —
+    hardware encode plus an ffmpeg that muxes HEVC into flv (enhanced
+    RTMP). Everything else is 'h264': the battle-tested path every
+    YouTube ingest accepts, and what a mixed fleet safely degrades to."""
+    if (cfg.get('push_codec') or 'h264') != 'hevc':
+        return 'h264'
+    caps = system.hw_encoders() if caps is None else caps
+    return 'hevc' if caps.get('hevc') else 'h264'
+
+
+def build_ffmpeg_cmd(cfg, acodec, push_url, hw=None, caps=None):
     if not acodec or acodec == 'aac':
         input_args = ['-rw_timeout', '10000000', '-i', rtmp_in(cfg)]
         audio_args = ['-c:a', 'copy']
@@ -90,10 +101,14 @@ def build_ffmpeg_cmd(cfg, acodec, push_url, hw=None):
     if kbps:
         # QuickSync via VA-API: decode on CPU (cheap), upload frames to
         # the GPU, encode there. CBR-ish with a 2x buffer and a 2 s GOP —
-        # what YouTube's ingest guidance wants for live.
+        # what YouTube's ingest guidance wants for live. HEVC rides
+        # enhanced RTMP (ffmpeg writes the hvc1 fourcc into flv) at the
+        # same bitrate — ~35% more quality per bit on the same uplink.
+        enc = ('hevc_vaapi' if push_codec(cfg, caps=caps) == 'hevc'
+               else 'h264_vaapi')
         video_args = ['-vaapi_device', '/dev/dri/renderD128',
                       '-vf', 'format=nv12,hwupload',
-                      '-c:v', 'h264_vaapi',
+                      '-c:v', enc,
                       '-b:v', f'{kbps}k', '-maxrate', f'{kbps}k',
                       '-bufsize', f'{kbps * 2}k', '-g', '60']
     else:
@@ -178,8 +193,13 @@ class YouTubePusher:
             # per attempt, then do the right thing anyway
             log.info(f'push_bitrate_kbps={want} configured but this box '
                      'has no hardware encoder — pushing source copy')
+        codec = push_codec(cfg) if kbps else ''
+        if kbps and (cfg.get('push_codec') or 'h264') == 'hevc' \
+                and codec != 'hevc':
+            log.info('push_codec=hevc configured but this box cannot '
+                     'encode/mux HEVC — transcoding to H.264 instead')
         log.info(f"push start (audio={acodec or 'assume-aac'}, video="
-                 + (f'{kbps}k transcode' if kbps else 'copy') + ')')
+                 + (f'{kbps}k {codec} transcode' if kbps else 'copy') + ')')
         started = time.monotonic()
         state = {}
         self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,

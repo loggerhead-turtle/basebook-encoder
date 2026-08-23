@@ -494,7 +494,8 @@ def test_heartbeat_payload_shape():
                        'pin', 'rtmp_urls', 'radar', 'temp_max', 'storage',
                        'transcode'}
     # a Pi (no hardware encoder) reports not-capable, copy target
-    assert hb['transcode'] == {'capable': False, 'target_kbps': 0}
+    assert hb['transcode'] == {'capable': False, 'hevc': False,
+                               'target_kbps': 0, 'codec': 'h264'}
     # fake mode (conftest) has no recordings mount — storage rides as a
     # benign stub so a dev laptop never fakes an outage
     assert hb['storage']['ok'] is True
@@ -1635,10 +1636,12 @@ def test_hw_encoder_requires_a_real_test_encode(monkeypatch):
     monkeypatch.setattr(system.os.path, 'exists', lambda p: True)
     # free driver: encoder listed, probe encode FAILS -> copy mode
     monkeypatch.setattr(system, '_HW_ENCODER', None)
+    monkeypatch.setattr(system, '_HW_ENCODERS', None)
     monkeypatch.setattr(system, 'run', runner(probe_rc=1))
     assert system.hw_encoder() == ''
     # non-free driver: probe encode succeeds -> vaapi (and cached)
     monkeypatch.setattr(system, '_HW_ENCODER', None)
+    monkeypatch.setattr(system, '_HW_ENCODERS', None)
     monkeypatch.setattr(system, 'run', runner(probe_rc=0))
     assert system.hw_encoder() == 'vaapi'
     assert system.hw_encoder() == 'vaapi'
@@ -1690,3 +1693,97 @@ def test_upload_cap_lifts_when_no_camera_is_publishing(monkeypatch):
     import inspect
     src = inspect.getsource(clip_mod.Clipper._throttled_upload)
     assert 'not UPLOAD_BPS or not self._ingest_live()' in src
+
+
+def test_hw_encoders_prove_hevc_with_encode_and_flv_mux(monkeypatch):
+    """HEVC capability means TWO proven facts: the silicon encodes it
+    AND this ffmpeg can mux it into flv (enhanced RTMP is the whole
+    point). The probe therefore writes flv to /dev/null — an ffmpeg too
+    old to carry HEVC-in-flv (the Pi's Bookworm 5.1) fails that step
+    and the box honestly reports h264-only."""
+    from encoder import system
+
+    class _R:
+        pass
+
+    def runner(h264_rc, hevc_rc):
+        def _run(cmd, **kw):
+            r = _R()
+            if '-encoders' in cmd:
+                r.stdout, r.returncode = 'V. h264_vaapi\nV. hevc_vaapi', 0
+            elif 'hevc_vaapi' in cmd:
+                assert cmd[-1] == '/dev/null' and 'flv' in cmd
+                r.stdout, r.returncode = '', hevc_rc
+            else:
+                r.stdout, r.returncode = '', h264_rc
+            return r
+        return _run
+
+    monkeypatch.setattr(system, 'fake_mode', lambda: False)
+    monkeypatch.setattr(system.os.path, 'exists', lambda p: True)
+    monkeypatch.setattr(system, '_HW_ENCODERS', None)
+    monkeypatch.setattr(system, '_HW_ENCODER', None)
+    monkeypatch.setattr(system, 'run', runner(0, 0))
+    assert system.hw_encoders() == {'h264': True, 'hevc': True}
+    assert system.hw_encoder() == 'vaapi'
+    monkeypatch.setattr(system, '_HW_ENCODERS', None)
+    monkeypatch.setattr(system, '_HW_ENCODER', None)
+    monkeypatch.setattr(system, 'run', runner(0, 1))
+    assert system.hw_encoders() == {'h264': True, 'hevc': False}
+    assert system.hw_encoder() == 'vaapi'
+
+
+def test_hevc_push_only_when_asked_and_proven():
+    """push_codec=hevc is honored only on a box that PROVED hevc; every
+    other combination lands on H.264 (or copy) — never an error loop."""
+    from encoder import youtube_push as yp
+    both = {'h264': True, 'hevc': True}
+    h264only = {'h264': True, 'hevc': False}
+    cfg = {'local_ingest_key': 'k', 'push_bitrate_kbps': 3000,
+           'push_codec': 'hevc'}
+    assert yp.push_codec(cfg, caps=both) == 'hevc'
+    assert yp.push_codec(cfg, caps=h264only) == 'h264'      # degrade
+    assert yp.push_codec({'push_codec': 'h264'}, caps=both) == 'h264'
+    assert yp.push_codec({}, caps=both) == 'h264'           # default
+    cmd = yp.build_ffmpeg_cmd(cfg, 'aac', 'rtmp://yt/x',
+                              hw='vaapi', caps=both)
+    assert 'hevc_vaapi' in cmd and 'flv' in cmd
+    cmd = yp.build_ffmpeg_cmd(cfg, 'aac', 'rtmp://yt/x',
+                              hw='vaapi', caps=h264only)
+    assert 'h264_vaapi' in cmd and 'hevc_vaapi' not in cmd
+    # copy mode ignores the codec choice entirely
+    cmd = yp.build_ffmpeg_cmd({'local_ingest_key': 'k',
+                               'push_codec': 'hevc'},
+                              'aac', 'rtmp://yt/x', hw='vaapi', caps=both)
+    assert 'copy' in cmd and 'hevc_vaapi' not in cmd
+
+
+def test_the_cloud_can_set_the_push_codec(monkeypatch):
+    """Same contract as the bitrate: None = no cloud opinion, a valid
+    value applies and restarts the push, junk is ignored."""
+    _paired_cfg()
+    cmds = []
+    link = cloud_link.CloudLink(
+        on_feed_change=lambda f: None,
+        runner=lambda cmd, **kw: cmds.append(cmd),
+        http=lambda *a, **kw: {})
+    base = {'assigned': True, 'team_id': 't1', 'team_name': 'W',
+            'bug_feed_url': 'https://cloud/bug.json',
+            'youtube_rtmp_url': 'rtmps://a.rtmps.youtube.com/live2/kkk',
+            'game_id': None}
+    assert link.handle_assignment(dict(base, push_codec='hevc'))
+    assert config.load()['push_codec'] == 'hevc'
+    assert any('restart' in c for c in cmds)
+    cmds.clear()
+    # junk never lands
+    link.handle_assignment(dict(base, push_codec='av1'))
+    assert config.load()['push_codec'] == 'hevc'
+    # back to the safe default
+    assert link.handle_assignment(dict(base, push_codec='h264'))
+    assert config.load()['push_codec'] == 'h264'
+    # None (older cloud) leaves the local setting alone
+    cfg = config.load()
+    cfg['push_codec'] = 'hevc'
+    config.save(cfg)
+    link.handle_assignment(dict(base))
+    assert config.load()['push_codec'] == 'hevc'

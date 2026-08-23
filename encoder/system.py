@@ -454,6 +454,47 @@ def storage_status(path=None):
 
 
 _HW_ENCODER = None
+_HW_ENCODERS = None
+
+
+def hw_encoders():
+    """{'h264': bool, 'hevc': bool} — what this box can hardware-encode,
+    each proven by a REAL five-frame test encode. An encoder being
+    COMPILED INTO ffmpeg proves nothing about the driver: the free
+    intel-media build on N100/N150-class iGPUs decodes but exposes no
+    encode entrypoints (those live in intel-media-va-driver-non-free),
+    and ffmpeg only finds out mid-stream. The HEVC probe additionally
+    proves the ffmpeg can MUX HEVC into flv — enhanced RTMP is the only
+    reason to encode HEVC here, and an ffmpeg too old to write it (the
+    Pi's Bookworm 5.1) must report incapable, not die mid-push. Runs
+    once per process; the result is cached."""
+    global _HW_ENCODERS
+    if _HW_ENCODERS is not None:
+        return _HW_ENCODERS
+    if fake_mode():
+        env = os.environ.get('SCOREBUG_FAKE_HW', '')
+        _HW_ENCODERS = {'h264': bool(env), 'hevc': env == 'vaapi-hevc'}
+        return _HW_ENCODERS
+    out = {'h264': False, 'hevc': False}
+    try:
+        if os.path.exists('/dev/dri/renderD128'):
+            r = run(['ffmpeg', '-hide_banner', '-encoders'], timeout=20)
+            listed = r.stdout or ''
+            for name, enc, sink in (
+                    ('h264', 'h264_vaapi', ['-f', 'null', '-']),
+                    ('hevc', 'hevc_vaapi', ['-f', 'flv', '/dev/null'])):
+                if enc not in listed:
+                    continue
+                p = run(['ffmpeg', '-hide_banner', '-y', '-v', 'error',
+                         '-vaapi_device', '/dev/dri/renderD128',
+                         '-f', 'lavfi', '-i', 'color=black:s=320x240:d=0.2',
+                         '-vf', 'format=nv12,hwupload',
+                         '-c:v', enc] + sink, timeout=20)
+                out[name] = p.returncode == 0
+    except Exception:
+        pass
+    _HW_ENCODERS = out
+    return out
 
 
 def hw_encoder():
@@ -462,40 +503,18 @@ def hw_encoder():
     The whole reason to run the encoder on an Intel N100/N150 instead of
     a Pi 5: the Pi has NO video encoder at all (its push is a stream
     copy by necessity), while QuickSync encodes 1080p for single-digit
-    watts. Detection is two facts checked once per process: the render
-    node exists and this ffmpeg build knows h264_vaapi. Either missing →
-    copy mode, exactly the Pi behavior, never an error."""
+    watts. See hw_encoders() for how capability is proven."""
     global _HW_ENCODER
     if _HW_ENCODER is not None:
         return _HW_ENCODER
     if fake_mode():
+        # legacy fake contract: the env var IS the returned string
         _HW_ENCODER = os.environ.get('SCOREBUG_FAKE_HW', '')
+        if _HW_ENCODER == 'vaapi-hevc':
+            _HW_ENCODER = 'vaapi'
         return _HW_ENCODER
-    found = ''
-    try:
-        if os.path.exists('/dev/dri/renderD128'):
-            r = run(['ffmpeg', '-hide_banner', '-encoders'], timeout=20)
-            if 'h264_vaapi' in (r.stdout or ''):
-                # The encoder being COMPILED IN proves nothing about the
-                # driver: the free intel-media build on N100/N150-class
-                # iGPUs decodes but exposes no H.264 ENCODE entrypoint
-                # (that lives in intel-media-va-driver-non-free), and
-                # ffmpeg only finds out mid-stream. Prove it here with a
-                # five-frame test encode, so a box that can't really do
-                # it stays honestly in copy mode instead of crash-looping
-                # the push. Runs once per process; the result is cached.
-                p = run(['ffmpeg', '-hide_banner', '-v', 'error',
-                         '-vaapi_device', '/dev/dri/renderD128',
-                         '-f', 'lavfi', '-i', 'color=black:s=320x240:d=0.2',
-                         '-vf', 'format=nv12,hwupload',
-                         '-c:v', 'h264_vaapi', '-f', 'null', '-'],
-                        timeout=20)
-                if p.returncode == 0:
-                    found = 'vaapi'
-    except Exception:
-        found = ''
-    _HW_ENCODER = found
-    return found
+    _HW_ENCODER = 'vaapi' if hw_encoders().get('h264') else ''
+    return _HW_ENCODER
 
 
 def journal_tail(lines=20, units=('playcall-encoder',
