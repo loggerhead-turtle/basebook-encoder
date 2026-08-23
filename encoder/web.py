@@ -16,6 +16,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -24,6 +25,34 @@ from flask import (Flask, redirect, render_template_string, request,
                    session, url_for)
 
 from . import __version__, config, provisioning, system
+
+_MAC_RE = re.compile(r'^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$')
+
+
+def comms_status():
+    """The coach-comms box, best-effort: installed? running? which buds
+    are connected right now? Comms manages itself on :8790 (pairing,
+    labels, Bluetooth lock) — the settings card is its doorbell and
+    status light, not a reimplementation."""
+    st = {'state': 'absent', 'buds': []}
+    try:
+        chk = system.run(['systemctl', 'cat', 'playcall-comms'], timeout=5)
+        if chk.returncode != 0:
+            return st
+        r = system.run(['systemctl', 'is-active', 'playcall-comms'],
+                       timeout=5)
+        st['state'] = (r.stdout or '').strip() or 'inactive'
+    except Exception:
+        return st
+    try:
+        r = system.run(['bluetoothctl', 'devices', 'Connected'], timeout=8)
+        for ln in (r.stdout or '').splitlines():
+            parts = ln.split(None, 2)
+            if len(parts) >= 3 and parts[0] == 'Device':
+                st['buds'].append({'mac': parts[1], 'name': parts[2]})
+    except Exception:
+        pass
+    return st
 
 log = logging.getLogger('web')
 
@@ -282,6 +311,86 @@ STATUS_PAGE = """<!doctype html><html><head>
   </form>
 </div>
 {% endif %}
+
+<div class="card">
+  <h2>🔫 Radar</h2>
+  <p class="hint">
+    {% if radar and radar.get('connected') %}
+      🟢 listening on {{ radar.get('port') or '?' }} @ {{ radar.get('baud') }}
+      {% if radar.get('gun_heard_s') is not none %}
+        — gun heard {{ radar.get('gun_heard_s')|int }}s ago
+      {% else %} — gun not heard yet{% endif %}
+      {% if radar.get('learned') %} · cables learned ✓{% endif %}
+      {% if radar.get('pin_overridden') %} · ⚠ the pinned port was wrong —
+        forget the learned cables below and let it re-learn{% endif %}
+    {% elif radar %}
+      ⚫ no serial adapter open — plug in the gun's cable, or set a
+      Bluetooth adapter below
+    {% else %}
+      radar capture runs in the encoder service
+    {% endif %}
+  </p>
+  <form method="post" action="/radar">
+    <label>Capture
+      <select name="enabled">
+        <option value="auto" {{ 'selected' if radar_cfg.get('enabled', 'auto') != 'off' }}>Auto (default)</option>
+        <option value="off" {{ 'selected' if radar_cfg.get('enabled') == 'off' }}>Off</option>
+      </select>
+    </label>
+    <label>Gun baud
+      <select name="baud">
+        {% for b in [19200, 9600, 4800, 38400, 57600, 115200] %}
+        <option value="{{ b }}" {{ 'selected' if (radar_cfg.get('baud') or 19200)|int == b }}>{{ b }}{{ ' — Stalker default' if b == 19200 }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>Bluetooth gun adapter (BT578…) MAC
+      <input name="bluetooth_mac" value="{{ radar_cfg.get('bluetooth_mac') or '' }}"
+             placeholder="00:11:22:33:44:55 — blank for cabled">
+    </label>
+    <label>LED board output
+      <select name="display_format">
+        <option value="speed" {{ 'selected' if radar_cfg.get('display_format', 'speed') != 'raw' }}>Speed (default)</option>
+        <option value="raw" {{ 'selected' if radar_cfg.get('display_format') == 'raw' }}>Raw passthrough</option>
+      </select>
+    </label>
+    <button class="btn" type="submit">Save radar settings</button>
+  </form>
+  <form method="post" action="/radar/forget" style="margin-top:.5rem"
+        onsubmit="return confirm('Forget the learned cable roles? The box re-learns them from the next real velocity.')">
+    <button class="btn" type="submit">Forget learned cables</button>
+  </form>
+  <p class="hint">The box listens for real velocities to learn which
+    cable is the gun — settings here are for the gun itself (see
+    docs/RADAR.md for the gun-side settings: 19200 8N1, continuous).
+    {% if cloud_base %}Test end-to-end at
+    <a href="{{ cloud_base }}/score/radar">{{ cloud_base }}/score/radar</a>
+    — live readings, verdicts, log tail.{% endif %}</p>
+</div>
+
+<div class="card">
+  <h2>🎧 Coach comms</h2>
+  {% if comms['state'] == 'absent' %}
+  <p class="hint">Not installed on this box. Comms turns the box into
+    the catcher's &amp; pitcher's ear — called pitches spoken into
+    paired Bluetooth buds, plus the coach's live voice. One-time
+    install on the box: <code>sudo bash comms/install_comms.sh</code>
+    (from the release repo checkout).</p>
+  {% else %}
+  <p class="hint">
+    {{ '🟢 running' if comms['state'] == 'active' else '🔴 ' + comms['state'] }}
+    {% if comms['buds'] %} — connected:
+      {% for b in comms['buds'] %}<b>{{ b['name'] }}</b>{{ ', ' if not loop.last }}{% endfor %}
+    {% else %} — no buds connected right now{% endif %}
+  </p>
+  <p>
+    <a class="btn" href="http://{{ request.host.split(':')[0] }}:8790">🎧
+      Open the comms manager</a>
+    <span class="hint">pair &amp; label buds (🧢 catcher / ⚾ pitcher),
+      lock Bluetooth, name the box — comms' own phone-friendly page</span>
+  </p>
+  {% endif %}
+</div>
 
 <div class="card">
   <h2>Scorebug bandwidth</h2>
@@ -614,6 +723,12 @@ def create_app(cloud=None, sender=None):
             hw_hevc=bool(system.hw_encoders().get('hevc')),
             push_codec=cfg.get('push_codec') or 'h264',
             push_kbps=int(cfg.get('push_bitrate_kbps') or 0),
+            radar=(cloud.radar_health()
+                   if callable(getattr(cloud, 'radar_health', None))
+                   else None),
+            radar_cfg=(cfg.get('radar') or {}),
+            comms=comms_status(),
+            cloud_base=(cfg.get('cloud') or {}).get('base_url', ''),
             bandwidth_levels=BANDWIDTH_LEVELS,
             logs='\n'.join(config.redact_lines(system.journal_tail(60), cfg))
                  or '(no logs)')
@@ -744,6 +859,66 @@ def create_app(cloud=None, sender=None):
         return redirect(url_for('index', msg=(
             f'YouTube push: {kbps / 1000:.1f} Mbps transcode' if kbps
             else 'YouTube push: source quality')))
+
+    def _restart_self_soon():
+        """The radar service reads its config at (re)open, so the honest
+        way to apply every field is a service restart — deferred so this
+        response reaches the browser first (the update button's
+        pattern). Streaming is untouched: mediamtx and the push run in
+        their own units."""
+        def _go():
+            time.sleep(1.0)
+            system.systemctl('restart', 'playcall-encoder')
+        threading.Thread(target=_go, daemon=True).start()
+
+    @app.route('/radar', methods=['POST'])
+    def radar_settings():
+        cfg = config.load()
+        rd = dict(cfg.get('radar') or {})
+        if request.form.get('enabled') in ('auto', 'off'):
+            rd['enabled'] = request.form.get('enabled')
+        try:
+            baud = int(request.form.get('baud') or 0)
+            if baud in (4800, 9600, 19200, 38400, 57600, 115200):
+                rd['baud'] = baud
+        except (TypeError, ValueError):
+            pass
+        mac = (request.form.get('bluetooth_mac') or '').strip().upper()
+        if mac and not _MAC_RE.match(mac):
+            return redirect(url_for('index', err=(
+                'That is not a Bluetooth MAC — it looks like '
+                'AA:BB:CC:DD:EE:FF (find it in the comms manager or '
+                'bluetoothctl devices)')))
+        old_mac = (rd.get('bluetooth_mac') or '').upper()
+        rd['bluetooth_mac'] = mac
+        if request.form.get('display_format') in ('speed', 'raw'):
+            rd['display_format'] = request.form.get('display_format')
+        cfg['radar'] = rd
+        config.save(cfg)
+        if mac != old_mac:
+            # bind (or drop) /dev/rfcomm0 now, not at the next boot
+            system.systemctl('restart', 'playcall-encoder-radarbt')
+        _restart_self_soon()
+        log.info('radar settings saved from the settings page')
+        return redirect(url_for('index', msg=(
+            'Radar settings saved — radar restarting, back in ~10 s')))
+
+    @app.route('/radar/forget', methods=['POST'])
+    def radar_forget():
+        """Clear the learned/pinned cable roles. The box re-learns from
+        the next real velocity — the recovery move when a pin points at
+        the wrong adapter (new cable, clone IDs)."""
+        cfg = config.load()
+        rd = dict(cfg.get('radar') or {})
+        for k in ('port', 'display_port'):
+            rd.pop(k, None)
+        cfg['radar'] = rd
+        config.save(cfg)
+        _restart_self_soon()
+        log.info('learned radar cable roles cleared from the settings page')
+        return redirect(url_for('index', msg=(
+            'Learned cables forgotten — the box re-learns them from the '
+            'next real velocity')))
 
     @app.route('/bandwidth', methods=['POST'])
     def bandwidth():
