@@ -1609,6 +1609,27 @@ def _page_body(q):
     return ''.join(b)
 
 
+def _enc_token_ok(token):
+    """A sign-in minted by the ENCODER on this same box. Both apps hold
+    the box's activation key (comms imports it at install), so the
+    encoder settings page — already behind its own PIN/site auth — can
+    hand its user straight through without a second PIN. The token is
+    hmac(key, 'enc:<5-minute bucket>'); current and previous bucket
+    accepted, so a link is good for 5–10 minutes. The PIN keeps
+    guarding direct visits."""
+    key = os.environ.get('PLAYCALL_API_KEY') or ''
+    token = str(token or '')
+    if not key or not token.startswith('enc-'):
+        return False
+    now = int(time.time() // 300)
+    for b in (now, now - 1):
+        want = 'enc-' + hmac.new(key.encode(), f'enc:{b}'.encode(),
+                                 'sha256').hexdigest()[:32]
+        if hmac.compare_digest(token, want):
+            return True
+    return False
+
+
 def _token_ok(token):
     """Validate a one-click sign-in link from the team's comms page. A
     matching nonce proves the link came from someone with staff access on
@@ -1666,7 +1687,9 @@ class Admin(http.server.BaseHTTPRequestHandler):
                      self.path.split('?', 1)[1].split('&') if '=' in p)
         if self.path.split('?', 1)[0] == '/login':
             # one-click link from the team's comms page (⚙ Open settings)
-            if _token_ok(urllib.parse.unquote(q.get('token', ''))):
+            _tok = urllib.parse.unquote(q.get('token', ''))
+            # the encoder's pass first: local, cheap, no cloud round-trip
+            if _enc_token_ok(_tok) or _token_ok(_tok):
                 self.send_response(303)
                 self.send_header('Set-Cookie', f'tok={TOK}; HttpOnly')
                 self.send_header('Location', '/')
