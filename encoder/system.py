@@ -47,7 +47,11 @@ INSTALL_DIR = '/opt/playcall-encoder'
 # goes LAST, so the siblings come up on new code before we kill ourselves
 # and systemd revives us on the new tree.
 UPDATE_UNITS = ('playcall-encoder-mediamtx', 'playcall-encoder-youtube',
-                'playcall-encoder-clipper', 'playcall-encoder')
+                'playcall-encoder-clipper',
+                # comms is bundled with the encoder; on a box that never
+                # installed it the restart fails quietly and costs nothing
+                'playcall-comms',
+                'playcall-encoder')
 
 
 def self_update(repo_url=None, install_dir=None):
@@ -88,6 +92,18 @@ def self_update(repo_url=None, install_dir=None):
                     dst = os.path.join(install_dir, 'scripts', name)
                     shutil.copy2(os.path.join(sdir, name), dst)
                     os.chmod(dst, 0o755)
+        # 🎧 comms is bundled: the ear updates with the encoder, so the
+        # one-button update refreshes both. The caller's restart list
+        # includes playcall-comms (harmless on boxes without it).
+        cdir = os.path.join(src, 'comms')
+        if os.path.isdir(cdir):
+            os.makedirs(os.path.join(install_dir, 'comms'), exist_ok=True)
+            for name in os.listdir(cdir):
+                if name.endswith(('.py', '.sh', '.md')):
+                    dst = os.path.join(install_dir, 'comms', name)
+                    shutil.copy2(os.path.join(cdir, name), dst)
+                    if not name.endswith('.md'):
+                        os.chmod(dst, 0o755)
         # Stale bytecode from removed/renamed modules must not shadow the
         # new tree on restart.
         for root, dirs, _files in os.walk(os.path.join(install_dir,

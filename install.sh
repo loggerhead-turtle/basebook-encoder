@@ -162,6 +162,14 @@ mkdir -p "$INSTALL_DIR/scripts"
 install -m 755 "$SRC/scripts/"*.sh "$SRC/scripts/"*.py "$INSTALL_DIR/scripts/" 2>/dev/null || \
   install -m 755 "$SRC/scripts/youtube_push.sh" "$INSTALL_DIR/scripts/"
 find "$INSTALL_DIR" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
+# 🎧 coach comms ships WITH the encoder: same box, same identity. The
+# payload is laid down here; whether it also gets INSTALLED (packages,
+# audio session, service) is decided after activation below.
+if [[ -d "$SRC/comms" ]]; then
+  mkdir -p "$INSTALL_DIR/comms"
+  install -m 755 "$SRC/comms/"*.py "$SRC/comms/"*.sh "$INSTALL_DIR/comms/" 2>/dev/null || true
+  cp "$SRC/comms/README.md" "$INSTALL_DIR/comms/" 2>/dev/null || true
+fi
 
 # ── MediaMTX (static binary from GitHub releases; arm64 on Pi 4/5) ────────────
 if ! command -v mediamtx >/dev/null; then
@@ -254,6 +262,29 @@ systemctl enable playcall-encoder playcall-encoder-mediamtx \
 systemctl enable playcall-encoder-radarbt >/dev/null 2>&1 || true
 systemctl restart playcall-encoder-mediamtx playcall-encoder-youtube \
                   playcall-encoder-clipper playcall-encoder
+
+# ── 🎧 coach comms rides along ───────────────────────────────────────────────
+# One box, one install: the comms ear (spoken pitch calls + the coach's
+# live voice into Bluetooth buds) installs with the encoder and reuses
+# this box's activation key — so it only makes sense on a PAIRED box.
+# Unpaired installs skip it (the settings page's comms card says how to
+# add it after pairing), and a comms failure must never fail the
+# encoder install.
+if [[ -f "$INSTALL_DIR/comms/install_comms.sh" ]] && python3 - <<'PY'
+import json, sys
+try:
+    cfg = json.load(open('/etc/playcall-encoder/config.json'))
+    sys.exit(0 if (cfg.get('cloud') or {}).get('api_key') else 1)
+except Exception:
+    sys.exit(1)
+PY
+then
+  echo "── installing 🎧 coach comms (rides this box's pairing) ──"
+  if ! bash "$INSTALL_DIR/comms/install_comms.sh"; then
+    echo "⚠ comms install did not finish — the encoder is unaffected."
+    echo "  Re-run it any time:  sudo bash $INSTALL_DIR/comms/install_comms.sh"
+  fi
+fi
 
 echo
 echo "── Done ─────────────────────────────────────────────────"
