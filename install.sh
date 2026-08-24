@@ -101,6 +101,10 @@ apt-get purge -y -qq brltty >/dev/null 2>&1 || true
 # uplink can actually carry. Needs the VA-API driver; ffmpeg already
 # speaks VA-API on Debian.
 if [[ "$(uname -m)" == "x86_64" ]]; then
+  # AMD boxes (Ryzen/Vega — VCN encoder) use Mesa's VA-API driver,
+  # which lives in main but is NOT on a desktop-less install. Harmless
+  # and tiny on Intel; on AMD it is the whole hardware-encode story.
+  apt-get install -y -qq mesa-va-drivers >/dev/null 2>&1 || true
   # The H.264 ENCODE entrypoints on N100/N150-class iGPUs live in the
   # NON-FREE driver build — the free intel-media-va-driver decodes but
   # cannot encode there, which shows up later as a push that dies
@@ -305,10 +309,10 @@ if [[ "$(uname -m)" == "x86_64" ]]; then
   if ffmpeg -hide_banner -v error -vaapi_device /dev/dri/renderD128 \
        -f lavfi -i color=black:s=320x240:d=0.2 -vf format=nv12,hwupload \
        -c:v h264_vaapi -f null - >/dev/null 2>&1; then
-    echo "QuickSync: H.264 hardware encode WORKS — pick the YouTube quality"
+    echo "Hardware H.264 encode WORKS (QuickSync/VCN) — pick the YouTube quality"
     echo "on the game page's encoder card (📺) once the box shows online."
   else
-    echo "⚠ QuickSync H.264 encode NOT working — the YouTube push will run"
+    echo "⚠ Hardware H.264 encode NOT working — the YouTube push will run"
     echo "  in copy mode. Usually the driver: sudo apt install \\"
     echo "    intel-media-va-driver-non-free firmware-misc-nonfree"
     echo "  then reboot and re-run this installer to check again."
