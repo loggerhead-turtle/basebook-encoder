@@ -86,6 +86,13 @@ apt-get install -y -qq ffmpeg curl git avahi-daemon hostapd dnsmasq \
 # and is read exactly like a cabled one. Costs nothing on a box that
 # never uses it — see scripts/radar_bt_bind.sh and docs/RADAR.md.
 
+# brltty (Debian's braille-display daemon) grabs exactly the USB-serial
+# chips radar cables use (CH340/PL2303) and detaches the port the
+# moment it appears — the adapter enumerates, then vanishes, and the
+# radar reads as 'not connected' with nothing in our logs. An encoder
+# appliance has no braille display; make sure it can never happen.
+apt-get purge -y -qq brltty >/dev/null 2>&1 || true
+
 # ── Hardware video encoding (x86 only) ───────────────────────────────────────
 # The Pi 5 has no video ENCODER at all — its push is a stream copy, which
 # is why an $80 board can relay a game. An Intel N100/N150 does have one
