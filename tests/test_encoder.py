@@ -1992,6 +1992,56 @@ def test_settings_page_embeds_comms_when_installed(monkeypatch):
     assert 'open full-screen' in html
 
 
+def test_comms_audio_wakes_the_sink_before_the_first_word(monkeypatch,
+                                                              tmp_path):
+    """A suspended Bluetooth sink eats the first ~second of whatever is
+    played while the link wakes ('cutting off the first second or so',
+    field report). Speech gets leading silence baked into the wav, the
+    coach's voice clips get an ffplay adelay, and a WirePlumber drop-in
+    stops bluez sinks from suspending at all — written once, restart
+    only on first write."""
+    import importlib.util
+    import os as _os
+    import wave as _wave
+    root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    src = open(_os.path.join(root, 'comms', 'comms_ear.py')).read()
+    assert "_pad_wav(wav)" in src                  # speech path pads
+    assert "adelay=" in src                        # clip path pads
+    spec = importlib.util.spec_from_file_location(
+        'comms_ear_audio_test', _os.path.join(root, 'comms',
+                                              'comms_ear.py'))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    wav = str(tmp_path / 't.wav')
+    with _wave.open(wav, 'wb') as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(22050)
+        w.writeframes(b'\x01\x02' * 2205)         # 0.1 s of "speech"
+    mod._pad_wav(wav, ms=700)
+    pad_n = int(22050 * 700 / 1000.0)
+    with _wave.open(wav, 'rb') as r:
+        n = r.getnframes()
+        head = r.readframes(pad_n)
+    assert n == 2205 + pad_n                       # padded, not replaced
+    assert head == b'\x00' * len(head)             # and the pad is silence
+    # the no-suspend drop-in: written once, restarted once
+    calls = []
+    monkeypatch.setattr(mod, '_NO_SUSPEND',
+                        str(tmp_path / 'wp' / '51.conf'))
+    monkeypatch.setattr(mod.subprocess, 'run',
+                        lambda *a, **k: calls.append(a[0]) or
+                        type('R', (), {'returncode': 0})())
+    mod.ensure_bt_no_suspend()
+    body = open(str(tmp_path / 'wp' / '51.conf')).read()
+    assert 'suspend-timeout-seconds = 0' in body
+    assert 'bluez_output' in body
+    assert any('wireplumber' in ' '.join(c) for c in calls)
+    calls.clear()
+    mod.ensure_bt_no_suspend()                     # already there
+    assert not calls                               # no second restart
+
+
 def test_comms_picker_diagnoses_a_dead_dongle_instead_of_a_button(
         monkeypatch):
     """A dongle with no firmware enumerates as an hci with NO address.
