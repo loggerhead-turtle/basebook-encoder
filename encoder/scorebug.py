@@ -431,7 +431,10 @@ def _render_tv(bug, theme):
                        sx + 14 + i * 20, my0 + TV_MAIN - 22),
                       fill=red if onq else pal['off'])
     velo, rpm = bug.get('velo'), bug.get('rpm')
-    with_rpm = bool(show.get('rpm')) and rpm is not None
+    # RPM ENABLED reserves its line whether or not this pitch carried
+    # spin (a gun without spin never sends it) — the bug must not change
+    # size mid-game the first time a reading arrives (field report).
+    with_rpm = bool(show.get('rpm'))
     # With spin shown the speed rides a little higher to make room; without
     # it the bug is pixel-identical to before.
     vy = my0 + TV_MAIN - (40 if with_rpm else 28)
@@ -439,7 +442,8 @@ def _render_tv(bug, theme):
         d.text((TV_W - 24, vy), str(velo),
                font=f_big, fill=yellow, anchor='rm')
     if with_rpm:
-        d.text((TV_W - 24, my0 + TV_MAIN - 15), f'{rpm} RPM',
+        d.text((TV_W - 24, my0 + TV_MAIN - 15),
+               f'{rpm} RPM' if rpm is not None else '— RPM',
                font=_font(theme, 15), fill=pal['dim'], anchor='rm')
     return img
 

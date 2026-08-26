@@ -1992,6 +1992,61 @@ def test_settings_page_embeds_comms_when_installed(monkeypatch):
     assert 'open full-screen' in html
 
 
+def test_comms_bt_calls_select_the_pinned_radio(monkeypatch, tmp_path):
+    """With an adapter pinned, every bluetoothctl call runs as a scripted
+    session that SELECTs the pinned controller first — powering the
+    others down is not enough on an N150, where BlueZ keeps a blocked
+    controller as [default] and every one-shot call talked to a radio
+    that was off ('picked, but NOT the one in use', field report)."""
+    import importlib.util
+    import os as _os
+    import subprocess as _sp
+    root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    spec = importlib.util.spec_from_file_location(
+        'comms_ear_bt_test', _os.path.join(root, 'comms', 'comms_ear.py'))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    monkeypatch.setattr(mod, 'adapter_pref', lambda: 'AA:BB:CC:DD:EE:FF')
+    sent = {}
+
+    class _P:
+        def __init__(self, *a, **k):
+            self.stdin = self
+
+        def write(self, txt):
+            sent['in'] = sent.get('in', '') + txt
+
+        def flush(self):
+            pass
+
+        def communicate(self, timeout=None):
+            return ('\x1b[0;94m[bluetooth]\x1b[0m# Controller '
+                    'AA:BB:CC:DD:EE:FF box [default]\r\n', '')
+
+        def kill(self):
+            pass
+    monkeypatch.setattr(mod.subprocess, 'Popen', lambda *a, **k: _P())
+    out = mod._bt('show')
+    assert sent['in'].startswith('select AA:BB:CC:DD:EE:FF\n')
+    assert 'exit' in sent['in']
+    assert '\x1b[' not in out and '\r' not in out    # ANSI/CR stripped
+    assert 'AA:BB:CC:DD:EE:FF' in out
+    # the scan form holds the session open, then turns discovery off
+    monkeypatch.setattr(mod.time, 'sleep', lambda s: None)
+    sent.clear()
+    mod._bt('--timeout', '12', 'scan', 'on', timeout=20)
+    assert 'scan on' in sent['in'] and 'scan off' in sent['in']
+    # unpinned boxes keep the one-shot path untouched
+    monkeypatch.setattr(mod, 'adapter_pref', lambda: '')
+    calls = []
+    monkeypatch.setattr(mod.subprocess, 'run',
+                        lambda *a, **k: (calls.append(a[0]),
+                                         type('R', (), {'stdout': '',
+                                                        'stderr': ''}))[1])
+    mod._bt('show')
+    assert calls and calls[0][:2] == ['bluetoothctl', 'show']
+
+
 def test_comms_ear_accepts_the_encoders_pass(monkeypatch):
     """The two halves of the handshake actually shake: a token minted
     by encoder.web.comms_token is accepted by comms_ear._enc_token_ok
