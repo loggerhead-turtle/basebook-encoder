@@ -85,6 +85,12 @@ apt-get install -y -qq ffmpeg curl git avahi-daemon hostapd dnsmasq \
 # bluez: a radar gun on a serial→Bluetooth adapter becomes /dev/rfcomm0
 # and is read exactly like a cabled one. Costs nothing on a box that
 # never uses it — see scripts/radar_bt_bind.sh and docs/RADAR.md.
+# USB Bluetooth dongles (the long-range comms option) are nearly all
+# Realtek inside — TP-Link UB500 included — and a netinst Debian ships
+# no firmware for them: the dongle enumerates as an hci with NO address
+# and the radio picker shows a dead row ("hci1 · ?", field report).
+# The firmware package is tiny and inert on boxes without the chip.
+apt-get install -y -qq firmware-realtek >/dev/null 2>&1 || true
 
 # brltty (Debian's braille-display daemon) grabs exactly the USB-serial
 # chips radar cables use (CH340/PL2303) and detaches the port the
