@@ -296,6 +296,77 @@ def _default_sink():
 
 # Piper (neural TTS, installed by install_comms.sh) sounds like a
 # person; espeak-ng sounds like 1982 and stays only as the fallback.
+# The coach picks the VOICE the ear speaks with. Curated Piper voices
+# (all en_US, medium quality — ~60 MB each, fetched on selection and
+# kept under the service user's home so no root is needed):
+VOICE_DIR = os.path.expanduser('~/.playcall-piper')
+VOICES = {
+    'lessac': ('Lessac — clear, neutral', 'lessac'),
+    'amy': ('Amy — bright female', 'amy'),
+    'ryan': ('Ryan — deep male', 'ryan'),
+    'joe': ('Joe — plain male', 'joe'),
+}
+VOICE_DL = {'busy': False, 'msg': ''}
+
+
+def _voice_base(name):
+    return ('https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0'
+            f'/en/en_US/{name}/medium/en_US-{name}-medium')
+
+
+def voice_current():
+    try:
+        return open(os.path.join(VOICE_DIR, 'name')).read().strip()
+    except Exception:
+        return ''
+
+
+def _voice_onnx():
+    """The model say() speaks with: the coach's pick, else the install
+    default."""
+    sel = os.path.join(VOICE_DIR, 'voice.onnx')
+    if voice_current() and os.path.exists(sel):
+        return sel
+    return PIPER_VOICE
+
+
+def voice_download(name):
+    """Fetch a voice in the background; speaks a sample when it lands."""
+    if VOICE_DL['busy'] or name not in VOICES:
+        return
+    VOICE_DL['busy'] = True
+    VOICE_DL['msg'] = f'downloading {VOICES[name][0]}…'
+
+    def _run():
+        try:
+            os.makedirs(VOICE_DIR, exist_ok=True)
+            base = _voice_base(VOICES[name][1])
+            for suff, dst in (('.onnx', 'voice.onnx.new'),
+                              ('.onnx.json', 'voice.onnx.json.new')):
+                req = urllib.request.Request(base + suff)
+                with urllib.request.urlopen(req, timeout=300) as r, \
+                        open(os.path.join(VOICE_DIR, dst), 'wb') as fh:
+                    while True:
+                        chunk = r.read(1 << 20)
+                        if not chunk:
+                            break
+                        fh.write(chunk)
+            # both halves landed — swap atomically, then remember the pick
+            for src, dst in (('voice.onnx.new', 'voice.onnx'),
+                             ('voice.onnx.json.new', 'voice.onnx.json')):
+                os.replace(os.path.join(VOICE_DIR, src),
+                           os.path.join(VOICE_DIR, dst))
+            with open(os.path.join(VOICE_DIR, 'name'), 'w') as fh:
+                fh.write(name)
+            VOICE_DL['msg'] = f'✓ {VOICES[name][0]}'
+            say('this is the new voice. fastball, low and away.')
+        except Exception as exc:
+            VOICE_DL['msg'] = f'download failed: {exc}'
+        finally:
+            VOICE_DL['busy'] = False
+    threading.Thread(target=_run, daemon=True).start()
+
+
 PIPER = '/opt/piper/piper'
 PIPER_VOICE = '/opt/piper/voice.onnx'
 
@@ -358,11 +429,12 @@ def say(text):
     page's 'voice out' line is how a silent Test explains itself."""
     _route_to_bud()
     err = ''
-    if os.path.exists(PIPER) and os.path.exists(PIPER_VOICE):
+    onnx = _voice_onnx()
+    if os.path.exists(PIPER) and os.path.exists(onnx):
         try:
             wav = tempfile.NamedTemporaryFile(suffix='.wav',
                                               delete=False).name
-            r = subprocess.run([PIPER, '--model', PIPER_VOICE,
+            r = subprocess.run([PIPER, '--model', onnx,
                                 '--output_file', wav],
                                input=text.encode(), capture_output=True,
                                timeout=20)
@@ -1701,6 +1773,27 @@ def _page_body(q):
         f'<br><span class="dim">what the coach page shows after '
         f'"LIVE →"</span></form></div>')
     b.append(_adapter_card())
+    # ── the voice the ear speaks with ──
+    cur = voice_current() or ('install default' if os.path.exists(
+        PIPER_VOICE) else 'espeak fallback')
+    vrows = ''.join(
+        f'<form method="post" action="/voice" style="margin:.2rem 0">'
+        f'<button name="v" value="{k}" '
+        + ('disabled' if k == voice_current() else '')
+        + f'>{html.escape(label)}'
+        + (' ✓' if k == voice_current() else '')
+        + '</button></form>'
+        for k, (label, _slug) in VOICES.items())
+    st = html.escape(VOICE_DL['msg'])
+    b.append(
+        '<div class="card"><b>🗣 Voice</b><br>'
+        f'<span class="dim">speaking with: {html.escape(cur)}</span><br>'
+        + vrows
+        + (f'<span class="dim">{st}</span>' if st else
+           '<span class="dim">picking one downloads it (~60 MB, a '
+           'minute on field WiFi) and speaks a sample when it lands. '
+           'Calls keep flowing on the old voice until then.</span>')
+        + '</div>')
     if q.get('scanned'):
         devs = bt_scan()
         # Answering just now is the only evidence that matters. The rest
@@ -1938,6 +2031,9 @@ class Admin(http.server.BaseHTTPRequestHandler):
         elif self.path == '/adapter':
             set_adapter_pref((form.get('mac') or '').strip())
             enforce_adapter()
+            loc = '/'
+        elif self.path == '/voice':
+            voice_download((form.get('v') or '').strip())
             loc = '/'
         else:
             loc = '/'
