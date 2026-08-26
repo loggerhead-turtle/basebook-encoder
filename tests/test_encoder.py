@@ -1992,6 +1992,47 @@ def test_settings_page_embeds_comms_when_installed(monkeypatch):
     assert 'open full-screen' in html
 
 
+def test_comms_voice_is_pickable_and_survives_bad_picks(monkeypatch,
+                                                            tmp_path):
+    """The coach picks the ear's voice from a curated Piper set. The
+    pick lives under the service user's home (no root), say() prefers
+    it over the install default, and an unknown or mid-download pick is
+    refused rather than queued."""
+    import importlib.util
+    import os as _os
+    root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    spec = importlib.util.spec_from_file_location(
+        'comms_ear_voice_test', _os.path.join(root, 'comms',
+                                              'comms_ear.py'))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert set(mod.VOICES) >= {'lessac', 'amy', 'ryan', 'joe'}
+    monkeypatch.setattr(mod, 'VOICE_DIR', str(tmp_path))
+    # no pick yet → the install default speaks
+    assert mod._voice_onnx() == mod.PIPER_VOICE
+    # a pick with its model present wins
+    (tmp_path / 'voice.onnx').write_bytes(b'onnx')
+    (tmp_path / 'name').write_text('amy')
+    assert mod._voice_onnx() == str(tmp_path / 'voice.onnx')
+    assert mod.voice_current() == 'amy'
+    # unknown / busy picks never start a thread
+    started = []
+    monkeypatch.setattr(mod.threading, 'Thread',
+                        lambda *a, **k: started.append(1) or
+                        type('T', (), {'start': lambda self: None})())
+    mod.voice_download('not-a-voice')
+    assert not started
+    mod.VOICE_DL['busy'] = True
+    mod.voice_download('ryan')
+    assert not started
+    mod.VOICE_DL['busy'] = False
+    mod.voice_download('ryan')
+    assert started
+    # and the admin page offers the picker
+    src = open(_os.path.join(root, 'comms', 'comms_ear.py')).read()
+    assert 'action="/voice"' in src
+
+
 def test_comms_audio_wakes_the_sink_before_the_first_word(monkeypatch,
                                                               tmp_path):
     """A suspended Bluetooth sink eats the first ~second of whatever is
