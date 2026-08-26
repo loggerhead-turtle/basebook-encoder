@@ -603,19 +603,34 @@ async def _rtc_main():
         await asyncio.sleep(3)
         gid = STATE.get('game')
         if not gid:
+            RTC_STATE['s'] = 'no live game yet'
             continue
+        # Every step reports. 'waiting for a coach' covered THREE
+        # different failures (register bounced, offer poll bounced, and
+        # coach-on-a-different-game) and made all of them undiagnosable
+        # from the fence (field report: healthy box, 'still not
+        # working'). The gid rides along so the coach page can spot the
+        # box sitting on the WRONG game.
         try:
             await asyncio.to_thread(
                 _api_json, f'/api/sk/game/{gid}/rtc',
                 {'role': 'register', 'ear': ear_id, 'label': box_name()})
+        except Exception as exc:
+            RTC_STATE['s'] = f'register failed: {str(exc)[:80]}'
+            continue
+        try:
             d = await asyncio.to_thread(
                 _api_json,
                 f'/api/sk/game/{gid}/rtc?want=offer&ear={ear_q}')
-        except Exception:
+        except Exception as exc:
+            RTC_STATE['s'] = f'offer poll failed: {str(exc)[:80]}'
             continue
         peer = (d or {}).get('peer') or {}
         gen = peer.get('gen')
         if not gen or gen == seen_gen:
+            if not str(RTC_STATE.get('s', '')).startswith(('🎙', 'answer')):
+                RTC_STATE['s'] = (f'ear registered on game {str(gid)[:8]} '
+                                  '— waiting for the coach')
             continue
         seen_gen = gen
         try:
@@ -682,7 +697,8 @@ async def _rtc_main():
             def on_cs():
                 if pc.connectionState in ('failed', 'closed',
                                           'disconnected'):
-                    RTC_STATE['s'] = 'link dropped — back to polling'
+                    RTC_STATE['s'] = ('link failed — is the phone on the '
+                                      'same WiFi as the box?')
 
             await pc.setRemoteDescription(
                 RTCSessionDescription(**json.loads(peer['sdp'])))
