@@ -121,6 +121,14 @@ def test_sender_fake_mode_writes_png(tmp_path):
     assert (tmp_path / 'bug.png').stat().st_size > 0
     # Same seq + same look → no re-render.
     assert s.poll_once() is False
+    # A radar reading arriving BETWEEN plays must re-render: seq only
+    # moves when the book does, and skipping on seq alone kept the
+    # burned bug's velocity spot empty through a whole game while the
+    # app showed every pitch (field report).
+    s.fetch = lambda: dict(FAKE_BUG, theme=_theme('tvbox'),
+                           velo=91, rpm=2100)
+    assert s.poll_once() is True
+    assert s.poll_once() is False        # same reading → quiet again
 
 
 # ── config ───────────────────────────────────────────────────────────────────
