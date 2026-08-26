@@ -932,7 +932,66 @@ def enforce_adapter():
 
 # ── bluetoothctl plumbing for the admin page ─────────────────────────────
 
+_ANSI_RE = re.compile(r'\x1b\[[0-9;]*m|\r')
+
+
 def _bt(*args, timeout=12):
+    """One bluetoothctl call, landed on the PICKED radio.
+
+    Powering the other controllers down (enforce_adapter) was meant to
+    leave BlueZ's "default" no choice, and on the N150 it simply is not
+    true: bluetoothctl keeps a soft-blocked controller as [default], so
+    every one-shot call here talked to a radio that was off — the pin
+    verified as "did not take" and rolled back forever, and the card
+    said "picked, but NOT the one in use" no matter what was tapped
+    (field report). bluetoothctl has no per-invocation adapter flag,
+    but its interactive mode has `select`, which holds for the session.
+    So with an adapter pinned, every call becomes a tiny scripted
+    session: select the pinned controller, run the command, exit. The
+    scan's `--timeout N scan on` form holds the session open for N
+    seconds first — discovery needs wall-clock, not a flag.
+    ANSI color and prompt noise are stripped so the parsers see the
+    same text the one-shot form produced.
+    """
+    want = adapter_pref()
+    if not want or (args and args[0] == 'list'):
+        return _bt_oneshot(*args, timeout=timeout)
+    try:
+        hold = 0
+        cmds = list(args)
+        if cmds and cmds[0] == '--timeout':
+            hold = int(cmds[1])
+            cmds = cmds[2:]
+        p = subprocess.Popen(['bluetoothctl'], stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True)
+        p.stdin.write(f'select {want}\n' + ' '.join(cmds) + '\n')
+        p.stdin.flush()
+        if hold:
+            time.sleep(hold)
+            try:
+                p.stdin.write('scan off\n')
+                p.stdin.flush()
+            except Exception:
+                pass
+        try:
+            p.stdin.write('exit\n')
+            p.stdin.flush()
+        except Exception:
+            pass
+        out, _ = p.communicate(timeout=timeout)
+        return _ANSI_RE.sub('', out or '')
+    except FileNotFoundError:
+        return '__NO_BT__'
+    except Exception as exc:
+        try:
+            p.kill()
+        except Exception:
+            pass
+        return str(exc)
+
+
+def _bt_oneshot(*args, timeout=12):
     try:
         r = subprocess.run(['bluetoothctl'] + list(args),
                            capture_output=True, text=True, timeout=timeout)
