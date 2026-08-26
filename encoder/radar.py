@@ -463,11 +463,19 @@ class RadarService:
         garbage fragments, because the board expects the classic
         display protocol: a bare right-aligned speed (' 57.8'), exactly
         the parser's format-A. Value frames only — idle keepalives are
-        not display traffic, the board holds its last number."""
+        not display traffic, the board holds its last number.
+
+        PEAK outranks live. The live field is the deceleration curve —
+        the ball slowing on its way to the plate — and a board fed live
+        rolls 87→84→81 while the gun's own display, the pad, and the
+        app all hold the pitch's 87 (field report: 'the LED board is
+        showing the roll down velocity'). The peak field is what a fan
+        wants on the fence; live only leads before the first peak lock
+        of a track, exactly like the cloud push in _finish_burst."""
         if not frame:
             return None
-        v = frame.get('live') if frame.get('live') is not None \
-            else frame.get('peak')
+        v = frame.get('peak') if frame.get('peak') is not None \
+            else frame.get('live')
         if v is None:
             return None
         return ('%5.1f\r' % v).encode('ascii')
