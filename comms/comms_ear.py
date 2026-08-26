@@ -693,6 +693,27 @@ def _adapter_address(hci):
     return ''
 
 
+def _usb_product(hci):
+    """The adapter's own USB product string ("TP-Link UB500 Adapter",
+    "AX201 Bluetooth"), walked up sysfs from the hci device. On an x86
+    box the BUILT-IN Bluetooth also hangs off an internal USB bus, so
+    "USB dongle vs built-in" stops being a distinction at all — two
+    identical rows on the one card a coach uses to pick a radio. The
+    product string is the difference the hardware itself declares."""
+    try:
+        p = os.path.realpath('/sys/class/bluetooth/' + hci)
+        for _ in range(8):
+            p = os.path.dirname(p)
+            if not p or p == '/':
+                break
+            f = os.path.join(p, 'product')
+            if os.path.isfile(f):
+                return open(f).read().strip()
+    except Exception:
+        pass
+    return ''
+
+
 def adapters():
     """Every Bluetooth controller on the box, with enough to choose by.
 
@@ -777,7 +798,9 @@ def _adapter_card():
         # when he ordered it turns the card into a mirror: the UB500 in
         # this box is the nano model with an internal antenna, and the
         # card was congratulating him on range he had not installed.
-        kind = 'USB dongle' if a['usb'] else 'built-in radio (Raspberry Pi)'
+        prod = _usb_product(a['hci'])
+        kind = (prod or 'USB dongle') if a['usb'] else \
+            (prod and f'built-in radio ({prod})' or 'built-in radio')
         # "In use" is now READ, not assumed. The pin is a request; this
         # is the answer, and they can disagree — see active_adapter().
         tag = ''

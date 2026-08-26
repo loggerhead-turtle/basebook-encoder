@@ -778,7 +778,12 @@ class Sender:
         layout, pos, scale, bw, theme = resolve_look(
             bug, self.default_pos, self.default_layout)
         theme_sig = json.dumps(theme, sort_keys=True) if theme else None
-        sig = (pos, layout, scale, bw, theme_sig)
+        # velo/rpm ride the sig: seq only moves when the BOOK does, so
+        # without them a radar reading arriving between plays never
+        # re-rendered — the burned bug's velocity spot stayed empty for
+        # the whole game while the app showed every pitch (field report).
+        sig = (pos, layout, scale, bw, theme_sig,
+               bug.get('velo'), bug.get('rpm'))
         seq = bug.get('seq')
         # Re-render on a score change OR any look change — without the
         # second half, dragging the bug / editing the theme mid-inning
