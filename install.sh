@@ -138,6 +138,41 @@ if [[ "$ADOPTED" != 1 ]]; then
   systemctl disable --now hostapd dnsmasq >/dev/null 2>&1 || true
 fi
 
+# ── Wired ports the OS never configured ──────────────────────────────────────
+# Debian's installer writes a network stanza ONLY for the interface used
+# during the install. A box installed over Wi-Fi therefore boots with a DEAD
+# Ethernet port: plug a cable and nothing happens — headless Debian has no
+# NetworkManager to react, and `ip a` shows the NIC DOWN with no address.
+# Three cables and a router got blamed in the field before the OS did.
+# Give every wired port that has NO configuration at all its own
+# allow-hotplug DHCP stanza. Purely additive: a port that is mentioned
+# anywhere — adopted, static, Speedify — is never touched, and boxes run
+# by NetworkManager/systemd-networkd (which handle hotplug themselves)
+# are skipped entirely.
+if [[ -f /etc/network/interfaces ]] \
+   && ! systemctl is-active --quiet NetworkManager 2>/dev/null \
+   && ! systemctl is-active --quiet systemd-networkd 2>/dev/null; then
+  mkdir -p /etc/network/interfaces.d
+  grep -Eq '^[^#]*source(-directory)?[[:space:]].*interfaces\.d' \
+      /etc/network/interfaces || \
+    echo 'source /etc/network/interfaces.d/*' >> /etc/network/interfaces
+  for _np in /sys/class/net/*; do
+    ifc="$(basename "$_np")"
+    [[ "$ifc" == lo ]] && continue
+    [[ -d "$_np/wireless" ]] && continue     # Wi-Fi belongs to the installer
+    [[ -e "$_np/device" ]] || continue       # skip bridges/virtual devices
+    if ! grep -rqsw "$ifc" /etc/network/interfaces /etc/network/interfaces.d/
+    then
+      printf 'allow-hotplug %s\niface %s inet dhcp\n' "$ifc" "$ifc" \
+        > "/etc/network/interfaces.d/playcall-$ifc"
+      echo "Wired port $ifc had no network config — DHCP added (hotplug)."
+      # bring it up now if a cable is already in; backgrounded so an empty
+      # port's DHCP timeout can't stall the install
+      (ifup "$ifc" >/dev/null 2>&1 || true) &
+    fi
+  done
+fi
+
 # ── Service user + directories ────────────────────────────────────────────────
 id playcall &>/dev/null || \
   useradd --system --home /var/lib/playcall-encoder --shell /usr/sbin/nologin playcall

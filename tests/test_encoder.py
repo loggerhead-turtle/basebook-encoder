@@ -1934,6 +1934,25 @@ def test_comms_is_bundled_with_the_encoder():
     assert units.index('playcall-comms') < units.index('playcall-encoder')
 
 
+def test_installer_wakes_wired_ports_the_os_never_configured():
+    """Debian configures ONLY the interface used during install. A box
+    installed over Wi-Fi boots with a dead Ethernet port — the field
+    report blamed three cables before the OS. The installer adds an
+    allow-hotplug DHCP stanza for any wired port with NO config at all,
+    touches nothing that has one, and stays out of the way wherever
+    NetworkManager or systemd-networkd is in charge."""
+    import os as _os
+    root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    sh = open(_os.path.join(root, 'install.sh')).read()
+    assert 'allow-hotplug %s\\niface %s inet dhcp' in sh
+    assert '/etc/network/interfaces.d/playcall-' in sh
+    assert 'NetworkManager' in sh and 'systemd-networkd' in sh
+    # additive only: a port mentioned ANYWHERE in the config is skipped
+    assert 'grep -rqsw "$ifc" /etc/network/interfaces' in sh
+    # and an empty port's DHCP wait must not stall the install
+    assert '(ifup "$ifc" >/dev/null 2>&1 || true) &' in sh
+
+
 def test_comms_manager_embeds_without_a_second_pin(monkeypatch):
     """One PIN per box: the settings page mints a 5-minute pass (hmac
     of the shared activation key over a time bucket — see
