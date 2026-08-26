@@ -300,6 +300,59 @@ PIPER = '/opt/piper/piper'
 PIPER_VOICE = '/opt/piper/voice.onnx'
 
 
+# A suspended Bluetooth sink takes the best part of a second to wake,
+# and PipeWire suspends idle nodes after a few seconds — so the FIRST
+# word of every call was eaten while the link spun up (field report:
+# "cutting off the first second or so of the audio"). Two belts:
+# leading silence on everything we play, and a WirePlumber drop-in
+# that stops bluez sinks from suspending at all.
+PAD_MS = 700
+
+
+def _pad_wav(path, ms=PAD_MS):
+    """Prepend silence in the file's own format. The silence wakes the
+    sink; by the time speech starts, the link is up."""
+    import wave
+    try:
+        with wave.open(path, 'rb') as r:
+            prm = r.getparams()
+            frames = r.readframes(r.getnframes())
+        pad = b'\x00' * (int(prm.framerate * ms / 1000.0)
+                          * prm.nchannels * prm.sampwidth)
+        with wave.open(path, 'wb') as w:
+            w.setparams(prm)
+            w.writeframes(pad + frames)
+    except Exception:
+        pass                      # an unpadded call still beats silence
+
+
+_NO_SUSPEND = os.path.expanduser(
+    '~/.config/wireplumber/wireplumber.conf.d/'
+    '51-playcall-bt-no-suspend.conf')
+
+
+def ensure_bt_no_suspend():
+    """Keep bluez audio nodes from suspending between calls. Written
+    once; wireplumber restarts only the first time so a healthy boot
+    never bounces audio."""
+    if os.path.exists(_NO_SUSPEND):
+        return
+    try:
+        os.makedirs(os.path.dirname(_NO_SUSPEND), exist_ok=True)
+        with open(_NO_SUSPEND, 'w') as fh:
+            fh.write(
+                'monitor.bluez.rules = [\n'
+                '  { matches = [ { node.name = "~bluez_output.*" } ]\n'
+                '    actions = { update-props = {\n'
+                '      session.suspend-timeout-seconds = 0\n'
+                '    } } }\n'
+                ']\n')
+        subprocess.run(['systemctl', '--user', 'restart', 'wireplumber'],
+                       capture_output=True, timeout=15)
+    except Exception:
+        pass
+
+
 def say(text):
     """Speak, and RECORD which path actually produced sound — the admin
     page's 'voice out' line is how a silent Test explains itself."""
@@ -314,6 +367,7 @@ def say(text):
                                input=text.encode(), capture_output=True,
                                timeout=20)
             if r.returncode == 0:
+                _pad_wav(wav)
                 p = subprocess.run(['paplay', wav], capture_output=True,
                                    timeout=30)
                 os.unlink(wav)
@@ -344,7 +398,8 @@ def play_clip(data_uri):
             f.write(raw)
             path = f.name
         if subprocess.run(['ffplay', '-nodisp', '-autoexit', '-loglevel',
-                           'quiet', path], check=False).returncode != 0:
+                           'quiet', '-af', f'adelay={PAD_MS}:all=1',
+                           path], check=False).returncode != 0:
             subprocess.run(['mpg123', '-q', path], check=False)
         os.unlink(path)
     except Exception:
@@ -1905,6 +1960,7 @@ def main():
         enforce_adapter()
     except Exception:
         pass                    # a picker that fails must not cost the box
+    ensure_bt_no_suspend()
     threading.Thread(target=poll_loop, daemon=True).start()
     threading.Thread(target=rtc_thread, daemon=True).start()
     threading.Thread(target=reconnect_loop, daemon=True).start()
