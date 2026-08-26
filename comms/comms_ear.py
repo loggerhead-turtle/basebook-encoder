@@ -1606,7 +1606,11 @@ def _page_body(q):
         # here. Saying so beats a coach tapping it and reading a timeout.
         b.append(
             f'<div class="card"><b>Found nearby:</b><br>{tally}{rows}'
-            '<form method="post" action="/scan" style="margin-top:.5rem">'
+            '<form method="post" action="/scan" style="margin-top:.5rem" '
+            # the scan runs synchronously in the NEXT page load
+            # (~15 s) — without this the press reads as nothing
+            # happening (field report, N150 settings iframe)
+            "onsubmit=\"var b=this.querySelector('button');setTimeout(function(){b.disabled=true;b.textContent='🔍 Scanning… about 15 s';},0)\"" '>'
             '<button class="go">🔍 Scan again</button></form>'
             '<span class="dim">each scan runs ~12 s; WiFi and Bluetooth '
             'share the Pi\'s antenna, so 2–3 scans is normal. A bud '
@@ -1619,14 +1623,16 @@ def _page_body(q):
             'right now.</span></div>')
     else:
         b.append('<div class="card">'
-                 '<form method="post" action="/autopair">'
+                 '<form method="post" action="/autopair" '
+                 "onsubmit=\"var b=this.querySelector('button');setTimeout(function(){b.disabled=true;b.textContent='⚡ Listening for the flashing bud… about 20 s';},0)\"" '>'
                  '<button class="go">⚡ Pair the flashing bud '
                  '(automatic)</button></form>'
                  '<span class="dim">put the bud in pairing mode FIRST '
                  '(hold its button until it flashes), then tap — the '
                  'box grabs it the moment it appears (~20 s)</span>'
                  '<form method="post" action="/scan" '
-                 'style="margin-top:.6rem">'
+                 'style="margin-top:.6rem" '
+                 "onsubmit=\"var b=this.querySelector('button');setTimeout(function(){b.disabled=true;b.textContent='🔍 Scanning… about 15 s';},0)\"" '>'
                  '<button>🔍 Scan and pick from a list instead</button>'
                  '</form></div>')
     return ''.join(b)
