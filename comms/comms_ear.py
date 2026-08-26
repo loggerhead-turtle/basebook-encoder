@@ -708,6 +708,16 @@ def _usb_product(hci):
                 break
             f = os.path.join(p, 'product')
             if os.path.isfile(f):
+                # a root hub's product ("xHCI Host Controller") is the
+                # BUS's name, not the radio's — the Intel card carries
+                # no product string and the walk was crediting it with
+                # the host controller's (field report screenshot)
+                try:
+                    vend = open(os.path.join(p, 'idVendor')).read().strip()
+                except Exception:
+                    vend = ''
+                if vend == '1d6b':          # Linux Foundation = root hub
+                    return ''
                 return open(f).read().strip()
     except Exception:
         pass
@@ -803,10 +813,30 @@ def _adapter_card():
             (prod and f'built-in radio ({prod})' or 'built-in radio')
         # "In use" is now READ, not assumed. The pin is a request; this
         # is the answer, and they can disagree — see active_adapter().
+        if not a['mac']:
+            # An adapter with NO address never initialized — on a USB
+            # dongle that is almost always missing firmware (the UB500's
+            # Realtek chip needs firmware-realtek, which a netinst
+            # Debian doesn't ship). The old row still drew a button, and
+            # its value was the empty MAC — which /adapter reads as
+            # UNPIN. So the coach tapped the dongle, the page silently
+            # cleared the pin, and "nothing happens" (field report).
+            # A dead radio gets a diagnosis, never a button.
+            rows.append(
+                f'<div style="margin:.25rem 0;padding:.5rem .6rem;'
+                f'border:1px dashed #666;border-radius:.4rem">'
+                + f'{html.escape(kind)}<br>'
+                + f'<span class="dim">{html.escape(a["hci"])} · no '
+                'address — the adapter never initialized. On a USB '
+                'dongle this is almost always missing firmware: '
+                '<code>sudo apt install -y firmware-realtek</code>, '
+                'then unplug and replug the dongle (no reboot needed) '
+                'and reload this page.</span></div>')
+            continue
         tag = ''
-        if a['mac'] and a['mac'] == actual:
+        if a['mac'] == actual:
             tag = ' <b class="ok">← in use</b>'
-        elif a['mac'] == want:
+        elif want and a['mac'] == want:
             tag = ' <b class="bad">← picked, but NOT the one in use</b>'
         elif a['blocked']:
             tag = ' <span class="dim">(powered down)</span>'
@@ -818,7 +848,7 @@ def _adapter_card():
             + (' disabled' if a['mac'] == want else '') + '>'
             + f'{html.escape(kind)}<br>'
             + f'<span class="dim">{html.escape(a["hci"])} · '
-            + f'{html.escape(a["mac"] or "?")}</span>{tag}</button></form>')
+            + f'{html.escape(a["mac"])}</span>{tag}</button></form>')
     # BlueZ keys pairings by ADAPTER (/var/lib/bluetooth/<adapter>/<bud>),
     # so changing adapters hands you an empty pairing list and a bud that
     # will not show up in a scan unless it is put back into pairing mode.

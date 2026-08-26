@@ -1992,6 +1992,73 @@ def test_settings_page_embeds_comms_when_installed(monkeypatch):
     assert 'open full-screen' in html
 
 
+def test_comms_picker_diagnoses_a_dead_dongle_instead_of_a_button(
+        monkeypatch):
+    """A dongle with no firmware enumerates as an hci with NO address.
+    The old card drew it as a button whose value was the empty MAC —
+    which the /adapter POST reads as UNPIN, so tapping the dongle
+    silently cleared the pin: 'I click on the tp link and nothing
+    happens' (field report). A dead radio gets a diagnosis — including
+    the firmware-realtek fix — and never a button. The installer also
+    ships firmware-realtek so sold boxes never hit this."""
+    import importlib.util
+    import os as _os
+    root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    spec = importlib.util.spec_from_file_location(
+        'comms_ear_card_test', _os.path.join(root, 'comms', 'comms_ear.py'))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    monkeypatch.setattr(mod, 'adapters', lambda: [
+        {'hci': 'hci0', 'mac': '28:A4:4A:F0:D7:13', 'usb': True,
+         'blocked': False, 'name': 'box'},
+        {'hci': 'hci1', 'mac': '', 'usb': True,
+         'blocked': False, 'name': ''}])
+    monkeypatch.setattr(mod, 'adapter_pref', lambda: '')
+    monkeypatch.setattr(mod, 'active_adapter',
+                        lambda: '28:A4:4A:F0:D7:13')
+    monkeypatch.setattr(mod, '_usb_product',
+                        lambda hci: 'TP-Link UB500 Adapter'
+                        if hci == 'hci1' else '')
+    card = mod._adapter_card()
+    assert 'value=""' not in card          # no unpin-in-disguise button
+    assert 'firmware-realtek' in card      # the fix, named on the card
+    assert 'never initialized' in card
+    # the working radio still gets its button, and unpinned ≠ 'picked'
+    assert 'value="28:A4:4A:F0:D7:13"' in card
+    assert 'picked, but NOT' not in card
+    sh = open(_os.path.join(root, 'install.sh')).read()
+    assert 'firmware-realtek' in sh
+
+
+def test_comms_product_walk_never_credits_the_root_hub(monkeypatch,
+                                                       tmp_path):
+    """The Intel card carries no product string, and the sysfs walk was
+    crediting it with the xHCI root hub's name — 'xHCI Host Controller'
+    on the picker (field report screenshot). A Linux Foundation root
+    hub (idVendor 1d6b) ends the walk empty-handed."""
+    import importlib.util
+    import os as _os
+    root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    spec = importlib.util.spec_from_file_location(
+        'comms_ear_walk_test', _os.path.join(root, 'comms', 'comms_ear.py'))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    hub = tmp_path / 'usb1'
+    dev = hub / '1-3'
+    iface = dev / '1-3:1.0' / 'bluetooth' / 'hci9'
+    iface.mkdir(parents=True)
+    (hub / 'product').write_text('xHCI Host Controller\n')
+    (hub / 'idVendor').write_text('1d6b\n')
+    monkeypatch.setattr(mod.os.path, 'realpath',
+                        lambda p: str(iface) if 'hci9' in p else p)
+    # no product anywhere below the root hub → empty, not the hub's name
+    assert mod._usb_product('hci9') == ''
+    # a REAL device's product still wins before the walk reaches the hub
+    (dev / 'product').write_text('TP-Link UB500 Adapter\n')
+    (dev / 'idVendor').write_text('2357\n')
+    assert mod._usb_product('hci9') == 'TP-Link UB500 Adapter'
+
+
 def test_comms_bt_calls_select_the_pinned_radio(monkeypatch, tmp_path):
     """With an adapter pinned, every bluetoothctl call runs as a scripted
     session that SELECTs the pinned controller first — powering the
