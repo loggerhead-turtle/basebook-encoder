@@ -224,19 +224,26 @@ def test_loop_listens_to_every_adapter_at_once(monkeypatch):
     assert svc.port == gun_p                # and identified as the gun
     # the board is DRIVEN in its own display protocol — a bare
     # right-aligned speed — never the gun's raw multi-tag stream
-    # (verbatim EA frames rendered as garbage fragments, field report)
+    # (verbatim EA frames rendered as garbage fragments, field report);
+    # and it carries the frame's PEAK (58.9), not the decel value (58.6)
     disp = _FakePort.OPEN.get(disp_p)
-    assert disp and disp.written == [b' 58.6\r']
+    assert disp and disp.written == [b' 58.9\r']
 
 
 def test_display_line_speaks_the_board_protocol():
     """Value frames become ' 57.8\\r'; keepalives are not display
-    traffic (the board holds its last number); live outranks peak."""
+    traffic (the board holds its last number); PEAK outranks live —
+    the live field is the ball DECELERATING, and a board fed live
+    rolls the number down while every other surface holds the pitch
+    speed (field report)."""
     from encoder.radar import RadarService
     assert RadarService.display_line(
-        {'live': 57.8, 'peak': 58.9}) == b' 57.8\r'
+        {'live': 57.8, 'peak': 58.9}) == b' 58.9\r'
     assert RadarService.display_line(
         {'live': None, 'peak': 58.9}) == b' 58.9\r'
+    # before the first peak lock of a track, live leads the way
+    assert RadarService.display_line(
+        {'live': 57.8, 'peak': None}) == b' 57.8\r'
     assert RadarService.display_line(
         {'live': None, 'peak': None, 'rpm': None, 'alive': True}) is None
     assert RadarService.display_line(None) is None
@@ -437,9 +444,11 @@ def test_a_wrong_pin_releases_to_the_port_streaming_gun_frames(monkeypatch):
     # third on, capture flows
     assert svc.frames_parsed == 2
     # the display pin names the gun's own port — the board is driven on
-    # the OTHER adapter (where it actually is), never the gun itself
+    # the OTHER adapter (where it actually is), never the gun itself.
+    # Both frames are the same track rolling down (live 58.6 → 53.7,
+    # peak 58.9): the board holds the PEAK, not the decel curve
     disp = _FakePort.OPEN.get(board_p)
-    assert disp and disp.written == [b' 58.6\r', b' 53.7\r']
+    assert disp and disp.written == [b' 58.9\r', b' 58.9\r']
 
 
 def test_board_echo_of_our_own_speeds_never_steals_the_claim(monkeypatch):
