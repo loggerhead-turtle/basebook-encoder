@@ -102,6 +102,26 @@ HOSTNAME = socket.gethostname()
 # writable once privileges drop, and these are field preferences anyway.
 NAME_FILE = os.path.expanduser('~/.playcall-comms-name')
 EARS_FILE = os.path.expanduser('~/.playcall-comms-ears.json')
+# 🔌 Wired transmitter mode: an external Bluetooth transmitter (an
+# Avantree Oasis in the 3.5 mm jack — dual-link, long range) carries
+# the audio to the earbuds, and the BUDS PAIR TO IT, not to this box.
+# The box then routes speech to the analog line-out and stops hunting
+# for Bluetooth ears entirely.
+LINEOUT_FILE = os.path.expanduser('~/.playcall-comms-lineout')
+
+
+def lineout_on():
+    return os.path.exists(LINEOUT_FILE)
+
+
+def set_lineout(on):
+    try:
+        if on:
+            open(LINEOUT_FILE, 'w').write('1')
+        elif os.path.exists(LINEOUT_FILE):
+            os.remove(LINEOUT_FILE)
+    except Exception:
+        pass
 ADAPTER_FILE = os.path.expanduser('~/.playcall-comms-adapter')
 
 
@@ -197,11 +217,18 @@ def fetch():
     # anything. Cheap: three short headers, no extra request.
     ears = []
     try:
-        st = bt_status()
-        labs = ear_labels()
-        for d in (st.get('connected') or []):
-            lab = labs.get(d['mac'].upper()) or labs.get(d['mac']) or ''
-            ears.append(lab or d.get('name') or 'bud')
+        if lineout_on():
+            # the wired transmitter IS the earpiece as far as readiness
+            # goes — without this the site warned 'no earpiece paired'
+            # about a rig that was working perfectly
+            ears.append('line-out transmitter')
+        else:
+            st = bt_status()
+            labs = ear_labels()
+            for d in (st.get('connected') or []):
+                lab = labs.get(d['mac'].upper()) or labs.get(d['mac']) \
+                    or ''
+                ears.append(lab or d.get('name') or 'bud')
     except Exception:
         pass
     auth = {'X-Api-Key': KEY, 'Authorization': 'Bearer ' + KEY}
@@ -233,12 +260,40 @@ def fetch():
 _COMBINE = {'slaves': None, 'mod': None}
 
 
+def _route_to_lineout():
+    """Default sink → the analog jack, where the wired transmitter
+    lives. Prefers the sink that says 'analog' on it; any non-Bluetooth
+    sink beats none."""
+    try:
+        out = subprocess.run(['pactl', 'list', 'short', 'sinks'],
+                             capture_output=True, text=True,
+                             timeout=5).stdout
+        wired = [ln.split('\t')[1] for ln in out.splitlines()
+                 if ln.strip() and 'bluez' not in ln
+                 and 'playcall_both' not in ln]
+        if not wired:
+            return False
+        pick = next((sk for sk in wired if 'analog' in sk), wired[0])
+        subprocess.run(['pactl', 'set-default-sink', pick],
+                       check=False, timeout=5)
+        _sink_audible(pick)
+        return True
+    except Exception:
+        return False
+
+
 def _route_to_bud():
     """Point the default audio sink at the Bluetooth bud(s). One bud →
     straight at it. TWO buds on one box (catcher + pitcher on the plate
     Pi) → a combined sink so every word lands in BOTH ears; rebuilt
     whenever the set of connected buds changes (dugout walks). Cheap and
-    idempotent; called before every utterance."""
+    idempotent; called before every utterance.
+
+    In wired-transmitter mode the destination is the LINE-OUT instead —
+    the transmitter in the jack owns the radio leg, and a bud that
+    happens to still be paired here must not steal the speech."""
+    if lineout_on():
+        return _route_to_lineout()
     try:
         out = subprocess.run(['pactl', 'list', 'short', 'sinks'],
                              capture_output=True, text=True,
@@ -402,22 +457,35 @@ _NO_SUSPEND = os.path.expanduser(
     '51-playcall-bt-no-suspend.conf')
 
 
+_NO_SUSPEND_BODY = (
+    'monitor.bluez.rules = [\n'
+    '  { matches = [ { node.name = "~bluez_output.*" } ]\n'
+    '    actions = { update-props = {\n'
+    '      session.suspend-timeout-seconds = 0\n'
+    '    } } }\n'
+    ']\n'
+    '# the analog jack feeds the wired transmitter — a suspended ALSA\n'
+    '# sink (and the transmitter dozing on silence behind it) eats the\n'
+    '# first word exactly like a sleeping Bluetooth link did\n'
+    'monitor.alsa.rules = [\n'
+    '  { matches = [ { node.name = "~alsa_output.*" } ]\n'
+    '    actions = { update-props = {\n'
+    '      session.suspend-timeout-seconds = 0\n'
+    '    } } }\n'
+    ']\n')
+
+
 def ensure_bt_no_suspend():
-    """Keep bluez audio nodes from suspending between calls. Written
-    once; wireplumber restarts only the first time so a healthy boot
-    never bounces audio."""
-    if os.path.exists(_NO_SUSPEND):
-        return
+    """Keep audio sinks from suspending between calls. Rewritten (and
+    wireplumber bounced) only when the content is out of date, so a
+    healthy boot never bounces audio."""
     try:
+        if os.path.exists(_NO_SUSPEND) and \
+                open(_NO_SUSPEND).read() == _NO_SUSPEND_BODY:
+            return
         os.makedirs(os.path.dirname(_NO_SUSPEND), exist_ok=True)
         with open(_NO_SUSPEND, 'w') as fh:
-            fh.write(
-                'monitor.bluez.rules = [\n'
-                '  { matches = [ { node.name = "~bluez_output.*" } ]\n'
-                '    actions = { update-props = {\n'
-                '      session.suspend-timeout-seconds = 0\n'
-                '    } } }\n'
-                ']\n')
+            fh.write(_NO_SUSPEND_BODY)
         subprocess.run(['systemctl', '--user', 'restart', 'wireplumber'],
                        capture_output=True, timeout=15)
     except Exception:
@@ -1435,6 +1503,8 @@ def reconnect_loop():
         try:
             if PAIRING['busy']:
                 continue                     # never fight an active pair
+            if lineout_on():
+                continue          # the transmitter owns the radio leg
             st = bt_status()
             if not st.get('ok'):
                 continue
@@ -1788,6 +1858,31 @@ def _page_body(q):
         f'<button style="padding:.3rem .7rem">save</button>'
         f'<br><span class="dim">what the coach page shows after '
         f'"LIVE →"</span></form></div>')
+    # ── wired transmitter (Avantree in the 3.5 mm jack) ──
+    if lineout_on():
+        b.append(
+            '<div class="card"><b>🔌 Wired transmitter mode — ON</b><br>'
+            '<span class="dim">speech goes out the 3.5 mm jack to the '
+            'transmitter; the earbuds pair to the TRANSMITTER (its own '
+            'buttons), not to this box. Bluetooth pairing below is '
+            'ignored while this is on.</span>'
+            '<form method="post" action="/lineout" style="margin-top:.4rem">'
+            '<button name="v" value="">↩ back to Bluetooth earbuds</button>'
+            '</form>'
+            '<form method="post" action="/test" style="margin-top:.3rem">'
+            '<button class="go">🔊 Radio check out the jack</button>'
+            '</form></div>')
+    else:
+        b.append(
+            '<div class="card"><b>🔌 Wired transmitter mode</b><br>'
+            '<span class="dim">Using an external Bluetooth transmitter '
+            '(e.g. Avantree Oasis — holds TWO earbuds, long range)? Plug '
+            'it into the 3.5 mm jack with the AUX cable, pair both buds '
+            'to the transmitter, then flip this — speech routes out the '
+            'jack and the box stops hunting for Bluetooth ears.</span>'
+            '<form method="post" action="/lineout" style="margin-top:.4rem">'
+            '<button name="v" value="1">🔌 Use the wired transmitter'
+            '</button></form></div>')
     b.append(_adapter_card())
     # ── the voice the ear speaks with ──
     cur = voice_current() or ('install default' if os.path.exists(
@@ -2050,6 +2145,10 @@ class Admin(http.server.BaseHTTPRequestHandler):
             loc = '/'
         elif self.path == '/voice':
             voice_download((form.get('v') or '').strip())
+            loc = '/'
+        elif self.path == '/lineout':
+            set_lineout(bool((form.get('v') or '').strip()))
+            _route_to_bud()               # take effect before the reply
             loc = '/'
         else:
             loc = '/'
