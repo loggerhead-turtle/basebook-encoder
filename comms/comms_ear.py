@@ -655,6 +655,15 @@ def lk_thread():
             LK_STATE['s'] = ''
             time.sleep(60)
             continue
+        # Join ONLY while a game is on. Connected participants are what
+        # the SFU bills by the minute — a box that idles in the room
+        # around the clock burns ~43k minutes a month doing nothing,
+        # which is a plan tier all by itself. The game window is when
+        # a coach can possibly talk; outside it the room stays empty.
+        if not STATE.get('game'):
+            LK_STATE['s'] = ''
+            time.sleep(30)
+            continue
         try:
             import asyncio                          # noqa: F401
             from livekit import rtc                 # noqa: F401
@@ -714,6 +723,19 @@ async def _lk_session(d):
 
     await room.connect(d['url'], d['token'])
     LK_STATE['s'] = 'cloud channel joined — waiting for the coach'
+
+    async def leave_when_game_ends():
+        # the join was for the game; the game ending is the leave
+        while not done.is_set():
+            await asyncio.sleep(15)
+            if not STATE.get('game'):
+                try:
+                    await room.disconnect()
+                except Exception:
+                    pass
+                done.set()
+                return
+    asyncio.ensure_future(leave_when_game_ends())
     await done.wait()
     for pr in players:
         try:
