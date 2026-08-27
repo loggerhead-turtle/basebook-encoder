@@ -2005,6 +2005,11 @@ def test_comms_cloud_voice_subscriber(monkeypatch, tmp_path):
     assert 'def lk_thread' in src
     assert 'target=lk_thread' in src               # actually started
     assert 're-run install_comms.sh' in src        # missing lib says so
+    # billed by the participant-minute: join only while a game is on,
+    # and leave when it ends — an always-connected box burns ~43k
+    # min/month idling, a plan tier by itself
+    assert "if not STATE.get('game'):" in src
+    assert 'leave_when_game_ends' in src
     spec = importlib.util.spec_from_file_location(
         'comms_ear_lk_test', _os.path.join(root, 'comms', 'comms_ear.py'))
     mod = importlib.util.module_from_spec(spec)
