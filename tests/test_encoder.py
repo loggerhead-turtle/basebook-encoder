@@ -1992,6 +1992,37 @@ def test_settings_page_embeds_comms_when_installed(monkeypatch):
     assert 'open full-screen' in html
 
 
+def test_comms_cloud_voice_subscriber(monkeypatch, tmp_path):
+    """The ☁ cloud voice channel: the box polls the cloud for a
+    LiveKit ticket and subscribes; disabled answers idle the thread;
+    a missing livekit library reports itself instead of dying; and a
+    LIVE cloud link outranks the P2P state on the coach page."""
+    import importlib.util
+    import os as _os
+    root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    src = open(_os.path.join(root, 'comms', 'comms_ear.py')).read()
+    assert "/api/sk/voice/token" in src
+    assert 'def lk_thread' in src
+    assert 'target=lk_thread' in src               # actually started
+    assert 're-run install_comms.sh' in src        # missing lib says so
+    spec = importlib.util.spec_from_file_location(
+        'comms_ear_lk_test', _os.path.join(root, 'comms', 'comms_ear.py'))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    # the voice line the cloud sees: cloud LIVE outranks the P2P state
+    mod.RTC_STATE['s'] = 'waiting for a coach'
+    mod.LK_STATE['s'] = ''
+    assert mod._voice_line() == 'waiting for a coach'
+    mod.LK_STATE['s'] = 'cloud channel joined — waiting for the coach'
+    assert 'cloud channel joined' in mod._voice_line()
+    assert 'waiting for a coach ·' in mod._voice_line()
+    mod.LK_STATE['s'] = '🎙 cloud LIVE — coach linked'
+    assert mod._voice_line() == '🎙 cloud LIVE — coach linked'
+    # the installer ships the client
+    sh = open(_os.path.join(root, 'comms', 'install_comms.sh')).read()
+    assert 'livekit' in sh
+
+
 def test_comms_wired_transmitter_mode(monkeypatch, tmp_path):
     """An Avantree-style transmitter in the 3.5 mm jack: speech routes
     to the ANALOG sink (never a leftover bud), the cloud hears

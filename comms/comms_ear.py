@@ -236,7 +236,7 @@ def fetch():
             'X-Pi-Comms-Port': hdr(PORT, 8),
             'X-Pi-Name': hdr(box_name(), 40),
             'X-Pi-Ears': hdr(','.join(ears), 120),
-            'X-Pi-Voice': hdr(RTC_STATE.get('s', ''), 60)}
+            'X-Pi-Voice': hdr(_voice_line(), 60)}
 
     def _get(headers):
         req = urllib.request.Request(BASE + '/api/sk/device/comms',
@@ -626,6 +626,102 @@ def poll_loop():
 # into the earbud; called pitches ride the data channel instantly.
 
 RTC_STATE = {'s': 'starting…'}
+# ☁ the cloud voice channel (LiveKit SFU): the coach reaches this ear
+# from ANY network — coach on cellular, box on the field hotspot. The
+# cloud is the feature flag: /api/sk/voice/token answers {disabled}
+# until LiveKit is configured, and this thread then just naps. The P2P
+# link (rtc_thread) stays as the same-WiFi fast path.
+LK_STATE = {'s': ''}
+
+
+def _voice_line():
+    """What X-Pi-Voice reports: a LIVE cloud link outranks everything,
+    otherwise the P2P state with the cloud state riding along."""
+    lk = str(LK_STATE.get('s') or '')
+    if lk.startswith('🎙'):
+        return lk
+    s0 = str(RTC_STATE.get('s') or '')
+    return (s0 + (' · ' + lk if lk else ''))[:118]
+
+
+def lk_thread():
+    while True:
+        try:
+            d = _api_json('/api/sk/voice/token')
+        except Exception:
+            time.sleep(30)
+            continue
+        if not d or d.get('disabled') or not d.get('url'):
+            LK_STATE['s'] = ''
+            time.sleep(60)
+            continue
+        try:
+            import asyncio                          # noqa: F401
+            from livekit import rtc                 # noqa: F401
+        except Exception:
+            LK_STATE['s'] = ('cloud voice is ON at the site but livekit '
+                             'is not installed — re-run install_comms.sh')
+            time.sleep(300)
+            continue
+        import asyncio
+        try:
+            asyncio.run(_lk_session(d))
+        except Exception as exc:
+            LK_STATE['s'] = f'cloud voice error: {str(exc)[:80]}'
+        time.sleep(10)
+
+
+async def _lk_session(d):
+    import asyncio
+    from livekit import rtc
+    room = rtc.Room()
+    done = asyncio.Event()
+    players = []
+
+    @room.on('track_subscribed')
+    def on_track(track, pub, participant):
+        if track.kind != rtc.TrackKind.KIND_AUDIO:
+            return
+
+        async def pump():
+            _route_to_bud()           # bud OR line-out, same as speech
+            try:
+                stream = rtc.AudioStream(track, sample_rate=48000,
+                                         num_channels=2)
+            except TypeError:         # older livekit: no resample args
+                stream = rtc.AudioStream(track)
+            proc = None
+            LK_STATE['s'] = '🎙 cloud LIVE — coach linked'
+            async for ev in stream:
+                f = ev.frame
+                if proc is None:
+                    proc = subprocess.Popen(
+                        ['paplay', '--raw', '--format=s16le',
+                         f'--rate={f.sample_rate}',
+                         f'--channels={f.num_channels}'],
+                        stdin=subprocess.PIPE)
+                    players.append(proc)
+                try:
+                    proc.stdin.write(bytes(f.data))
+                except Exception:
+                    break
+            LK_STATE['s'] = 'cloud channel joined — coach went quiet'
+        asyncio.ensure_future(pump())
+
+    @room.on('disconnected')
+    def on_dc(*a):
+        done.set()
+
+    await room.connect(d['url'], d['token'])
+    LK_STATE['s'] = 'cloud channel joined — waiting for the coach'
+    await done.wait()
+    for pr in players:
+        try:
+            pr.kill()
+        except Exception:
+            pass
+    LK_STATE['s'] = 'cloud channel dropped — rejoining'
+
 
 
 def _api_json(path, body=None):
@@ -2174,6 +2270,7 @@ def main():
     ensure_bt_no_suspend()
     threading.Thread(target=poll_loop, daemon=True).start()
     threading.Thread(target=rtc_thread, daemon=True).start()
+    threading.Thread(target=lk_thread, daemon=True).start()
     threading.Thread(target=reconnect_loop, daemon=True).start()
     say('comms box on')
     srv = http.server.ThreadingHTTPServer(('0.0.0.0', PORT), Admin)

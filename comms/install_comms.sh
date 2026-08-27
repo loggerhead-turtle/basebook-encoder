@@ -80,6 +80,12 @@ apt-get install -y -qq espeak-ng mpg123 ffmpeg \
 apt-get install -y -qq python3-aiortc python3-av >/dev/null 2>&1 \
   || pip3 install --break-system-packages -q aiortc 2>/dev/null \
   || echo "   (aiortc unavailable — live voice falls back to clips)"
+# livekit = the ☁ cloud voice channel (SFU): the coach talks from ANY
+# network once the site has LiveKit configured. Optional — everything
+# else works without it, and the box says so on the coach page if the
+# site enables cloud voice before this lands.
+pip3 install --break-system-packages -q livekit 2>/dev/null \
+  || echo "   (livekit unavailable — cloud voice stays off on this box)"
 
 # ── a HUMAN voice (Piper neural TTS; espeak-ng stays as fallback) ───────
 PIPER_DIR=/opt/piper
