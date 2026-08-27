@@ -1992,6 +1992,54 @@ def test_settings_page_embeds_comms_when_installed(monkeypatch):
     assert 'open full-screen' in html
 
 
+def test_comms_wired_transmitter_mode(monkeypatch, tmp_path):
+    """An Avantree-style transmitter in the 3.5 mm jack: speech routes
+    to the ANALOG sink (never a leftover bud), the cloud hears
+    'line-out transmitter' as the earpiece (no false 'no earpiece
+    paired' warning), and the bud-chaser stands down."""
+    import importlib.util
+    import os as _os
+    root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    spec = importlib.util.spec_from_file_location(
+        'comms_ear_lineout_test', _os.path.join(root, 'comms',
+                                                'comms_ear.py'))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    monkeypatch.setattr(mod, 'LINEOUT_FILE', str(tmp_path / 'lineout'))
+    assert not mod.lineout_on()
+    mod.set_lineout(True)
+    assert mod.lineout_on()
+    calls = []
+
+    def fake_run(cmd, **k):
+        calls.append(cmd)
+        out = ''
+        if cmd[:3] == ['pactl', 'list', 'short']:
+            out = ('55\tbluez_output.AA_BB.1\tmodule\ts16le\tIDLE\n'
+                   '56\talsa_output.pci-0000_00_1f.3.analog-stereo\t'
+                   'module\ts16le\tIDLE\n')
+        return type('R', (), {'stdout': out, 'returncode': 0})()
+    monkeypatch.setattr(mod.subprocess, 'run', fake_run)
+    monkeypatch.setattr(mod, '_sink_audible', lambda s: None)
+    assert mod._route_to_bud() is True         # mode redirects the router
+    picked = [c for c in calls if c[:2] == ['pactl', 'set-default-sink']]
+    assert picked and 'analog' in picked[-1][2]
+    assert 'bluez' not in picked[-1][2]
+    # readiness: the wired transmitter IS the ear
+    src = open(_os.path.join(root, 'comms', 'comms_ear.py')).read()
+    assert "ears.append('line-out transmitter')" in src
+    assert 'if lineout_on():\n                continue' in src  # chaser
+    assert 'action="/lineout"' in src          # and the card offers it
+    # off again → the bluetooth path is back
+    mod.set_lineout(False)
+    calls.clear()
+    assert mod._route_to_bud() is True
+    picked = [c for c in calls if c[:2] == ['pactl', 'set-default-sink']]
+    assert picked and 'bluez' in picked[-1][2]
+    # the no-suspend drop-in now covers the analog jack too
+    assert 'alsa_output' in mod._NO_SUSPEND_BODY
+
+
 def test_comms_voice_is_pickable_and_survives_bad_picks(monkeypatch,
                                                             tmp_path):
     """The coach picks the ear's voice from a curated Piper set. The
