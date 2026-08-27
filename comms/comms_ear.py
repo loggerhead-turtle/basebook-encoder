@@ -586,6 +586,12 @@ def poll_loop():
             time.sleep(5)
             continue
         STATE['game'] = d.get('game')
+        # cloud-voice gate: join the PAID room only when the cloud says
+        # the coach is present AND voice is usable (defense / warmup /
+        # the 🧪 all-game toggle). Older clouds don't send it — fall
+        # back to game-presence, the previous behavior.
+        STATE['voice_wanted'] = d.get('voice_wanted',
+                                      bool(d.get('game')))
         STATE['opponent'] = d.get('opponent') or ''
         if d.get('zones'):
             STATE['zones'] = d['zones']     # cached for the live link too
@@ -660,9 +666,9 @@ def lk_thread():
         # around the clock burns ~43k minutes a month doing nothing,
         # which is a plan tier all by itself. The game window is when
         # a coach can possibly talk; outside it the room stays empty.
-        if not STATE.get('game'):
+        if not STATE.get('voice_wanted'):
             LK_STATE['s'] = ''
-            time.sleep(30)
+            time.sleep(15)
             continue
         try:
             import asyncio                          # noqa: F401
@@ -725,10 +731,13 @@ async def _lk_session(d):
     LK_STATE['s'] = 'cloud channel joined — waiting for the coach'
 
     async def leave_when_game_ends():
-        # the join was for the game; the game ending is the leave
+        # joined for the coach's defense half (or warmup/testing) —
+        # leave the moment the cloud stops wanting voice, so an idle
+        # console, our offense half, or a game left live for days all
+        # empty the paid room
         while not done.is_set():
-            await asyncio.sleep(15)
-            if not STATE.get('game'):
+            await asyncio.sleep(10)
+            if not STATE.get('voice_wanted'):
                 try:
                     await room.disconnect()
                 except Exception:

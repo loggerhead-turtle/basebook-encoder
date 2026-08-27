@@ -2008,8 +2008,12 @@ def test_comms_cloud_voice_subscriber(monkeypatch, tmp_path):
     # billed by the participant-minute: join only while a game is on,
     # and leave when it ends — an always-connected box burns ~43k
     # min/month idling, a plan tier by itself
-    assert "if not STATE.get('game'):" in src
+    assert "if not STATE.get('voice_wanted'):" in src
     assert 'leave_when_game_ends' in src
+    # older clouds don't send voice_wanted — game presence is the
+    # fallback so an un-updated site keeps the previous behavior
+    assert "d.get('voice_wanted',\n" in src or \
+        "d.get('voice_wanted'," in src
     spec = importlib.util.spec_from_file_location(
         'comms_ear_lk_test', _os.path.join(root, 'comms', 'comms_ear.py'))
     mod = importlib.util.module_from_spec(spec)
