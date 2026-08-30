@@ -2099,6 +2099,29 @@ def test_comms_wired_transmitter_mode(monkeypatch, tmp_path):
     assert 'alsa_output' in mod._NO_SUSPEND_BODY
 
 
+def test_comms_call_text_never_flips_by_handedness():
+    """Absolute sides: 'right hand side' is the catcher's right whoever
+    bats. The old batter-true swap made every call depend on the coach
+    keeping the batter's handedness set (field report)."""
+    import importlib.util
+    import os as _os
+    root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    spec = importlib.util.spec_from_file_location(
+        'comms_ear_zone_test', _os.path.join(root, 'comms',
+                                             'comms_ear.py'))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    zones = {'A': 'right hand side, off the plate',
+             '6': 'right hand side'}
+    for bats in ('R', 'L', ''):
+        assert mod.call_text({'pitch_type': 'Fastball', 'location': 'A',
+                              'bats': bats}, zones) \
+            == 'Fastball — right hand side, off the plate', bats
+        assert mod.call_text({'pitch_type': 'Slider', 'location': '6',
+                              'bats': bats}, zones) \
+            == 'Slider — right hand side', bats
+
+
 def test_comms_voice_is_pickable_and_survives_bad_picks(monkeypatch,
                                                             tmp_path):
     """The coach picks the ear's voice from a curated Piper set. The
