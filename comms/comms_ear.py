@@ -775,10 +775,16 @@ async def _lk_session(d):
         # joined for the coach's defense half (or warmup/testing) —
         # leave the moment the cloud stops wanting voice, so an idle
         # console, our offense half, or a game left live for days all
-        # empty the paid room
+        # empty the paid room. And an ABSOLUTE ceiling: no single
+        # session outlives 5 hours no matter what the signals say —
+        # longer than any real game, and the last backstop against a
+        # gating bug ever costing unbounded minutes (rejoining after
+        # is allowed and instant if the signals are still genuine).
+        t0 = time.time()
         while not done.is_set():
             await asyncio.sleep(10)
-            if not STATE.get('voice_wanted'):
+            if not STATE.get('voice_wanted') \
+                    or time.time() - t0 > 5 * 3600:
                 try:
                     await room.disconnect()
                 except Exception:
