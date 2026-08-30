@@ -236,7 +236,7 @@ def fetch():
             'X-Pi-Comms-Port': hdr(PORT, 8),
             'X-Pi-Name': hdr(box_name(), 40),
             'X-Pi-Ears': hdr(','.join(ears), 120),
-            'X-Pi-Voice': hdr(_voice_line(), 60)}
+            'X-Pi-Voice': hdr(_voice_line(), 118)}
 
     def _get(headers):
         req = urllib.request.Request(BASE + '/api/sk/device/comms',

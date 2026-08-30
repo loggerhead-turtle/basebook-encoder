@@ -84,8 +84,15 @@ apt-get install -y -qq python3-aiortc python3-av >/dev/null 2>&1 \
 # network once the site has LiveKit configured. Optional — everything
 # else works without it, and the box says so on the coach page if the
 # site enables cloud voice before this lands.
-pip3 install --break-system-packages -q livekit 2>/dev/null \
-  || echo "   (livekit unavailable — cloud voice stays off on this box)"
+# a netinst Debian ships NO pip3 at all — both pip calls above and
+# below died with 'command not found' into /dev/null, and the box then
+# told the coach page 'livekit is not installed' after every install
+# (field report). Make pip exist, and make a livekit failure SAY WHY.
+command -v pip3 >/dev/null 2>&1 \
+  || apt-get install -y -qq python3-pip >/dev/null 2>&1 || true
+pip3 install --break-system-packages -q livekit \
+  || echo "   ⚠ livekit install failed (see pip output above) — cloud \
+voice stays off on this box"
 
 # ── a HUMAN voice (Piper neural TTS; espeak-ng stays as fallback) ───────
 PIPER_DIR=/opt/piper
