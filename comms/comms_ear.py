@@ -650,33 +650,49 @@ def _voice_line():
     return (s0 + (' · ' + lk if lk else ''))[:118]
 
 
+LK_CFG = {'enabled': None, 'ts': 0.0}   # cached 'is cloud voice on?'
+
+
 def lk_thread():
     while True:
+        # THE LOCAL CHECK COMES FIRST, AND OFTEN. voice_wanted is a
+        # variable the poll loop already maintains — re-checking it
+        # every 15 s (behind a network call, no less) put a dead
+        # quarter-minute in front of every resume: coach taps, ear
+        # joins 'about 10-20 seconds' later. 3 s here makes resume
+        # feel instant, and the token is only fetched when there is
+        # actually a join to make (the configured-or-not answer is
+        # cached ~2 min for the standby message).
+        if not STATE.get('voice_wanted'):
+            if time.time() - LK_CFG['ts'] > 120:
+                try:
+                    d0 = _api_json('/api/sk/voice/token')
+                    LK_CFG['enabled'] = bool(d0 and not d0.get('disabled')
+                                             and d0.get('url'))
+                except Exception:
+                    LK_CFG['enabled'] = None
+                LK_CFG['ts'] = time.time()
+            LK_STATE['s'] = (
+                'cloud voice standing by — joins on our defense half '
+                '(🧪 all-game overrides)' if LK_CFG['enabled'] else '')
+            time.sleep(3)
+            continue
         try:
             d = _api_json('/api/sk/voice/token')
         except Exception as exc:
             # visible, always — the register-failed saga was a week of
             # a swallowed exception exactly like this one
             LK_STATE['s'] = f'voice token poll failed: {str(exc)[:70]}'
-            time.sleep(30)
+            time.sleep(15)
             continue
         if not d or d.get('disabled') or not d.get('url'):
             LK_STATE['s'] = ''
+            LK_CFG['enabled'] = False
+            LK_CFG['ts'] = time.time()
             time.sleep(60)
             continue
-        # Join ONLY while a game is on. Connected participants are what
-        # the SFU bills by the minute — a box that idles in the room
-        # around the clock burns ~43k minutes a month doing nothing,
-        # which is a plan tier all by itself. The game window is when
-        # a coach can possibly talk; outside it the room stays empty.
-        if not STATE.get('voice_wanted'):
-            # cloud voice is CONFIGURED (the token said so) but gated
-            # out right now — say why, or '0 listening' on the coach
-            # pad reads as a fault instead of the cost gate working
-            LK_STATE['s'] = ('cloud voice standing by — joins on our '
-                             'defense half (🧪 all-game overrides)')
-            time.sleep(15)
-            continue
+        LK_CFG['enabled'] = True
+        LK_CFG['ts'] = time.time()
         try:
             import asyncio                          # noqa: F401
             from livekit import rtc                 # noqa: F401
@@ -690,7 +706,7 @@ def lk_thread():
             asyncio.run(_lk_session(d))
         except Exception as exc:
             LK_STATE['s'] = f'cloud voice error: {str(exc)[:80]}'
-        time.sleep(10)
+        time.sleep(3)
 
 
 async def _lk_session(d):
