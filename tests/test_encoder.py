@@ -2011,6 +2011,15 @@ def test_comms_cloud_voice_subscriber(monkeypatch, tmp_path):
     assert "if not STATE.get('voice_wanted'):" in src
     assert 'cloud voice standing by' in src     # the gate names itself
     assert 'leave_when_game_ends' in src
+    # playback must never block the event loop: a stalled paplay pipe
+    # starved the keepalive and the server dropped the box mid-sentence
+    # ('stops listening after about 5-10 seconds', field report) —
+    # frames go through a bounded queue drained by a writer thread,
+    # dropping the oldest when behind
+    assert 'q = _queue.Queue(maxsize=' in src
+    assert 'threading.Thread(target=writer' in src
+    assert 'q.get_nowait()' in src              # drop-oldest, keep now
+    assert 'await asyncio.to_thread(_route_to_bud)' in src
     # older clouds don't send voice_wanted — game presence is the
     # fallback so an un-updated site keeps the previous behavior
     assert "d.get('voice_wanted',\n" in src or \

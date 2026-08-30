@@ -706,27 +706,61 @@ async def _lk_session(d):
             return
 
         async def pump():
-            _route_to_bud()           # bud OR line-out, same as speech
+            # ROUTING AND PLAYBACK MUST NEVER BLOCK THIS LOOP. The
+            # first cut of this wrote to paplay's pipe inline — a pipe
+            # that backs up for even a moment stalls the event loop,
+            # the client misses its keepalive pings, and the server
+            # drops the box ~10 s into the coach's sentence (field
+            # report: 'it will stop listening after about 5-10
+            # seconds'). Frames now go through a bounded queue drained
+            # by a writer THREAD; when the sink falls behind, old
+            # frames are dropped — the ear hears NOW, never a backlog,
+            # and the loop never waits on anyone.
+            import queue as _queue
+            await asyncio.to_thread(_route_to_bud)
             try:
                 stream = rtc.AudioStream(track, sample_rate=48000,
                                          num_channels=2)
             except TypeError:         # older livekit: no resample args
                 stream = rtc.AudioStream(track)
-            proc = None
+            q = _queue.Queue(maxsize=25)          # ~a quarter second
+            stop = object()
+
+            def writer():
+                proc = None
+                while True:
+                    item = q.get()
+                    if item is stop:
+                        break
+                    rate, ch, data = item
+                    if proc is None:
+                        proc = subprocess.Popen(
+                            ['paplay', '--raw', '--format=s16le',
+                             f'--rate={rate}', f'--channels={ch}'],
+                            stdin=subprocess.PIPE)
+                        players.append(proc)
+                    try:
+                        proc.stdin.write(data)
+                    except Exception:
+                        break
+            wt = threading.Thread(target=writer, daemon=True)
+            wt.start()
             LK_STATE['s'] = '🎙 cloud LIVE — coach linked'
             async for ev in stream:
                 f = ev.frame
-                if proc is None:
-                    proc = subprocess.Popen(
-                        ['paplay', '--raw', '--format=s16le',
-                         f'--rate={f.sample_rate}',
-                         f'--channels={f.num_channels}'],
-                        stdin=subprocess.PIPE)
-                    players.append(proc)
+                item = (f.sample_rate, f.num_channels, bytes(f.data))
                 try:
-                    proc.stdin.write(bytes(f.data))
-                except Exception:
-                    break
+                    q.put_nowait(item)
+                except _queue.Full:
+                    try:                   # drop the OLDEST, keep now
+                        q.get_nowait()
+                        q.put_nowait(item)
+                    except Exception:
+                        pass
+            try:
+                q.put_nowait(stop)
+            except Exception:
+                pass
             LK_STATE['s'] = 'cloud channel joined — coach went quiet'
         asyncio.ensure_future(pump())
 
