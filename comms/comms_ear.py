@@ -654,7 +654,10 @@ def lk_thread():
     while True:
         try:
             d = _api_json('/api/sk/voice/token')
-        except Exception:
+        except Exception as exc:
+            # visible, always — the register-failed saga was a week of
+            # a swallowed exception exactly like this one
+            LK_STATE['s'] = f'voice token poll failed: {str(exc)[:70]}'
             time.sleep(30)
             continue
         if not d or d.get('disabled') or not d.get('url'):
