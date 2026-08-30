@@ -2037,9 +2037,15 @@ def test_comms_cloud_voice_subscriber(monkeypatch, tmp_path):
     assert 'waiting for a coach ·' in mod._voice_line()
     mod.LK_STATE['s'] = '🎙 cloud LIVE — coach linked'
     assert mod._voice_line() == '🎙 cloud LIVE — coach linked'
-    # the installer ships the client
+    # the installer ships the client — and ships PIP first: a netinst
+    # Debian has no pip3, so the livekit install died silently with
+    # 'command not found' and the box reported 'livekit is not
+    # installed' after every install (field report)
     sh = open(_os.path.join(root, 'comms', 'install_comms.sh')).read()
     assert 'livekit' in sh
+    assert 'python3-pip' in sh
+    assert sh.index('python3-pip') < sh.index(
+        'pip3 install --break-system-packages -q livekit')
 
 
 def test_comms_wired_transmitter_mode(monkeypatch, tmp_path):
