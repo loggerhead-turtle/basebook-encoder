@@ -667,7 +667,11 @@ def lk_thread():
         # which is a plan tier all by itself. The game window is when
         # a coach can possibly talk; outside it the room stays empty.
         if not STATE.get('voice_wanted'):
-            LK_STATE['s'] = ''
+            # cloud voice is CONFIGURED (the token said so) but gated
+            # out right now — say why, or '0 listening' on the coach
+            # pad reads as a fault instead of the cost gate working
+            LK_STATE['s'] = ('cloud voice standing by — joins on our '
+                             'defense half (🧪 all-game overrides)')
             time.sleep(15)
             continue
         try:

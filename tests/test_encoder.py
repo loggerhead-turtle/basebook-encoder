@@ -2009,6 +2009,7 @@ def test_comms_cloud_voice_subscriber(monkeypatch, tmp_path):
     # and leave when it ends — an always-connected box burns ~43k
     # min/month idling, a plan tier by itself
     assert "if not STATE.get('voice_wanted'):" in src
+    assert 'cloud voice standing by' in src     # the gate names itself
     assert 'leave_when_game_ends' in src
     # older clouds don't send voice_wanted — game presence is the
     # fallback so an un-updated site keeps the previous behavior
