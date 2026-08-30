@@ -2020,6 +2020,9 @@ def test_comms_cloud_voice_subscriber(monkeypatch, tmp_path):
     assert 'threading.Thread(target=writer' in src
     assert 'q.get_nowait()' in src              # drop-oldest, keep now
     assert 'await asyncio.to_thread(_route_to_bud)' in src
+    # the absolute ceiling: no session outlives 5 h whatever the
+    # signals say — the last backstop against unbounded minutes
+    assert 'time.time() - t0 > 5 * 3600' in src
     # older clouds don't send voice_wanted — game presence is the
     # fallback so an un-updated site keeps the previous behavior
     assert "d.get('voice_wanted',\n" in src or \
