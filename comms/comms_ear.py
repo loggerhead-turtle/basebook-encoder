@@ -5,7 +5,7 @@ Runs on the SAME Pi that already shows the play-card board: it reuses
 the device key the Pi got when you activated it (/etc/playcall.env), so
 there is nothing new to pair with the cloud. It polls
 /api/sk/device/comms, finds the team's live game by itself, and SPEAKS
-every called pitch ("Curveball — down and away", batter-true in/away)
+every called pitch ("Curveball — down, right hand side"; absolute sides)
 into a Bluetooth earpiece paired to the Pi. Coach push-to-talk clips
 play as recorded audio. PRIVATE AUDIO ONLY — never an open speaker:
 pitch calls read aloud at the backstop belong to the other dugout too.
@@ -552,9 +552,11 @@ def call_text(c, zones):
         bits.append(c['pitch_type'])
     loc = zones.get(c.get('location') or '')
     if loc:
-        if c.get('bats') == 'L':      # batter-true: in/away swap for a lefty
-            loc = ' '.join('away' if w == 'in' else 'in' if w == 'away'
-                           else w for w in loc.split(' '))
+        # ABSOLUTE sides now — 'left hand side' is the catcher's left,
+        # whoever bats. The old batter-true in/away swap made every
+        # call depend on the coach keeping the batter's handedness set
+        # (field report), so the vocabulary moved to sides that never
+        # flip and this function stopped rewording anything.
         bits.append(loc)
     return ' — '.join(bits)
 
