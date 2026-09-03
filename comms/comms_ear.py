@@ -615,14 +615,23 @@ def poll_loop():
                     STATE['spoken'] += 1
                     say(txt)
             primed = True
-        # pacing = what we're waiting for: idle box → nothing to speak,
-        # check for a game every 8 s; live voice link up → calls arrive
-        # over the data channel instantly, the poll is just the net
+        # pacing = what we're waiting for. The SERVER names it (next_poll:
+        # 1.5 s live or warming up, 60 s with nothing on) so the cadence
+        # is retuned in one place and reaches every box in the field; an
+        # older server without the hint gets the old guesses. Live voice
+        # link up → calls arrive over the data channel instantly, the
+        # poll is just the net.
         nap = POLL_S
+        try:
+            np_ = float(d.get('next_poll') or 0)
+        except (TypeError, ValueError):
+            np_ = 0
         if not d.get('game'):
-            nap = 8.0
+            nap = max(POLL_S, min(900.0, np_)) if np_ else 8.0
         elif str(RTC_STATE.get('s', '')).startswith('🎙'):
             nap = POLL_S * 4
+        elif np_:
+            nap = max(1.0, min(30.0, np_))
         time.sleep(nap)
 
 

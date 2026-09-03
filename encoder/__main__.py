@@ -89,6 +89,26 @@ def main():
     from . import radar
     _radar = radar.RadarService(link, cfg_load=config.load)
     _radar.start_thread()
+
+    # The bug feed polls at full speed only while the FIELD is active:
+    # video is arriving at MediaMTX, or the radar gun has been heard in
+    # the last 10 minutes (a radar-only day has no video and no live
+    # book, but somebody is standing at the field). Otherwise the box
+    # follows the server's cadence and sleeps between games.
+    def _field_active():
+        try:
+            if link.ingest_status().get('connected'):
+                return True
+        except Exception:
+            pass
+        try:
+            hs = _radar.health().get('gun_heard_s')
+            if hs is not None and float(hs) < 600:
+                return True
+        except Exception:
+            pass
+        return False
+    sender.active_fn = _field_active
     # the heartbeat carries radar health so the SITE can show a dark
     # board / a collapsed parse rate without anyone SSHing in
     link.radar_health = _radar.health

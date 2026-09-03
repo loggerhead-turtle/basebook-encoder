@@ -38,6 +38,7 @@ import signal
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -757,10 +758,26 @@ class Sender:
         self.ndi_send = None
         self.ndi_frame = None
         self.img = self._render(PLACEHOLDER_BUG, None)
+        # ── cadence ──
+        # The feed answers every poll with `next_poll` (1 s live, 5 s near
+        # first pitch, up to 15 min asleep) and an ETag. Ignoring both —
+        # a fixed 1 s ask, 86,400 a day, each answered with the whole
+        # game row — was ~90% of the cloud database's egress bill
+        # (Sep 2026). `active_fn`, when set, says whether THIS box is at
+        # a field right now (video flowing, or the radar gun talking);
+        # while it is, the box asks at full speed regardless of the
+        # hint, so a radar-only day or an off-schedule game never waits
+        # on the server's schedule to notice.
+        self.etag = None
+        self.next_poll = None
+        self.active_fn = None
+        self._active_cache = (0.0, False)
 
     def set_feed(self, url):
         self.feed = url
         self.last_seq = None      # force a re-render from the new feed
+        self.etag = None
+        self.next_poll = None
 
     def _render(self, bug, theme):
         img = render_bug(bug, self.pos, self.scale, self.layout, theme)
@@ -771,14 +788,59 @@ class Sender:
         return img
 
     def fetch(self):
-        with urllib.request.urlopen(self.feed, timeout=6) as r:
-            return json.loads(r.read().decode())
+        """The feed's frame, or None when the server says 304 (nothing
+        changed since the ETag we sent — the answer is a header, not a
+        body, and costs the cloud nothing)."""
+        headers = {'If-None-Match': self.etag} if self.etag else {}
+        req = urllib.request.Request(self.feed, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=6) as r:
+                self.etag = r.headers.get('ETag') or self.etag
+                return json.loads(r.read().decode())
+        except urllib.error.HTTPError as e:
+            if e.code == 304:
+                return None
+            raise
+
+    def field_active(self):
+        """Is this box at a field right now? Asked at most every 5 s —
+        the answer costs a local HTTP call to MediaMTX."""
+        if self.active_fn is None:
+            return False
+        at, val = self._active_cache
+        now = time.monotonic()
+        if now - at < 5.0:
+            return val
+        try:
+            val = bool(self.active_fn())
+        except Exception:
+            val = False
+        self._active_cache = (now, val)
+        return val
+
+    def cadence(self):
+        """Seconds until the next ask: full speed while the field is
+        active, else whatever the server said (bounded 1 s … 15 min),
+        else the configured poll."""
+        if self.field_active():
+            return self.poll
+        try:
+            np = float(self.next_poll or 0)
+        except (TypeError, ValueError):
+            np = 0
+        if np > 0:
+            return max(self.poll, min(900.0, np))
+        return self.poll
 
     def poll_once(self):
         """One poll cycle; separated from the loop for testability."""
         if not self.feed:
             return False
         bug = self.fetch()
+        if bug is None:                      # 304: nothing changed
+            return False
+        if isinstance(bug, dict) and bug.get('next_poll') is not None:
+            self.next_poll = bug.get('next_poll')
         layout, pos, scale, bw, theme = resolve_look(
             bug, self.default_pos, self.default_layout)
         theme_sig = json.dumps(theme, sort_keys=True) if theme else None
@@ -816,7 +878,15 @@ class Sender:
                 self.poll_once()
             except Exception as e:
                 print(f'feed error (retrying): {e}', file=sys.stderr)
-            time.sleep(self.poll)
+            # a long sleep is taken in short slices so a field that wakes
+            # up (stream starts, gun powers on) is noticed within seconds
+            # rather than at the end of a 15-minute nap
+            nap = self.cadence()
+            until = time.monotonic() + nap
+            while self.running and time.monotonic() < until:
+                time.sleep(min(2.0, max(0.0, until - time.monotonic())))
+                if nap > 2.0 and self.field_active():
+                    break
 
     # ── NDI output (or PNG files in fake mode) ───────────────────────────────
     def ndi_init(self):
