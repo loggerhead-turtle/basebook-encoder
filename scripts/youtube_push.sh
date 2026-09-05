@@ -42,16 +42,26 @@ PUSH_URL="${YT_URL%/}/${YT_KEY}"
 
 while true; do
     # Probed fresh every attempt — the source can change between sessions
-    # (Mevo one game, a phone the next). RTSP sees the true track list.
+    # (Mevo one game, a phone the next). RTSP sees the true track list;
+    # MediaMTX's local RTMP read leg silently DROPS what RTMP can't carry
+    # (Opus audio, H.265 video — 'skipping track (H265)'), so RTMP is
+    # used only when BOTH tracks are RTMP-safe (H.264 + AAC).
     ACODEC="$(ffprobe -v error -rtsp_transport tcp -select_streams a:0 \
         -show_entries stream=codec_name -of csv=p=0 \
         "${RTSP_IN}" 2>/dev/null)"
+    VCODEC="$(ffprobe -v error -rtsp_transport tcp -select_streams v:0 \
+        -show_entries stream=codec_name -of csv=p=0 \
+        "${RTSP_IN}" 2>/dev/null)"
     if [[ -z "$ACODEC" || "$ACODEC" == "aac" ]]; then
-        INPUT_ARGS=(-rw_timeout 10000000 -i "$RTMP_IN")
         AUDIO_ARGS=(-c:a copy)
     else
-        INPUT_ARGS=(-rtsp_transport tcp -i "$RTSP_IN")
         AUDIO_ARGS=(-c:a aac -b:a 128k -ar 48000)
+    fi
+    if [[ ( -z "$ACODEC" || "$ACODEC" == "aac" ) \
+          && ( -z "$VCODEC" || "$VCODEC" == "h264" ) ]]; then
+        INPUT_ARGS=(-rw_timeout 10000000 -i "$RTMP_IN")
+    else
+        INPUT_ARGS=(-rtsp_transport tcp -i "$RTSP_IN")
     fi
 
     ffmpeg -hide_banner -loglevel warning \

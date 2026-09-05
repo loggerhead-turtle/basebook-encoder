@@ -43,16 +43,35 @@ def rtsp_in(cfg):
     return f"rtsp://127.0.0.1:8554/live/{cfg['local_ingest_key']}"
 
 
-def probe_audio_codec(cfg, runner=None):
-    """Audio codec of the currently-published stream via loopback RTSP
-    (RTSP sees the true track list; RTMP would just drop an Opus track).
-    Empty string when nobody is publishing yet."""
+def probe_codecs(cfg, runner=None):
+    """(video, audio) codecs of the currently-published stream via loopback
+    RTSP (RTSP sees the true track list; RTMP silently DROPS any track it
+    cannot carry — an Opus audio track, and H.265 video: MediaMTX logs
+    'skipping track (H265)' and hands the reader audio only). Both empty
+    when nobody is publishing yet."""
     runner = runner or system.run
     r = runner(['ffprobe', '-v', 'error', '-rtsp_transport', 'tcp',
-                '-select_streams', 'a:0', '-show_entries',
-                'stream=codec_name', '-of', 'csv=p=0', rtsp_in(cfg)],
+                '-show_entries', 'stream=codec_type,codec_name',
+                '-of', 'json', rtsp_in(cfg)],
                timeout=15)
-    return (r.stdout or '').strip() if r.returncode == 0 else ''
+    if r.returncode != 0:
+        return '', ''
+    try:
+        streams = json.loads(r.stdout or '{}').get('streams') or []
+    except (ValueError, AttributeError):
+        return '', ''
+    vcodec = acodec = ''
+    for s in streams:
+        if s.get('codec_type') == 'video' and not vcodec:
+            vcodec = s.get('codec_name') or ''
+        elif s.get('codec_type') == 'audio' and not acodec:
+            acodec = s.get('codec_name') or ''
+    return vcodec, acodec
+
+
+def probe_audio_codec(cfg, runner=None):
+    """Kept for parity with the shell script's audio-only probe."""
+    return probe_codecs(cfg, runner)[1]
 
 
 def push_bitrate(cfg, hw=None):
@@ -90,13 +109,22 @@ def push_codec(cfg, caps=None):
     return 'hevc' if caps.get('hevc') else 'h264'
 
 
-def build_ffmpeg_cmd(cfg, acodec, push_url, hw=None, caps=None):
-    if not acodec or acodec == 'aac':
+def build_ffmpeg_cmd(cfg, acodec, push_url, hw=None, caps=None, vcodec=''):
+    # The INPUT leg must carry every track. Loopback RTMP only carries
+    # H.264 + AAC — MediaMTX drops anything else from an RTMP read
+    # ('skipping track (H265)'), which handed ffmpeg an audio-only
+    # stream from an HEVC camera and crash-looped the push while the
+    # local ingest was perfectly healthy. So: RTMP only when BOTH tracks
+    # are RTMP-safe; any other camera (HEVC video, Opus audio) is read
+    # over loopback RTSP, which carries the true track list.
+    rtmp_safe = (not acodec or acodec == 'aac') \
+        and (not vcodec or vcodec == 'h264')
+    if rtmp_safe:
         input_args = ['-rw_timeout', '10000000', '-i', rtmp_in(cfg)]
-        audio_args = ['-c:a', 'copy']
     else:
         input_args = ['-rtsp_transport', 'tcp', '-i', rtsp_in(cfg)]
-        audio_args = ['-c:a', 'aac', '-b:a', '128k', '-ar', '48000']
+    audio_args = (['-c:a', 'copy'] if not acodec or acodec == 'aac'
+                  else ['-c:a', 'aac', '-b:a', '128k', '-ar', '48000'])
     kbps = push_bitrate(cfg, hw=hw)
     if kbps:
         # QuickSync via VA-API: decode on CPU (cheap), upload frames to
@@ -184,8 +212,8 @@ class YouTubePusher:
         if not url or not cfg.get('youtube', {}).get('key'):
             self.status.write(False)
             return 0
-        acodec = probe_audio_codec(cfg, self.runner)
-        cmd = build_ffmpeg_cmd(cfg, acodec, url)
+        vcodec, acodec = probe_codecs(cfg, self.runner)
+        cmd = build_ffmpeg_cmd(cfg, acodec, url, vcodec=vcodec)
         kbps = push_bitrate(cfg)
         want = int(cfg.get('push_bitrate_kbps') or 0)
         if want > 0 and not kbps:
@@ -198,7 +226,17 @@ class YouTubePusher:
                 and codec != 'hevc':
             log.info('push_codec=hevc configured but this box cannot '
                      'encode/mux HEVC — transcoding to H.264 instead')
-        log.info(f"push start (audio={acodec or 'assume-aac'}, video="
+        if vcodec and vcodec != 'h264' and not kbps:
+            # copying non-H.264 into flv needs enhanced-RTMP muxing; a
+            # too-old ffmpeg will fail here, so leave a breadcrumb that
+            # names the camera codec instead of a bare reconnect loop
+            log.info(f'camera sends {vcodec} and no transcode is '
+                     'configured — copying it to YouTube as-is (needs '
+                     'an enhanced-RTMP-capable ffmpeg)')
+        log.info('push start ('
+                 + f"in={vcodec or 'unknown'}/{acodec or 'assume-aac'}"
+                 + (' via rtsp' if '-rtsp_transport' in cmd else ' via rtmp')
+                 + ', video='
                  + (f'{kbps}k {codec} transcode' if kbps else 'copy') + ')')
         started = time.monotonic()
         state = {}

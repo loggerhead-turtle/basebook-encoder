@@ -2403,3 +2403,58 @@ def test_comms_ear_accepts_the_encoders_pass(monkeypatch):
     assert mod._enc_token_ok('') is False
     monkeypatch.setenv('PLAYCALL_API_KEY', 'different')
     assert mod._enc_token_ok(tok) is False
+
+
+# Field report (Maeser Prep, N150 v1.2.52): camera sending H.265 + AAC,
+# ingest healthy at 3.7 Mbps, but the push crash-looped every ~15 s and
+# YouTube refused GO LIVE with 'stream inactive'. The input leg chose
+# loopback RTMP because the AUDIO was AAC — and MediaMTX drops H.265
+# from an RTMP read ('skipping track 1 (H265)'), so ffmpeg pushed an
+# audio-only stream. The input choice must consider BOTH tracks.
+
+def test_an_hevc_camera_is_read_over_rtsp():
+    from encoder import youtube_push as yp
+    cfg = {'local_ingest_key': 'k', 'push_bitrate_kbps': 3000,
+           'push_codec': 'hevc'}
+    cmd = yp.build_ffmpeg_cmd(cfg, 'aac', 'rtmp://yt/x', hw='vaapi',
+                              caps={'h264': True, 'hevc': True},
+                              vcodec='hevc')
+    assert '-rtsp_transport' in cmd            # video survives the read
+    assert 'rtsp://127.0.0.1:8554/live/k' in cmd
+    assert 'hevc_vaapi' in cmd                 # …and transcodes to HEVC
+    # AAC audio still copies — the RTSP hop does not force a re-encode
+    assert ['-c:a', 'copy'] == cmd[cmd.index('-c:a'):cmd.index('-c:a') + 2]
+
+
+def test_an_h264_camera_keeps_the_rtmp_copy_path():
+    """The battle-tested default is untouched: H.264 + AAC (Mevo) still
+    reads over loopback RTMP, byte-identical copy."""
+    from encoder import youtube_push as yp
+    cfg = {'local_ingest_key': 'k'}
+    for vcodec in ('', 'h264'):                # '' = probe saw nobody yet
+        cmd = yp.build_ffmpeg_cmd(cfg, 'aac', 'rtmp://yt/x', hw='',
+                                  vcodec=vcodec)
+        assert 'rtmp://127.0.0.1:1935/live/k' in cmd
+        assert '-rtsp_transport' not in cmd
+        assert cmd[cmd.index('-c:v') + 1] == 'copy'
+
+
+def test_probe_codecs_reads_both_tracks_and_fails_closed():
+    from encoder import youtube_push as yp
+
+    class _R:
+        def __init__(self, rc, out):
+            self.returncode, self.stdout = rc, out
+    ok = json.dumps({'streams': [
+        {'codec_type': 'video', 'codec_name': 'hevc'},
+        {'codec_type': 'audio', 'codec_name': 'aac'}]})
+    cfg = {'local_ingest_key': 'k'}
+    assert yp.probe_codecs(cfg, lambda c, **kw: _R(0, ok)) == ('hevc', 'aac')
+    # audio-only publisher, ffprobe failure, junk: all degrade to ''
+    aud = json.dumps({'streams': [{'codec_type': 'audio',
+                                   'codec_name': 'opus'}]})
+    assert yp.probe_codecs(cfg, lambda c, **kw: _R(0, aud)) == ('', 'opus')
+    assert yp.probe_codecs(cfg, lambda c, **kw: _R(1, '')) == ('', '')
+    assert yp.probe_codecs(cfg, lambda c, **kw: _R(0, 'junk')) == ('', '')
+    # the shell-parity wrapper still answers audio-only
+    assert yp.probe_audio_codec(cfg, lambda c, **kw: _R(0, ok)) == 'aac'
