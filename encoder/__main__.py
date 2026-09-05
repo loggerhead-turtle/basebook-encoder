@@ -5,11 +5,11 @@ Boot decision:
   1. Zero-touch preconfig on the boot partition → apply + delete it.
   2. Unconfigured → provisioning hotspot + captive portal (blocks; the
      portal exits the process when done and systemd restarts us configured).
-  3. Configured → start the scorebug sender + local web app + cloud link
-     + offline watchdog threads and run forever.
+  3. Configured → start the local web app + cloud link + radar + offline
+     watchdog threads and run forever.
 
-SCOREBUG_FAKE=1 runs the whole stack on a laptop: no AP, no systemctl, the
-scorebug renders to PNG files instead of NDI.
+SCOREBUG_FAKE=1 runs the whole stack on a laptop: no AP, no systemctl, no
+hardware calls.
 """
 
 import logging
@@ -18,7 +18,7 @@ import sys
 import threading
 import time
 
-from . import __version__, cloud_link, config, provisioning, scorebug
+from . import __version__, cloud_link, config, provisioning
 from . import system, web
 
 log = logging.getLogger('encoder')
@@ -75,12 +75,7 @@ def main():
     except Exception:
         log.exception('storage hardening skipped')
 
-    sender = scorebug.Sender(feed=cfg['cloud'].get('feed_url') or None,
-                             layout='bar', fake=fake)
-    sender.bandwidth = cfg.get('bandwidth', 0)
-    sender.start_threads()
-
-    link = cloud_link.CloudLink(on_feed_change=sender.set_feed)
+    link = cloud_link.CloudLink()
     link.start_threads()
 
     # Stalker radar capture: idles silently until a USB-RS232 adapter (and
@@ -90,28 +85,18 @@ def main():
     _radar = radar.RadarService(link, cfg_load=config.load)
     _radar.start_thread()
 
-    # The bug feed polls at full speed only while the FIELD is active:
-    # video is arriving at MediaMTX, or the radar gun has been heard in
-    # the last 10 minutes (a radar-only day has no video and no live
-    # book, but somebody is standing at the field). Otherwise the box
-    # follows the server's cadence and sleeps between games.
-    def _field_active():
-        try:
-            if link.ingest_status().get('connected'):
-                return True
-        except Exception:
-            pass
-        try:
-            hs = _radar.health().get('gun_heard_s')
-            if hs is not None and float(hs) < 600:
-                return True
-        except Exception:
-            pass
-        return False
-    sender.active_fn = _field_active
     # the heartbeat carries radar health so the SITE can show a dark
     # board / a collapsed parse rate without anyone SSHing in
     link.radar_health = _radar.health
+
+    # Pocket Radar Smart Coach over Bluetooth LE: a separate service on
+    # purpose — the serial pipeline above stays untouched whether this
+    # one runs, idles (no bleak / no BT adapter), or dies. Same cloud
+    # endpoint, same display-only invariant. See encoder/smart_coach.py.
+    from . import smart_coach
+    _scoach = smart_coach.SmartCoachService(link, cfg_load=config.load)
+    _scoach.start_thread()
+    link.ble_radar_health = _scoach.health
 
     # Clip cutter: systemd normally runs it as its own unit, but a box
     # installed before that unit existed never got it — self-update
@@ -141,12 +126,11 @@ def main():
                 threading.Thread(target=_clipper.Clipper().run_forever,
                                  daemon=True).start()
             except Exception:
-                # a broken cutter must never take down the scorebug,
-                # the web app, or the stream — but it must be VISIBLE
+                # a broken cutter must never take down the web app or
+                # the stream — but it must be VISIBLE
                 log.exception('in-process clipper failed to start')
 
-    threading.Thread(target=web.serve,
-                     kwargs={'cloud': link, 'sender': sender},
+    threading.Thread(target=web.serve, kwargs={'cloud': link},
                      daemon=True).start()
 
     if not fake and cfg.get('network_managed', True) is not False:
@@ -164,7 +148,6 @@ def main():
                          daemon=True).start()
 
     def stop(*a):
-        sender.running = False
         link.running = False
         sys.exit(0)
     signal.signal(signal.SIGINT, stop)

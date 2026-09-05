@@ -37,7 +37,6 @@ DEFAULTS = {
     # encoder.activation spends it and blanks this. Also the landing spot
     # for a code taken off the boot partition of a prebuilt image.
     'pending_code': '',
-    'bandwidth': 0,
     # YouTube push bitrate, kbps. 0 = push the camera's own stream
     # untouched (the only mode a Pi 5 has — it owns no video encoder).
     # On a box with QuickSync (N100/N150), a non-zero value transcodes

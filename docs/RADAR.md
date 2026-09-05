@@ -200,6 +200,48 @@ male and female serial heads and Type-C for power.
 
 ---
 
+## Pocket Radar Smart Coach (BLE)
+
+The Smart Coach (SR1100) has **no wired data output** — its micro-USB
+port is power and firmware updates only. Readings leave the gun
+exclusively as Bluetooth LE notifications to the Pocket Radar phone
+app, so the box runs a second, independent capture service
+(`encoder/smart_coach.py`) that plays the app's role. It feeds the same
+cloud endpoint as the Stalker reader; the pad tile, score bug and
+play-by-play stamps don't know or care which gun spoke.
+
+Setup is one step: turn the gun on near the box with the phone app
+**closed**. Pocket Radar has never published the protocol, so the box
+learns it — it connects to anything advertising as a Pocket Radar,
+subscribes to every notifying characteristic, and decodes defensively;
+after three consistent readings it writes the gun's MAC,
+characteristic and wire format to config
+(`radar.smart_coach_mac/_char/_decode`) and reconnects straight to it
+on every boot. The settings page can pin the MAC up front and switch
+the capture off (`radar.smart_coach: off`).
+
+Know what you're trading against the Stalker:
+
+* **One number per pitch.** No deceleration curve (no plate speed), no
+  spin, no track shape — so no throw detection either: every in-band
+  reading files as a one-frame pitch, out-of-band as a ghost.
+* **One client at a time.** While the box holds the connection the
+  phone app cannot connect, and a gun already connected to a phone is
+  invisible to the box's scan. Close the app at the field.
+* **Unofficial protocol.** A firmware update could change the wire
+  format. The learned decode is pinned, so a change shows up loudly as
+  "undecoded payloads" in the journal rather than as silently wrong
+  speeds — press **Forget learned cables** on the settings page and let
+  the box re-learn.
+* **Needs `python3-bleak`** (the installer adds it; without it the
+  service logs one line and stays out of the way).
+
+Diagnose with `journalctl -u playcall-encoder | grep -i 'smart coach'`
+— the first raw payloads are logged hex-escaped, which settles the wire
+format in one glance, exactly like the serial reader's rx samples.
+
+---
+
 ## When there is no velo
 
 In order, cheapest first:

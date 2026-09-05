@@ -55,11 +55,10 @@ srt://<encoder-ip>:8890?streamid=publish:live/<your-key>
   uplink hiccups.
 * A **rolling 12-hour local recording** is always kept on the SD card —
   an uplink drop never loses footage.
-* The **scorebug** is published separately as an NDI source
-  ("PlayCall Bug") plus `http://playcall-encoder.local:8765/bug.png` /
-  `/bug.mjpg` — composite it in Mevo Studio / OBS / vMix *before* the
-  video reaches the encoder, and it's burned into the stream, the
-  recording, and every future clip.
+* The **score bug** is a browser overlay from the PlayCall site (Score
+  Bug Studio → Browser overlay) — composite it in Mevo Studio / OBS /
+  vMix *before* the video reaches the encoder, and it's burned into the
+  stream, the recording, and every future clip.
 
 ## Encoder settings recommendations
 

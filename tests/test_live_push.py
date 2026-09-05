@@ -83,6 +83,24 @@ def test_a_half_written_ticket_is_not_a_ticket():
 
 # ── ffmpeg ───────────────────────────────────────────────────────────────────
 
+def test_an_absurd_h264_level_is_corrected_without_re_encoding():
+    """mimoLive stamps Level 5.2 — the figure for 4K120 — on a 1080p30
+    stream. An Android decoder reads that as a demand it cannot meet and
+    refuses the codec: MSE threw bufferAppendError on the first append,
+    nothing buffered, and the angle was black on every phone while
+    ffmpeg, MediaMTX, the clipper and YouTube all played it happily
+    (5 Sep 2026). h264_metadata is a bitstream filter — it rewrites the
+    declaration, not a single frame."""
+    h264 = live_push.build_ffmpeg_cmd({'local_ingest_key': 'k'}, 'h264')
+    assert h264[h264.index('-bsf:v') + 1] == 'h264_metadata=level=auto'
+    assert h264[h264.index('-c') + 1] == 'copy'      # still no encoding
+    # the filter is H.264's; an HEVC camera must not be handed it
+    hevc = live_push.build_ffmpeg_cmd({'local_ingest_key': 'k'}, 'hevc')
+    assert '-bsf:v' not in hevc
+    # and nothing at all before the codec is known
+    assert '-bsf:v' not in live_push.build_ffmpeg_cmd({'local_ingest_key': 'k'})
+
+
 def test_ffmpeg_is_copy_mode_fragmented_mp4_off_rtsp():
     cmd = live_push.build_ffmpeg_cmd({'local_ingest_key': 'abc123'})
     assert '-c' in cmd and cmd[cmd.index('-c') + 1] == 'copy'

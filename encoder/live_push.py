@@ -128,7 +128,7 @@ def probe_codecs(cfg, runner=None):
     return vcodec, acodec
 
 
-def build_ffmpeg_cmd(cfg):
+def build_ffmpeg_cmd(cfg, vcodec=''):
     """Read the published feed, write fragmented MP4 on stdout.
 
     +empty_moov puts a self-contained init segment (ftyp+moov) first and
@@ -136,10 +136,21 @@ def build_ffmpeg_cmd(cfg):
     expects, and the same one MediaRecorder hands the phone. Fragmenting
     on keyframes keeps every fragment independently decodable, so a chunk
     boundary is never a broken segment.
+
+    h264_metadata=level=auto recomputes the LEVEL the bitstream declares
+    from what it actually contains. mimoLive stamps Level 5.2 — the
+    figure you would use for 4K120 — on a 1080p30 stream, and an Android
+    decoder reads that as a demand it cannot meet and refuses the codec
+    outright: MSE threw bufferAppendError on the first append, nothing
+    ever buffered, and the angle was a black rectangle on every phone
+    while ffmpeg, MediaMTX, the clipper and YouTube all played it
+    happily (5 Sep 2026). It is a bitstream filter, not an encoder: the
+    frames are untouched and it costs nothing.
     """
+    fix = ['-bsf:v', 'h264_metadata=level=auto'] if vcodec == 'h264' else []
     return ['ffmpeg', '-hide_banner', '-loglevel', 'warning',
             '-rtsp_transport', 'tcp', '-i', rtsp_in(cfg),
-            '-map', '0:v:0', '-map', '0:a:0?', '-c', 'copy',
+            '-map', '0:v:0', '-map', '0:a:0?', '-c', 'copy'] + fix + [
             '-f', 'mp4', '-movflags',
             '+frag_keyframe+empty_moov+default_base_moof',
             'pipe:1']
@@ -253,7 +264,7 @@ class LivePusher:
             return 0
 
         started = time.monotonic()
-        self.proc = subprocess.Popen(build_ffmpeg_cmd(cfg),
+        self.proc = subprocess.Popen(build_ffmpeg_cmd(cfg, vcodec),
                                      stdout=subprocess.PIPE,
                                      stderr=subprocess.PIPE)
         threading.Thread(target=self._drain_stderr, daemon=True).start()

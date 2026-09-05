@@ -80,11 +80,17 @@ fi
 # only used for the first-boot setup hotspot.
 apt-get update -qq
 apt-get install -y -qq ffmpeg curl git avahi-daemon hostapd dnsmasq \
-  python3 python3-pil python3-flask python3-numpy python3-serial \
-  bluez >/dev/null
+  python3 python3-flask python3-serial bluez >/dev/null
 # bluez: a radar gun on a serial→Bluetooth adapter becomes /dev/rfcomm0
 # and is read exactly like a cabled one. Costs nothing on a box that
 # never uses it — see scripts/radar_bt_bind.sh and docs/RADAR.md.
+# python3-bleak: BLE client for the Pocket Radar Smart Coach (its ONLY
+# data output is BLE — the USB port is power/firmware). Debian packages
+# it; a distro that doesn't gets the pip fallback below, and a box with
+# neither simply logs "Smart Coach capture disabled" and runs on.
+apt-get install -y -qq python3-bleak >/dev/null 2>&1 \
+  || pip3 install -q bleak --break-system-packages 2>/dev/null \
+  || echo "⚠ bleak not installed — Pocket Radar Smart Coach capture disabled (Stalker serial radar unaffected)"
 # USB Bluetooth dongles (the long-range comms option) are nearly all
 # Realtek inside — TP-Link UB500 included — and a netinst Debian ships
 # no firmware for them: the dongle enumerates as an hci with NO address
@@ -266,10 +272,6 @@ from encoder import config
 config.write_mediamtx_config(config.load())
 PY
 
-# ── Optional NDI bindings (scorebug falls back to MJPEG/PNG without them) ────
-pip3 install -q ndi-python --break-system-packages 2>/dev/null \
-  || echo "⚠ ndi-python not installed — scorebug serves MJPEG/PNG on :8765 only"
-
 # ── Hostname: playcall-encoder.local via avahi (only if still the default) ───
 CURRENT_HOST="$(hostname)"
 if [[ "$CURRENT_HOST" == "raspberrypi" || -z "$CURRENT_HOST" ]]; then
@@ -285,7 +287,7 @@ systemctl enable --now avahi-daemon >/dev/null 2>&1 || true
 # while the person who ran this is still looking at the screen.
 #
 # A failure here is NOT fatal: the encoder is installed and works locally:
-# RTMP ingest, scorebug, clips. Only the cloud link is missing, and it can
+# RTMP ingest, clips. Only the cloud link is missing, and it can
 # be re-run. Killing the install over it would waste the whole download.
 ACTIVATED=0
 if [[ -n "$ACT_CODE" ]]; then

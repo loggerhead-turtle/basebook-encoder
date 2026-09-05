@@ -1,24 +1,24 @@
-# PlayCall NDI Encoder
+# PlayCall Encoder
 
 Turn a Raspberry Pi + **any RTMP camera app** (Mevo, Larix, OBS, drones…)
-into a **YouTube streaming relay with a professional scorebug overlay**.
+into a **YouTube streaming relay with automatic play clips**.
 
 ```
 Your camera app ──RTMP over local Wi-Fi──►  PlayCall Encoder (this Pi)
                                               ├─ copy-mode push ──► YouTube Live
                                               ├─ rolling 12h local recording
-                                              └─ live scorebug (NDI + PNG/MJPEG)
+                                              └─ clip cutter ──► PlayCall cloud
                                                    ▲
-                              PlayCall cloud feed ─┘  (score, theme, assignment)
+                              PlayCall cloud ──────┘  (assignment, clip jobs, radar)
 ```
 
 * **No capture card, no streaming PC.** The Pi ingests the camera's RTMP
   stream and forwards it to YouTube byte-for-byte (copy mode — a Pi 4
   loafs).
-* **Professional scorebug.** Six layout families (`bar`, `tv`, `tvbox`,
-  `bottomline`, `lowerthird`, `sidestack`), themeable colors/fonts, driven
-  live from the PlayCall scorekeeper. Published as a real **NDI** source
-  plus an always-on PNG/MJPEG fallback.
+* **Score bug on the broadcast.** The scoreboard is a browser overlay
+  from the PlayCall site (Score Bug Studio) — add it in your camera app
+  or mixer *before* the video reaches the encoder, and it's burned into
+  the stream, the recording, and every clip.
 * **Survives bad internet.** Uplink drops only interrupt YouTube — the
   local recording never stops, and the push auto-reconnects.
 * **Multi-team.** Pair it to the PlayCall cloud and one encoder hops
@@ -41,8 +41,8 @@ Hardware: Raspberry Pi 4 or 5, Raspberry Pi OS Bookworm (64-bit).
    rtmp://playcall-encoder.local:1935/live/<your-key>
    ```
 
-3. That's it — the encoder pushes to your YouTube channel and overlays
-   your scorebug automatically.
+3. That's it — the encoder pushes to your YouTube channel and cuts a
+   clip of every play automatically.
 
 ## Quickstart B — self-install on your own Pi
 
@@ -147,8 +147,8 @@ way:
   cellular outage.
 * Manage the box's connectivity with your own tools (Speedify dashboard,
   `nmcli`, `raspi-config`); the encoder just uses whatever route exists.
-  Streaming, the scorebug, cloud pairing, and multi-team assignment all
-  work identically in this mode.
+  Streaming, clips, cloud pairing, and multi-team assignment all work
+  identically in this mode.
 
 ---
 
@@ -206,8 +206,8 @@ already signed in — no PIN. Or browse to
 **`http://playcall-encoder.local:8080`** from any device on the same
 network and enter the recovery PIN. From there: view live status (camera
 receiving? pushing to YouTube?), add/remove Wi-Fi networks, update the
-YouTube key, adjust scorebug bandwidth, rotate the ingest key, copy a
-support log bundle, or factory reset.
+YouTube key, rotate the ingest key, copy a support log bundle, or
+factory reset.
 
 **Locked out / network changed?** If the encoder has no working network
 connection on **any** interface (no Ethernet, no Wi-Fi, no route out) for
@@ -256,8 +256,8 @@ not both.
 
 **Do I need the PlayCall cloud?** No. Standalone, the encoder is a
 rock-solid RTMP→YouTube relay with a local recording. Pairing to the
-cloud adds the live scorebug feed, remote status, and multi-team
-assignment hopping.
+cloud adds automatic play clips, remote status, radar capture, and
+multi-team assignment hopping.
 
 **Does it transcode?** No — video is pushed to YouTube byte-for-byte
 (`-c:v copy`). What your camera sends is what YouTube gets, so set the
@@ -265,10 +265,10 @@ camera bitrate for your *uplink*, not your LAN. (Opus audio from
 WebRTC-ish sources is the one exception — it's transcoded to AAC because
 RTMP can't carry Opus.)
 
-**Where does the scorebug appear?** It's published as an NDI source
-("PlayCall Bug") and at `http://playcall-encoder.local:8765/bug.png` /
-`/bug.mjpg`. Composite it over your cameras in Mevo Studio / OBS / vMix —
-then it's baked into the stream *and* the recording.
+**Where does the score bug come from?** From the PlayCall site, not the
+box: Score Bug Studio gives you a transparent browser-overlay URL. Add
+it in Mevo Studio / OBS / vMix over your cameras — then it's baked into
+the stream, the recording, and every clip.
 
 **What if the internet dies mid-game?** YouTube viewers see a gap; the
 local recording doesn't. The push reconnects automatically when the
@@ -297,7 +297,6 @@ Raspberry Pi OS Trixie.
 | Camera app can't connect | Same Wi-Fi as the encoder? Try the IP-form URL (settings page shows it). Key spelled exactly? |
 | `playcall-encoder.local` doesn't resolve | Some Android builds lack mDNS — use the IP URL. Is avahi running? (`systemctl status avahi-daemon`) |
 | Status shows Receiving but YouTube is dark | YouTube key set and the broadcast created in YouTube Studio? Check `reconnects/5m` on the status page. |
-| Scorebug frozen | Is the feed URL assigned (cloud pairing) and reachable? See the log viewer. |
 | No clips appearing | Auto-clips enabled in Scorekeeper Settings? Box paired to the cloud? `systemctl status playcall-encoder-clipper` and `journalctl -u playcall-encoder-clipper -n 50`. |
 | Setup hotspot never appears | It only broadcasts when unconfigured or offline >90 s — and **never** on an adopted box (`network_managed: false`, e.g. Speedify/Ethernet installs). To force setup: factory reset from the settings page, or delete `/etc/playcall-encoder/config.json` and reboot. |
 | Anything weird | Settings page → **Copy logs for AI help** → paste the bundle into your support chat. Secrets are already redacted. |
@@ -326,8 +325,8 @@ Raspberry Pi OS Trixie.
 
 ## Developing / running on a laptop
 
-`SCOREBUG_FAKE=1` runs the entire stack with PNG output and zero hardware
-calls — see [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
+`SCOREBUG_FAKE=1` runs the entire stack with zero hardware calls — see
+[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 
 ## License
 

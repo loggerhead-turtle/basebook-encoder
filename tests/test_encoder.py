@@ -1,179 +1,12 @@
-"""Unit tests for the PlayCall NDI Encoder package (laptop-runnable:
-no NDI, no root, no network — see conftest.py sandbox fixture)."""
+"""Unit tests for the PlayCall Encoder package (laptop-runnable:
+no root, no network — see conftest.py sandbox fixture)."""
 
 import json
 import threading
 import time
 from pathlib import Path
 
-from encoder import cloud_link, config, provisioning, scorebug
-
-
-FAKE_BUG = {
-    'seq': 42,
-    'away': {'abbr': 'WAR', 'runs': 4, 'color': '#1f6feb'},
-    'home': {'abbr': 'SID', 'runs': 2, 'color': '#da3633'},
-    'inning': 5, 'half': 'top', 'balls': 3, 'strikes': 2, 'outs': 2,
-    'bases': [True, False, True],
-    'batter': {'name': 'Sam Turner', 'slot': 4, 'line': '2-3'},
-    'pitcher': {'name': 'Alex Reyes', 'pc': 67},
-    'conf': {'away': 2, 'home': 3},
-}
-
-
-def _theme(layout, **over):
-    t = {'version': 2, 'layout': layout, 'pos': 'bl', 'scale': 1.0,
-         'colors': {'bg': '#101418', 'accent': '#e0352b',
-                    'accent2': '#f5c518', 'text': '#ffffff'},
-         'font': 'oswald',
-         'show': {'pitchcount': True, 'outs': True, 'count': True,
-                  'bases': True, 'inning': True}}
-    t.update(over)
-    return t
-
-
-def _render_with_theme(layout):
-    bug = dict(FAKE_BUG, theme=_theme(layout))
-    lay, pos, scale, bw, theme = scorebug.resolve_look(bug)
-    return scorebug.render_bug(bug, pos, scale, lay, theme)
-
-
-def _sample(img):
-    """Downsampled pixel fingerprint for cheap image comparison."""
-    return img.resize((40, 24)).tobytes()
-
-
-# ── rendering ────────────────────────────────────────────────────────────────
-
-def test_all_layout_families_render_nonblank_and_distinct():
-    samples = {}
-    for layout in scorebug.LAYOUTS:
-        img = _render_with_theme(layout)
-        assert img.size == (scorebug.W, scorebug.H)
-        # Non-blank: the bug drew opaque pixels somewhere.
-        assert img.getchannel('A').getbbox() is not None, layout
-        opaque = sum(1 for a in img.getchannel('A').tobytes() if a > 200)
-        assert opaque > 500, f'{layout} rendered almost nothing'
-        samples[layout] = _sample(img)
-    # Pairwise distinct: every family must actually look different.
-    keys = list(samples)
-    for i, a in enumerate(keys):
-        for b in keys[i + 1:]:
-            assert samples[a] != samples[b], f'{a} and {b} render identically'
-
-
-def test_unknown_layout_falls_back_to_bar():
-    bug = dict(FAKE_BUG, theme=_theme('holographic-cube'))
-    lay, pos, scale, bw, theme = scorebug.resolve_look(bug)
-    assert lay == 'bar'
-    img = scorebug.render_bug(bug, pos, scale, lay, theme)
-    assert _sample(img) == _sample(_render_with_theme('bar'))
-
-
-def test_theme_parsed_defensively():
-    # Garbage everywhere → defaults, no exception.
-    t = scorebug.parse_theme({'layout': 12, 'pos': 'zz', 'scale': 'huge',
-                              'colors': 'red', 'font': ['x'],
-                              'show': {'outs': 0}})
-    assert t['layout'] == 'bar' and t['pos'] == 'bl' and t['scale'] == 1.0
-    assert t['show']['outs'] is False
-    # Not a dict at all → legacy (None) path.
-    assert scorebug.parse_theme(None) is None
-    assert scorebug.parse_theme('tv') is None
-
-
-def test_no_theme_uses_legacy_ndi_cfg_keys():
-    bug = dict(FAKE_BUG, ndi={'pos': 'tr', 'layout': 'tv',
-                              'scale': 1.2, 'bandwidth': 2})
-    lay, pos, scale, bw, theme = scorebug.resolve_look(bug)
-    assert (lay, pos, scale, bw, theme) == ('tv', 'tr', 1.2, 2, None)
-
-
-def test_theme_colors_change_the_pixels():
-    a = _render_with_theme('bar')
-    bug = dict(FAKE_BUG, theme=_theme('bar', colors={'bg': '#ffffff',
-                                                     'accent': '#000000',
-                                                     'accent2': '#111111',
-                                                     'text': '#000000'}))
-    lay, pos, scale, bw, theme = scorebug.resolve_look(bug)
-    b = scorebug.render_bug(bug, pos, scale, lay, theme)
-    assert _sample(a) != _sample(b)
-
-
-def test_show_flags_hide_elements():
-    on = _render_with_theme('bottomline')
-    bug = dict(FAKE_BUG, theme=_theme('bottomline',
-                                      show={'pitchcount': False,
-                                            'outs': False, 'count': False,
-                                            'bases': False, 'inning': False}))
-    lay, pos, scale, bw, theme = scorebug.resolve_look(bug)
-    off = scorebug.render_bug(bug, pos, scale, lay, theme)
-    assert _sample(on) != _sample(off)
-
-
-def test_sender_fake_mode_writes_png(tmp_path):
-    s = scorebug.Sender(feed='http://x/feed.json', fake=True,
-                        fake_dir=str(tmp_path))
-    s.fetch = lambda: dict(FAKE_BUG, theme=_theme('tvbox'))
-    assert s.poll_once() is True
-    assert s.layout == 'tvbox'
-    s.write_png(str(tmp_path / 'bug.png'))
-    assert (tmp_path / 'bug.png').stat().st_size > 0
-    # Same seq + same look → no re-render.
-    assert s.poll_once() is False
-    # A radar reading arriving BETWEEN plays must re-render: seq only
-    # moves when the book does, and skipping on seq alone kept the
-    # burned bug's velocity spot empty through a whole game while the
-    # app showed every pitch (field report).
-    s.fetch = lambda: dict(FAKE_BUG, theme=_theme('tvbox'),
-                           velo=91, rpm=2100)
-    assert s.poll_once() is True
-    assert s.poll_once() is False        # same reading → quiet again
-
-
-
-def test_sender_obeys_the_feeds_cadence_and_304s(tmp_path):
-    """The cloud names the cadence (next_poll: 1 s live, 5 s near first
-    pitch, up to 15 min asleep) and answers an unchanged frame with 304.
-    Asking every second regardless, 86,400 times a day with the whole
-    game row in every answer, was ~90% of the cloud database's egress
-    bill (Sep 2026)."""
-    s = scorebug.Sender(feed='http://x/feed.json', fake=True,
-                        fake_dir=str(tmp_path))
-    assert s.cadence() == 1.0                    # no hint yet: configured
-    s.fetch = lambda: dict(FAKE_BUG, theme=_theme('tvbox'), next_poll=900)
-    assert s.poll_once() is True
-    assert s.cadence() == 900.0                  # idle: sleep as told
-    s.fetch = lambda: dict(FAKE_BUG, theme=_theme('tvbox'), next_poll=0.2)
-    s.poll_once()
-    assert s.cadence() == 1.0                    # never faster than configured
-    s.fetch = lambda: None                       # a 304: nothing changed
-    assert s.poll_once() is False
-    assert s.cadence() == 1.0                    # …and the last hint stands
-    # a new feed forgets the ETag and the hint — no stale 304 against a
-    # different team's frames
-    s.etag = '"abc"'
-    s.set_feed('http://y/feed.json')
-    assert s.etag is None and s.next_poll is None
-
-
-def test_sender_runs_flat_out_while_the_field_is_active(tmp_path):
-    """Video flowing or the radar gun talking = somebody is at the field:
-    the box asks at full speed whatever the server's schedule says, so a
-    radar-only day (no video, no live book) never waits on a 15-minute
-    nap. The answer is cached ~5 s — it costs a local MediaMTX call."""
-    s = scorebug.Sender(feed='http://x/feed.json', fake=True,
-                        fake_dir=str(tmp_path))
-    s.fetch = lambda: dict(FAKE_BUG, theme=_theme('tvbox'), next_poll=900)
-    s.poll_once()
-    assert s.cadence() == 900.0
-    calls = []
-    s.active_fn = lambda: calls.append(1) or True
-    assert s.cadence() == 1.0
-    assert s.cadence() == 1.0 and len(calls) == 1   # cached, not re-asked
-    s._active_cache = (0.0, False)
-    s.active_fn = lambda: (_ for _ in ()).throw(RuntimeError('mediamtx down'))
-    assert s.cadence() == 900.0                  # a broken probe = not active
+from encoder import cloud_link, config, provisioning
 
 
 # ── config ───────────────────────────────────────────────────────────────────
@@ -197,9 +30,9 @@ def test_config_atomic_write_read():
 
 
 def test_config_merge_keeps_unknown_and_defaults():
-    config.save({'bandwidth': 3, 'extra': {'x': 1}})
+    config.save({'record_hours': 3, 'extra': {'x': 1}})
     cfg = config.load()
-    assert cfg['bandwidth'] == 3
+    assert cfg['record_hours'] == 3
     assert cfg['extra'] == {'x': 1}          # forward-compat passthrough
     assert cfg['youtube']['url']             # defaults filled in
 
@@ -545,7 +378,7 @@ def test_heartbeat_payload_shape():
     assert hb['state'] == 'pushing'
     assert set(hb) == {'state', 'ingest', 'push', 'cpu', 'temp',
                        'version', 'log_tail', 'hostname', 'ip', 'clips',
-                       'pin', 'rtmp_urls', 'radar', 'temp_max', 'storage',
+                       'pin', 'rtmp_urls', 'radar', 'ble_radar', 'temp_max', 'storage',
                        'transcode'}
     # a Pi (no hardware encoder) reports not-capable, copy target
     assert hb['transcode'] == {'capable': False, 'hevc': False,
@@ -2038,6 +1871,35 @@ def test_settings_page_embeds_comms_when_installed(monkeypatch):
     assert '<iframe' in html and ':8790/login?token=enc-' in html
     assert 'open full-screen' in html
 
+
+
+# ── the scorebug sender is gone ──────────────────────────────────────────────
+
+def test_settings_page_has_no_scorebug_bandwidth_form(monkeypatch):
+    """The box no longer renders or publishes a bug (the NDI sender and
+    its bandwidth slider are gone) — the settings page must not offer
+    a knob that drives nothing, and the old POST must not be a route."""
+    from encoder import web
+    provisioning.headless_setup()
+    monkeypatch.setattr(web.system, 'journal_tail', lambda *a, **k: [])
+    app = web.create_app()
+    client = app.test_client()
+    client.post('/login', data={'pin': config.load()['device']['pin']})
+    html = client.get('/').get_data(as_text=True)
+    assert 'Scorebug bandwidth' not in html
+    assert 'name="bandwidth"' not in html
+    assert client.post('/bandwidth', data={'bandwidth': 2}).status_code == 404
+    assert 'bandwidth' not in config.load()
+    assert '/bandwidth' not in {r.rule for r in app.url_map.iter_rules()}
+
+
+def test_entrypoint_starts_no_sender():
+    import inspect
+    from encoder import __main__ as entry
+    src = inspect.getsource(entry)
+    assert 'scorebug' not in src and 'Sender(' not in src
+    assert 'cloud_link.CloudLink()' in src
+    assert "kwargs={'cloud': link}" in src
 
 def test_comms_cloud_voice_subscriber(monkeypatch, tmp_path):
     """The ☁ cloud voice channel: the box polls the cloud for a

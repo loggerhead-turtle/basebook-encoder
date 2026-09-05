@@ -1,5 +1,5 @@
 [Unit]
-Description=PlayCall Encoder - scorebug + provisioning + settings + cloud link
+Description=PlayCall Encoder - provisioning + settings + cloud link + radar
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=0

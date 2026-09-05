@@ -8,8 +8,9 @@ Only active when config.cloud.api_key is set. Two loops:
            "bug_feed_url": str|null, "youtube_rtmp_url": str|null,
            "game_id": str|null,
            "live": {"ingest","token","game","angle"}|null}
-    On change: repoint the scorebug feed live (no restart), rewrite the
-    YouTube push target in config, and restart the push service. This is
+    On change: record the team's bug feed URL in config (any hook that
+    wants it is told live, no restart), rewrite the YouTube push target in
+    config, and restart the push service. This is
     how ONE encoder hops between teams (Warriors at 3, Sidewinders at 5)
     with zero user action.
 
@@ -69,7 +70,7 @@ class CloudLink:
                  on_feed_change=None, runner=None, http=None):
         self.cfg_load = cfg_load
         self.cfg_save = cfg_save
-        self.on_feed_change = on_feed_change   # e.g. sender.set_feed
+        self.on_feed_change = on_feed_change   # optional live hook
         self.runner = runner or system.run
         self.http = http or _http_json         # monkeypatch point for tests
         self.running = True
@@ -168,7 +169,7 @@ class CloudLink:
         feed = a.get('bug_feed_url') or ''
         cfg['cloud']['feed_url'] = feed
         if self.on_feed_change:
-            self.on_feed_change(feed)          # live — scorebug never restarts
+            self.on_feed_change(feed)          # live — nothing restarts
 
         restart_push = False
         yt_url = a.get('youtube_rtmp_url')
@@ -389,6 +390,10 @@ class CloudLink:
             # without a gun.
             'radar': (self.radar_health() if callable(
                 getattr(self, 'radar_health', None)) else None),
+            # Smart Coach (BLE) health, same idea — a separate key so
+            # the two guns never impersonate each other on the site
+            'ble_radar': (self.ble_radar_health() if callable(
+                getattr(self, 'ble_radar_health', None)) else None),
             'version': __version__,
             # So the site can link straight to this box's settings page
             # instead of assuming playcall-encoder.local resolves.

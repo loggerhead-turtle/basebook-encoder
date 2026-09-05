@@ -1,4 +1,4 @@
-"""PlayCall NDI Encoder — Pi-based RTMP relay + scorebug overlay."""
+"""PlayCall Encoder — Pi-based RTMP relay + YouTube push + clips + radar."""
 
 from pathlib import Path
 

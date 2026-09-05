@@ -34,9 +34,9 @@ Unassigned: `{"assigned": false, "team_id": null, "team_name": null,
 On any change to `(assigned, team_id, bug_feed_url, youtube_rtmp_url,
 game_id)`:
 
-1. **Scorebug repoints live** — the sender's feed URL is swapped in-process,
-   no restart. The next poll renders the new team's bug (with the new
-   team's theme, since the theme rides on the feed).
+1. **Feed URL recorded live** — `config.cloud.feed_url` is swapped
+   in-process, no restart (the box itself draws no bug; the URL is kept
+   for anything local that wants the new team's feed).
 2. **YouTube target rewritten** — `config.youtube` is updated from
    `youtube_rtmp_url` and `playcall-encoder-youtube` is restarted
    (`systemctl restart`), so the push reconnects to the new broadcast.

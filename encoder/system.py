@@ -14,7 +14,7 @@ import threading
 
 
 def fake_mode():
-    """SCOREBUG_FAKE=1 — run everything render-to-PNG, no hardware calls."""
+    """SCOREBUG_FAKE=1 — laptop/dev mode: no hardware calls, no subprocesses."""
     return os.environ.get('SCOREBUG_FAKE') == '1'
 
 

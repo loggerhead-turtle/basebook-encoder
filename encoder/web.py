@@ -9,7 +9,7 @@ Status: camera-ingest state, YouTube push state (+ cloud assignment when
 paired), a log viewer, and a "Copy logs for AI help" button that copies a
 structured plaintext bundle (config summary minus secrets + last 200 log
 lines + ffmpeg stderr tail). Settings: Wi-Fi networks, YouTube key,
-bandwidth, rotate local ingest key, factory reset.
+rotate local ingest key, factory reset.
 """
 
 import hmac
@@ -386,8 +386,33 @@ STATUS_PAGE = """<!doctype html><html><head>
         <option value="raw" {{ 'selected' if radar_cfg.get('display_format') == 'raw' }}>Raw passthrough</option>
       </select>
     </label>
+    <label>Pocket Radar Smart Coach (BLE)
+      <select name="smart_coach">
+        <option value="auto" {{ 'selected' if radar_cfg.get('smart_coach', 'auto') != 'off' }}>Auto (default)</option>
+        <option value="off" {{ 'selected' if radar_cfg.get('smart_coach') == 'off' }}>Off</option>
+      </select>
+    </label>
+    <label>Smart Coach MAC (optional pin)
+      <input name="smart_coach_mac" value="{{ radar_cfg.get('smart_coach_mac') or '' }}"
+             placeholder="blank — found by name, learned on first pitch">
+    </label>
     <button class="btn" type="submit">Save radar settings</button>
   </form>
+  <p class="hint">
+    {% if ble_radar and ble_radar.get('connected') %}
+      🟢 Smart Coach connected: {{ ble_radar.get('name') or ble_radar.get('device') or '?' }}
+      {% if ble_radar.get('heard_s') is not none %}
+        — last reading {{ ble_radar.get('heard_s')|int }}s ago
+      {% else %} — no reading yet (pull the trigger once){% endif %}
+      {% if ble_radar.get('learned') %} · gun learned ✓{% endif %}
+    {% elif ble_radar and ble_radar.get('bleak') is false %}
+      ⚫ Smart Coach: BLE support not installed on this box
+      (apt install python3-bleak)
+    {% elif ble_radar %}
+      ⚫ Smart Coach: not found — turn the gun on and make sure the
+      phone app is NOT connected (BLE allows one client at a time)
+    {% endif %}
+  </p>
   <form method="post" action="/radar/forget" style="margin-top:.5rem"
         onsubmit="return confirm('Forget the learned cable roles? The box re-learns them from the next real velocity.')">
     <button class="btn" type="submit">Forget learned cables</button>
@@ -438,19 +463,6 @@ STATUS_PAGE = """<!doctype html><html><head>
   </p>
   {% endif %}
   {% endif %}
-</div>
-
-<div class="card">
-  <h2>Scorebug bandwidth</h2>
-  <form method="post" action="/bandwidth">
-    <select name="bandwidth">
-      {% for lvl in bandwidth_levels %}
-      <option value="{{ loop.index0 }}"
-        {{ 'selected' if loop.index0 == bandwidth }}>{{ lvl.label }}</option>
-      {% endfor %}
-    </select>
-    <button class="btn" type="submit">Save</button>
-  </form>
 </div>
 
 <div class="card">
@@ -630,7 +642,7 @@ def live_push_view(cfg):
             'status': line}
 
 
-def create_app(cloud=None, sender=None):
+def create_app(cloud=None):
     app = Flask(__name__)
     app.secret_key = _session_secret()
 
@@ -760,7 +772,6 @@ def create_app(cloud=None, sender=None):
 
     @app.route('/')
     def index():
-        from .scorebug import BANDWIDTH_LEVELS
         cfg = config.load()
         ingest = cloud.ingest_status() if cloud else \
             {'connected': False, 'kbps': None}
@@ -781,7 +792,6 @@ def create_app(cloud=None, sender=None):
             managed=cfg.get('network_managed', True) is not False,
             yt_placeholder='(saved)' if cfg['youtube'].get('key')
             else 'xxxx-xxxx-xxxx-xxxx',
-            bandwidth=cfg.get('bandwidth', 0),
             record_hours=int(cfg.get('record_hours') or 12),
             live_push=live_push_view(cfg),
             hw_encoder=bool(system.hw_encoder()),
@@ -791,11 +801,13 @@ def create_app(cloud=None, sender=None):
             radar=(cloud.radar_health()
                    if callable(getattr(cloud, 'radar_health', None))
                    else None),
+            ble_radar=(cloud.ble_radar_health()
+                       if callable(getattr(cloud, 'ble_radar_health', None))
+                       else None),
             radar_cfg=(cfg.get('radar') or {}),
             comms=comms_status(),
             comms_tok=comms_token(cfg),
             cloud_base=(cfg.get('cloud') or {}).get('base_url', ''),
-            bandwidth_levels=BANDWIDTH_LEVELS,
             logs='\n'.join(config.redact_lines(system.journal_tail(60), cfg))
                  or '(no logs)')
 
@@ -976,6 +988,20 @@ def create_app(cloud=None, sender=None):
         rd['bluetooth_mac'] = mac
         if request.form.get('display_format') in ('speed', 'raw'):
             rd['display_format'] = request.form.get('display_format')
+        if request.form.get('smart_coach') in ('auto', 'off'):
+            rd['smart_coach'] = request.form.get('smart_coach')
+        sc_mac = (request.form.get('smart_coach_mac') or '').strip().upper()
+        if sc_mac and not _MAC_RE.match(sc_mac):
+            return redirect(url_for('index', err=(
+                'That is not a Bluetooth MAC — the Smart Coach pin looks '
+                'like AA:BB:CC:DD:EE:FF (bluetoothctl devices while the '
+                'gun is on)')))
+        if sc_mac != (rd.get('smart_coach_mac') or '').upper():
+            rd['smart_coach_mac'] = sc_mac
+            # a different gun means the learned wire format is someone
+            # else's — re-learn from its first pitch
+            rd.pop('smart_coach_char', None)
+            rd.pop('smart_coach_decode', None)
         cfg['radar'] = rd
         config.save(cfg)
         if mac != old_mac:
@@ -993,7 +1019,12 @@ def create_app(cloud=None, sender=None):
         the wrong adapter (new cable, clone IDs)."""
         cfg = config.load()
         rd = dict(cfg.get('radar') or {})
-        for k in ('port', 'display_port'):
+        for k in ('port', 'display_port',
+                  # the Smart Coach's learned identity is the same kind
+                  # of fact — a replaced gun re-learns from its first
+                  # pitch just like a replaced cable
+                  'smart_coach_mac', 'smart_coach_char',
+                  'smart_coach_decode'):
             rd.pop(k, None)
         cfg['radar'] = rd
         config.save(cfg)
@@ -1002,19 +1033,6 @@ def create_app(cloud=None, sender=None):
         return redirect(url_for('index', msg=(
             'Learned cables forgotten — the box re-learns them from the '
             'next real velocity')))
-
-    @app.route('/bandwidth', methods=['POST'])
-    def bandwidth():
-        try:
-            level = max(0, min(3, int(request.form.get('bandwidth', 0))))
-        except ValueError:
-            level = 0
-        cfg = config.load()
-        cfg['bandwidth'] = level
-        config.save(cfg)
-        if sender is not None:
-            sender.bandwidth = level
-        return redirect(url_for('index'))
 
     @app.route('/pin', methods=['GET', 'POST'])
     def set_pin():
@@ -1092,6 +1110,6 @@ def create_app(cloud=None, sender=None):
     return app
 
 
-def serve(cloud=None, sender=None, port=WEB_PORT):
-    app = create_app(cloud=cloud, sender=sender)
+def serve(cloud=None, port=WEB_PORT):
+    app = create_app(cloud=cloud)
     app.run(host='0.0.0.0', port=port, threaded=True, use_reloader=False)
