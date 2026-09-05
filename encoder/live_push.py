@@ -96,6 +96,38 @@ def read_target(path=None):
     return t
 
 
+def probe_codecs(cfg, runner=None):
+    """(video, audio) codecs of whatever is publishing right now, or two
+    empty strings when nobody is — which is how this leg knows to wait.
+
+    Deliberately self-contained rather than borrowed from youtube_push:
+    that module is the YouTube leg's business, its helpers differ between
+    the encoder release repo and the site repo, and an import of one of
+    them crash-looped this service on a box where the name was absent.
+
+    RTSP, not RTMP: MediaMTX's RTMP reader silently DROPS a track it
+    cannot carry (H.265 video, Opus audio), so RTMP would report an HEVC
+    camera as having no video at all.
+    """
+    runner = runner or system.run
+    r = runner(['ffprobe', '-v', 'error', '-rtsp_transport', 'tcp',
+                '-show_entries', 'stream=codec_type,codec_name',
+                '-of', 'json', rtsp_in(cfg)], timeout=15)
+    if getattr(r, 'returncode', 1) != 0:
+        return '', ''
+    try:
+        streams = json.loads(r.stdout or '{}').get('streams') or []
+    except (ValueError, AttributeError):
+        return '', ''
+    vcodec = acodec = ''
+    for st in streams:
+        if st.get('codec_type') == 'video' and not vcodec:
+            vcodec = st.get('codec_name') or ''
+        elif st.get('codec_type') == 'audio' and not acodec:
+            acodec = st.get('codec_name') or ''
+    return vcodec, acodec
+
+
 def build_ffmpeg_cmd(cfg):
     """Read the published feed, write fragmented MP4 on stdout.
 
@@ -250,7 +282,6 @@ class LivePusher:
         return time.monotonic() - started
 
     def _probe(self, cfg):
-        from .youtube_push import probe_codecs
         return probe_codecs(cfg, self.runner)
 
     def _drain_stderr(self):

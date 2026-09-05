@@ -12,6 +12,7 @@ Run: python -m pytest tests/test_live_push.py
 """
 
 import json
+import os
 import time
 from pathlib import Path
 
@@ -310,3 +311,50 @@ def test_self_update_enables_a_brand_new_unit(tmp_path, monkeypatch):
     # and the caller bounces it, before the box's own service goes last
     assert 'playcall-encoder-live' in system.UPDATE_UNITS
     assert system.UPDATE_UNITS[-1] == 'playcall-encoder'
+
+
+# ── the probe ────────────────────────────────────────────────────────────────
+
+def test_probe_reads_the_true_track_list_over_rtsp():
+    """Self-contained on purpose: importing youtube_push.probe_codecs
+    crash-looped the service on a box whose youtube_push predated that
+    helper (5 Sep 2026). This leg must not depend on the YouTube leg's
+    internals."""
+    seen = {}
+
+    class R:
+        returncode = 0
+        stdout = json.dumps({'streams': [
+            {'codec_type': 'video', 'codec_name': 'hevc'},
+            {'codec_type': 'audio', 'codec_name': 'aac'}]})
+
+    def runner(cmd, **kw):
+        seen['cmd'] = cmd
+        return R()
+    cfg = {'local_ingest_key': 'abc123'}
+    assert live_push.probe_codecs(cfg, runner) == ('hevc', 'aac')
+    assert '-rtsp_transport' in seen['cmd']            # RTMP drops HEVC/Opus
+    assert 'rtsp://127.0.0.1:8554/live/abc123' in seen['cmd']
+
+    class Bad:
+        returncode = 1
+        stdout = ''
+    assert live_push.probe_codecs(cfg, lambda *a, **k: Bad()) == ('', '')
+
+    class Junk:
+        returncode = 0
+        stdout = 'not json'
+    assert live_push.probe_codecs(cfg, lambda *a, **k: Junk()) == ('', '')
+
+
+def test_live_push_imports_nothing_from_the_youtube_leg():
+    """The guard for the bug above: prose may MENTION the YouTube leg, but
+    nothing here may import from it."""
+    import ast as _ast
+    src = open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), 'encoder', 'live_push.py')).read()
+    for node in _ast.walk(_ast.parse(src)):
+        if isinstance(node, _ast.ImportFrom):
+            assert 'youtube_push' not in (node.module or '')
+        elif isinstance(node, _ast.Import):
+            assert all('youtube_push' not in a.name for a in node.names)
