@@ -301,19 +301,21 @@ fi
 install -m 644 "$SRC/systemd/playcall-encoder.service"          /etc/systemd/system/
 install -m 644 "$SRC/systemd/playcall-encoder-mediamtx.service" /etc/systemd/system/
 install -m 644 "$SRC/systemd/playcall-encoder-youtube.service"  /etc/systemd/system/
+install -m 644 "$SRC/systemd/playcall-encoder-live.service"     /etc/systemd/system/
 install -m 644 "$SRC/systemd/playcall-encoder-clipper.service"  /etc/systemd/system/
 install -m 644 "$SRC/systemd/playcall-encoder-activate.service" /etc/systemd/system/
 install -m 644 "$SRC/systemd/playcall-encoder-radarbt.service"  /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable playcall-encoder playcall-encoder-mediamtx \
                  playcall-encoder-youtube playcall-encoder-clipper \
-                 playcall-encoder-activate >/dev/null
+                 playcall-encoder-live playcall-encoder-activate >/dev/null
 # Bluetooth radar binder: enabled on every box, exits 0 immediately when
 # no radar.bluetooth_mac is set. Enabling it here means a gun added later
 # needs one config value and a reboot, not an install.
 systemctl enable playcall-encoder-radarbt >/dev/null 2>&1 || true
 systemctl restart playcall-encoder-mediamtx playcall-encoder-youtube \
-                  playcall-encoder-clipper playcall-encoder
+                  playcall-encoder-clipper playcall-encoder-live \
+                  playcall-encoder
 
 # ── 🎧 coach comms rides along ───────────────────────────────────────────────
 # One box, one install: the comms ear (spoken pitch calls + the coach's

@@ -6,11 +6,19 @@ Only active when config.cloud.api_key is set. Two loops:
   * assignment poll (5 s): GET {base}/api/encoder/assignment (X-Api-Key)
         → {"assigned": bool, "team_id": str|null, "team_name": str|null,
            "bug_feed_url": str|null, "youtube_rtmp_url": str|null,
-           "game_id": str|null}
+           "game_id": str|null,
+           "live": {"ingest","token","game","angle"}|null}
     On change: repoint the scorebug feed live (no restart), rewrite the
     YouTube push target in config, and restart the push service. This is
     how ONE encoder hops between teams (Warriors at 3, Sidewinders at 5)
     with zero user action.
+
+    "live" is the 🎦 Multi-View ingest ticket — present only while this
+    box's team has a live game and the site has a stream server. It is
+    written straight through to /run/playcall-encoder/live_target.json on
+    every poll (encoder/live_push.py reads it there); the token inside is
+    re-minted each time, so it is deliberately NOT part of the change
+    signature that restarts services.
 
   * heartbeat (15 s): POST {base}/api/encoder/heartbeat (X-Api-Key)
         {"state": "idle|receiving|pushing",
@@ -29,8 +37,10 @@ cloud is down, on a dead uplink, or before pairing ever happened.
 
 import json
 import logging
+import os
 import threading
 import time
+import urllib.parse
 import urllib.request
 
 from . import __version__, config, system
@@ -89,7 +99,8 @@ class CloudLink:
     # ── assignment ───────────────────────────────────────────────────────────
     def poll_assignment_once(self):
         base, _ = self._cloud()
-        a = self.http(f'{base}/api/encoder/assignment',
+        a = self.http(f'{base}/api/encoder/assignment'
+                      f'?angle={urllib.parse.quote(self.live_angle())}',
                       headers=self._headers())
         self.last_ok = time.monotonic()        # cloud reachable
         if not isinstance(a, dict):
@@ -112,7 +123,35 @@ class CloudLink:
             self.running = False
             self.runner(['systemctl', 'poweroff'])
             return True
+        # Multi-View ticket → tmpfs, on EVERY poll rather than in
+        # handle_assignment: the token is re-minted each time and would
+        # otherwise churn that method's change signature every 5 seconds.
+        # After the shutdown check: a box on its way down needs no ticket.
+        self.write_live_target(a.get('live'))
         return self.handle_assignment(a)
+
+    def live_angle(self):
+        """The angle name this box publishes under ('main' unless the
+        settings page says otherwise)."""
+        lp = self.cfg_load().get('live_push') or {}
+        return str(lp.get('angle') or 'main')[:24]
+
+    def write_live_target(self, live):
+        """Hand the Multi-View ingest ticket to the live-push leg through
+        a tmpfs file. Written every poll (it carries a fresh token) and
+        blanked the moment the site stops offering one — a box whose game
+        ended stops publishing without anyone restarting anything."""
+        lp = self.cfg_load().get('live_push') or {}
+        if not lp.get('enabled', True) or not isinstance(live, dict):
+            live = None
+        path = config.state_dir() / 'live_target.json'
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix('.tmp')
+            tmp.write_text(json.dumps(live or {}))
+            os.replace(tmp, path)
+        except OSError:
+            pass
 
     def handle_assignment(self, a):
         """Apply an assignment response. Returns True when anything changed

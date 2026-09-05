@@ -58,6 +58,14 @@ DEFAULTS = {
     # this box's whole point is that a real storage failure gets
     # noticed. Turn it back off when the drive returns.
     'record_fallback_ok': False,
+    # 🎦 Multi-View: post this box's camera feed to the site's stream
+    # server as one angle, so it plays on the game's Multi-View page beside
+    # the phones. The site hands down the signed ingest ticket on the
+    # assignment poll; with no ticket (no stream server, or no live game)
+    # this leg sits idle, which is why it can default on. 'angle' is the
+    # name viewers see — one per box, so two boxes at one game do not
+    # collide.
+    'live_push': {'enabled': True, 'angle': 'main'},
     'version_check': {'url': '', 'enabled': True},
 }
 

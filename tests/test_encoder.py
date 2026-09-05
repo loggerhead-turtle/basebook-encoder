@@ -489,7 +489,8 @@ def test_assignment_change_triggers_repoint():
 
     def http(url, headers=None, payload=None, **kw):
         assert headers == {'X-Api-Key': 'k123'}
-        assert url == 'https://cloud/api/encoder/assignment'
+        # the box names the angle it wants to publish under (Multi-View)
+        assert url == 'https://cloud/api/encoder/assignment?angle=main'
         return dict(ASSIGNMENT)
 
     link = cloud_link.CloudLink(on_feed_change=feeds.append,
@@ -959,13 +960,14 @@ def test_web_update_button_and_route(monkeypatch):
     assert r.status_code == 302
     assert 'msg=' in r.headers['Location'] and '9.9.9' in r.headers['Location']
     for _ in range(300):                           # restart thread finishes
-        if len(restarted) == 5:
+        if len(restarted) == 6:
             break
         time.sleep(0.01)
     # Siblings first (comms rides along); this web app's unit LAST.
     assert restarted == [('restart', 'playcall-encoder-mediamtx'),
                          ('restart', 'playcall-encoder-youtube'),
                          ('restart', 'playcall-encoder-clipper'),
+                         ('restart', 'playcall-encoder-live'),
                          ('restart', 'playcall-comms'),
                          ('restart', 'playcall-encoder')]
 

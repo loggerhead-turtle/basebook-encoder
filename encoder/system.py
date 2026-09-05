@@ -47,7 +47,7 @@ INSTALL_DIR = '/opt/playcall-encoder'
 # goes LAST, so the siblings come up on new code before we kill ourselves
 # and systemd revives us on the new tree.
 UPDATE_UNITS = ('playcall-encoder-mediamtx', 'playcall-encoder-youtube',
-                'playcall-encoder-clipper',
+                'playcall-encoder-clipper', 'playcall-encoder-live',
                 # comms is bundled with the encoder; on a box that never
                 # installed it the restart fails quietly and costs nothing
                 'playcall-comms',
@@ -118,12 +118,20 @@ def self_update(repo_url=None, install_dir=None):
         sysd = os.path.join(src, 'systemd')
         if os.path.isdir(sysd) and not fake_mode():
             try:
+                units = []
                 for f in os.listdir(sysd):
                     if f.startswith('playcall-encoder') and \
                             f.endswith('.service'):
                         shutil.copy2(os.path.join(sysd, f),
                                      '/etc/systemd/system/')
+                        units.append(f[:-len('.service')])
                 systemctl('daemon-reload')
+                # A unit that did not exist at install time has never been
+                # enabled, so without this a NEW leg is copied in, restarted
+                # once by the caller, and then gone after the next reboot.
+                # Enabling is idempotent for the units already on.
+                for unit in units:
+                    systemctl('enable', unit)
             except OSError:
                 pass
         with open(os.path.join(src, 'VERSION')) as fh:

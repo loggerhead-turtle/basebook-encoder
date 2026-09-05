@@ -282,6 +282,23 @@ STATUS_PAGE = """<!doctype html><html><head>
 </div>
 
 <div class="card">
+  <h2>&#127910; Multi-View</h2>
+  <p class="hint">Post this box's camera feed to the site's stream server,
+    so it plays on the game's Multi-View page beside the phones — same
+    picture, no re-encode. It runs only while the team has a LIVE game and
+    the site has a stream server; otherwise it waits.
+    {% if live_push.status %}<br><b>{{ live_push.status }}</b>{% endif %}</p>
+  <form method="post" action="/livepush">
+    <label>Angle name (what viewers see)</label>
+    <input type="text" name="angle" value="{{ live_push.angle }}"
+           placeholder="main" maxlength="24">
+    <label><input type="checkbox" name="enabled" value="1"
+      {{ 'checked' if live_push.enabled }}> Send to the site's stream server</label>
+    <button class="btn" type="submit">Save Multi-View</button>
+  </form>
+</div>
+
+<div class="card">
   <h2>Recording retention</h2>
   <p class="hint">How long the rolling game recording (the source of every
     clip) stays on this box before pruning. 4 Mbps &asymp; 1.8 GB/h — keep
@@ -597,6 +614,22 @@ def _session_secret():
     return data
 
 
+def live_push_view(cfg):
+    """Angle, switch and a one-line state for the Multi-View card."""
+    from . import live_push
+    lp = cfg.get('live_push') or {}
+    st = live_push.status()
+    if st.get('connected'):
+        line = (f"Sending as '{st.get('angle')}' · {st.get('kbps', 0)} kbps"
+                + (f" · {st['backlog_ms'] // 1000}s behind"
+                   if st.get('backlog_ms', 0) >= 2000 else ''))
+    else:
+        line = st.get('reason') or ''
+    return {'enabled': lp.get('enabled', True) is not False,
+            'angle': live_push.safe_angle(lp.get('angle') or 'main'),
+            'status': line}
+
+
 def create_app(cloud=None, sender=None):
     app = Flask(__name__)
     app.secret_key = _session_secret()
@@ -750,6 +783,7 @@ def create_app(cloud=None, sender=None):
             else 'xxxx-xxxx-xxxx-xxxx',
             bandwidth=cfg.get('bandwidth', 0),
             record_hours=int(cfg.get('record_hours') or 12),
+            live_push=live_push_view(cfg),
             hw_encoder=bool(system.hw_encoder()),
             hw_hevc=bool(system.hw_encoders().get('hevc')),
             push_codec=cfg.get('push_codec') or 'h264',
@@ -854,6 +888,23 @@ def create_app(cloud=None, sender=None):
             config.save(cfg)
             system.systemctl('restart', 'playcall-encoder-youtube')
         return redirect(url_for('index'))
+
+    @app.route('/livepush', methods=['POST'])
+    def livepush():
+        from .live_push import safe_angle
+        cfg = config.load()
+        cfg['live_push'] = {
+            'enabled': bool(request.form.get('enabled')),
+            'angle': safe_angle(request.form.get('angle')),
+        }
+        config.save(cfg)
+        system.systemctl('restart', 'playcall-encoder-live')
+        log.info(f"multi-view push: "
+                 + ('on' if cfg['live_push']['enabled'] else 'off')
+                 + f" as '{cfg['live_push']['angle']}'")
+        return redirect(url_for('index', msg=(
+            f"Multi-View: sending as '{cfg['live_push']['angle']}'"
+            if cfg['live_push']['enabled'] else 'Multi-View: off')))
 
     @app.route('/retention', methods=['POST'])
     def retention():

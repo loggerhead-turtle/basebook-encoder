@@ -223,6 +223,35 @@ comes up fully configured with no hotspot step. See
 
 ---
 
+## 🎦 Multi-View — sending the camera to the site instead of (or beside) YouTube
+
+The box can post its camera feed to the site's own stream server, where it
+becomes one **angle** on the game's Multi-View page — rewindable, beside the
+phones, with the same play markers. It is the same picture the box records:
+copy mode end to end, no re-encode, no quality lost.
+
+Nothing to configure on the box beyond the angle name. The site hands down a
+signed ingest ticket on the assignment poll whenever **(a)** the team has a
+LIVE game and **(b)** the site has `LIVE_SERVER_URL` + `LIVE_SERVER_SECRET`
+set. No ticket, no push — which is why the leg ships enabled and stays
+harmless on boxes that will never use it.
+
+    Mevo / mimoLive / OBS ─RTMP or SRT→ MediaMTX ─loopback RTSP→ live_push
+                                                 └─→ recording + clips
+    live_push ─fragmented MP4 over HTTPS→ stream server ─HLS→ Multi-View page
+
+Settings page → **Multi-View**: the angle name viewers see (one per box, so
+two boxes at one game do not collide) and an on/off switch. The card shows
+the live state — angle, kbps, and how far behind the uplink is running.
+
+    systemctl status playcall-encoder-live      # is it pushing?
+    journalctl -u playcall-encoder-live -n 50   # why not
+
+YouTube is untouched by all this: the box's YouTube push keeps running on
+whatever key it has. Clear the key (or set the game's YouTube angle on the
+stream desk, which pushes from the *server* instead) when you want one and
+not both.
+
 ## FAQ
 
 **Do I need the PlayCall cloud?** No. Standalone, the encoder is a
