@@ -154,10 +154,41 @@ def probe_codecs(cfg, runner=None):
             vcodec = st.get('codec_name') or ''
         elif st.get('codec_type') == 'audio' and not acodec:
             acodec = st.get('codec_name') or ''
+    if acodec and not _audio_flows(cfg, runner):
+        # DECLARED is not the same as PRESENT, and the difference is
+        # fatal downstream. mimoLive announces an AAC track and sends no
+        # samples in it; ffmpeg copies the empty track, the server's HLS
+        # carries it, and a browser then builds an audio SourceBuffer
+        # that never fills. HTMLMediaElement.buffered is the INTERSECTION
+        # of the source buffers, so a full video track and an empty audio
+        # one leave the element with nothing playable anywhere: frames
+        # decode, playback stalls, and not one error is raised by
+        # anything. It cost a whole evening on 6 Sep 2026 and read as
+        # five different faults, none of them this one.
+        log.info('audio track is declared but carries no samples — '
+                 'dropping it rather than shipping a track that can '
+                 'never fill')
+        acodec = ''
     return vcodec, acodec
 
 
-def build_ffmpeg_cmd(cfg, vcodec=''):
+def _audio_flows(cfg, runner):
+    """Does the audio track actually carry samples? Asked separately
+    because the stream listing cannot answer it — a track with no data
+    still appears in the listing, with a codec name and everything."""
+    try:
+        r = runner(['ffprobe', '-v', 'error', '-rtsp_transport', 'tcp',
+                    '-select_streams', 'a:0', '-read_intervals', '%+3',
+                    '-show_entries', 'packet=pts_time', '-of', 'csv=p=0',
+                    rtsp_in(cfg)], timeout=20)
+    except Exception:
+        return True          # cannot tell → do not throw audio away
+    if getattr(r, 'returncode', 1) != 0:
+        return True
+    return bool((getattr(r, 'stdout', '') or '').strip())
+
+
+def build_ffmpeg_cmd(cfg, vcodec='', acodec=''):
     """Read the published feed, write fragmented MP4 on stdout.
 
     +empty_moov puts a self-contained init segment (ftyp+moov) first and
@@ -177,9 +208,13 @@ def build_ffmpeg_cmd(cfg, vcodec=''):
     frames are untouched and it costs nothing.
     """
     fix = ['-bsf:v', 'h264_metadata=level=auto'] if vcodec == 'h264' else []
+    # -an, not just an unmapped optional stream: '-map 0:a:0?' still maps
+    # a track that exists, and an existing EMPTY track is precisely the
+    # thing that stalls a player forever (see probe_codecs).
+    audio = ['-map', '0:a:0?'] if acodec else ['-an']
     return ['ffmpeg', '-hide_banner', '-loglevel', 'warning',
             '-rtsp_transport', 'tcp', '-i', rtsp_in(cfg),
-            '-map', '0:v:0', '-map', '0:a:0?', '-c', 'copy'] + fix + [
+            '-map', '0:v:0'] + audio + ['-c', 'copy'] + fix + [
             '-f', 'mp4', '-movflags',
             '+frag_keyframe+empty_moov+default_base_moof',
             'pipe:1']
@@ -212,12 +247,17 @@ def build_srt_cmd(cfg, vcodec, url, acodec=''):
     end that KNOWS the codec is the one that guarantees it.
     """
     fix = ['-bsf:v', 'h264_metadata=level=auto'] if vcodec == 'h264' else []
-    audio = (['-c:a', 'copy'] if acodec in ('aac', '')
-             else ['-c:a', 'aac', '-b:a', '128k', '-ar', '48000'])
+    if not acodec:
+        audio = ['-an']
+    elif acodec == 'aac':
+        audio = ['-map', '0:a:0?', '-c:a', 'copy']
+    else:
+        audio = ['-map', '0:a:0?', '-c:a', 'aac', '-b:a', '128k',
+                 '-ar', '48000']
     return ['ffmpeg', '-hide_banner', '-loglevel', 'warning',
             '-progress', 'pipe:1', '-nostats',
             '-rtsp_transport', 'tcp', '-i', rtsp_in(cfg),
-            '-map', '0:v:0', '-map', '0:a:0?',
+            '-map', '0:v:0',
             '-c:v', 'copy'] + fix + audio + [
             '-muxdelay', '0', '-muxpreload', '0',
             '-f', 'mpegts', url]
@@ -382,7 +422,7 @@ class LivePusher:
                 self.status.write(False,
                                   reason='SRT unavailable on the server')
                 return 0
-        return self.push_https(cfg, target, vcodec)
+        return self.push_https(cfg, target, vcodec, acodec)
 
     # ── SRT: ffmpeg holds the socket, we watch ──────────────────────────
     def push_srt(self, cfg, target, ticket, vcodec, acodec=''):
@@ -464,9 +504,9 @@ class LivePusher:
                         'the usual cause.', SRT_STRIKES, SRT_COOLDOWN_S // 60)
 
     # ── HTTPS: we do the queueing ───────────────────────────────────────
-    def push_https(self, cfg, target, vcodec):
+    def push_https(self, cfg, target, vcodec, acodec=''):
         started = time.monotonic()
-        self.proc = subprocess.Popen(build_ffmpeg_cmd(cfg, vcodec),
+        self.proc = subprocess.Popen(build_ffmpeg_cmd(cfg, vcodec, acodec),
                                      stdout=subprocess.PIPE,
                                      stderr=subprocess.PIPE)
         threading.Thread(target=self._drain_stderr, daemon=True).start()

@@ -422,8 +422,33 @@ STATUS_PAGE = """<!doctype html><html><head>
         <option value="raw" {{ 'selected' if radar_cfg.get('display_format') == 'raw' }}>Raw passthrough</option>
       </select>
     </label>
+    <label>Pocket Radar Smart Coach (BLE)
+      <select name="smart_coach">
+        <option value="auto" {{ 'selected' if radar_cfg.get('smart_coach', 'auto') != 'off' }}>Auto (default)</option>
+        <option value="off" {{ 'selected' if radar_cfg.get('smart_coach') == 'off' }}>Off</option>
+      </select>
+    </label>
+    <label>Smart Coach MAC (optional pin)
+      <input name="smart_coach_mac" value="{{ radar_cfg.get('smart_coach_mac') or '' }}"
+             placeholder="blank — found by name, learned on first pitch">
+    </label>
     <button class="btn" type="submit">Save radar settings</button>
   </form>
+  <p class="hint">
+    {% if ble_radar and ble_radar.get('connected') %}
+      🟢 Smart Coach connected: {{ ble_radar.get('name') or ble_radar.get('device') or '?' }}
+      {% if ble_radar.get('heard_s') is not none %}
+        — last reading {{ ble_radar.get('heard_s')|int }}s ago
+      {% else %} — no reading yet (pull the trigger once){% endif %}
+      {% if ble_radar.get('learned') %} · gun learned ✓{% endif %}
+    {% elif ble_radar and ble_radar.get('bleak') is false %}
+      ⚫ Smart Coach: BLE support not installed on this box
+      (apt install python3-bleak)
+    {% elif ble_radar %}
+      ⚫ Smart Coach: not found — turn the gun on and make sure the
+      phone app is NOT connected (BLE allows one client at a time)
+    {% endif %}
+  </p>
   <form method="post" action="/radar/forget" style="margin-top:.5rem"
         onsubmit="return confirm('Forget the learned cable roles? The box re-learns them from the next real velocity.')">
     <button class="btn" type="submit">Forget learned cables</button>
@@ -476,7 +501,6 @@ STATUS_PAGE = """<!doctype html><html><head>
   {% endif %}
 </div>
 
-<div class="card">
 <div class="card">
   <h2>Logs</h2>
   <button class="btn2" onclick="copyBundle()">&#128203; Copy logs for AI help</button>

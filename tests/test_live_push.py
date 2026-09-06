@@ -110,7 +110,11 @@ def test_ffmpeg_is_copy_mode_fragmented_mp4_off_rtsp():
     # the server's splitter needs a self-contained init segment first
     assert '+empty_moov' in flags and 'frag_keyframe' in flags
     assert cmd[-1] == 'pipe:1'
-    assert '0:a:0?' in cmd                          # audio optional, never fatal
+    # audio is mapped optionally when the source HAS usable audio; an
+    # empty acodec now means 'none', not 'unknown' — see the empty-track
+    # test below.
+    assert '0:a:0?' in live_push.build_ffmpeg_cmd(
+        {'local_ingest_key': 'abc123'}, 'hevc', 'aac')
 
 
 # ── one push ─────────────────────────────────────────────────────────────────
@@ -564,10 +568,14 @@ def test_audio_always_leaves_the_box_as_aac_over_srt():
                                       'srt://s', codec)
         assert cmd[cmd.index('-c:a') + 1] == 'aac', codec
         assert '-b:a' in cmd and '-ar' in cmd
-    for codec in ('aac', ''):
-        cmd = live_push.build_srt_cmd({'local_ingest_key': 'k'}, 'hevc',
-                                      'srt://s', codec)
-        assert cmd[cmd.index('-c:a') + 1] == 'copy', codec
+    cmd = live_push.build_srt_cmd({'local_ingest_key': 'k'}, 'hevc',
+                                  'srt://s', 'aac')
+    assert cmd[cmd.index('-c:a') + 1] == 'copy'      # already AAC
+    # No usable audio is not 'unknown audio': the track is dropped, never
+    # carried empty.
+    none = live_push.build_srt_cmd({'local_ingest_key': 'k'}, 'hevc',
+                                   'srt://s', '')
+    assert '-an' in none and '-c:a' not in none
     # video is never re-encoded whatever the audio does
     assert live_push.build_srt_cmd({'local_ingest_key': 'k'}, 'hevc',
                                    'srt://s', 'opus')[
@@ -595,3 +603,57 @@ def test_the_probed_audio_codec_reaches_the_srt_push(monkeypatch, tmp_path):
                             v=v, a=a) or 5)
     assert p.run_once() == 5
     assert seen == {'v': 'hevc', 'a': 'opus'}
+
+
+def test_an_audio_track_with_no_samples_is_dropped_not_carried():
+    """DECLARED is not PRESENT, and the difference is fatal downstream.
+    mimoLive announces an AAC track and sends nothing in it; ffmpeg
+    copies the empty track, the server packages it, and the browser
+    builds an audio SourceBuffer that never fills. buffered is the
+    INTERSECTION of the source buffers, so a full video track beside an
+    empty audio one leaves the element with nothing playable at any
+    position: frames decode, playback stalls, and NOTHING raises an
+    error. On 6 Sep 2026 every segment carried 59 video packets and 0
+    audio packets, and it read as five different faults, none of them
+    this one.
+
+    -an, not an unmapped optional stream: '-map 0:a:0?' still maps a
+    track that exists, and existing-but-empty is exactly the case."""
+    cfg = {'local_ingest_key': 'k'}
+    for build in (lambda a: live_push.build_ffmpeg_cmd(cfg, 'hevc', a),
+                  lambda a: live_push.build_srt_cmd(cfg, 'hevc', 'srt://s', a)):
+        gone = build('')
+        assert '-an' in gone
+        assert '0:a:0?' not in gone
+        kept = build('aac')
+        assert '-an' not in kept and '0:a:0?' in kept
+
+
+def test_a_declared_audio_track_is_checked_for_actual_samples():
+    """The stream listing cannot answer this — a track carrying no data
+    still appears there with a codec name. It has to be asked separately,
+    and a probe that cannot tell must keep the audio rather than throw it
+    away on a guess."""
+    cfg = {'local_ingest_key': 'k'}
+    listing = json.dumps({'streams': [{'codec_type': 'video',
+                                       'codec_name': 'hevc'},
+                                      {'codec_type': 'audio',
+                                       'codec_name': 'aac'}]})
+
+    def runner(cmd, timeout=None):
+        if '-read_intervals' in cmd:                 # the packet probe
+            assert '-select_streams' in cmd and 'a:0' in cmd
+            return type('R', (), {'returncode': 0, 'stdout': runner.audio})()
+        return type('R', (), {'returncode': 0, 'stdout': listing})()
+
+    runner.audio = '1.234000\n2.345000\n'
+    assert live_push.probe_codecs(cfg, runner) == ('hevc', 'aac')
+    runner.audio = ''                                # declared, never sent
+    assert live_push.probe_codecs(cfg, runner) == ('hevc', '')
+
+    def broken(cmd, timeout=None):
+        if '-read_intervals' in cmd:
+            raise OSError('ffprobe went missing')
+        return type('R', (), {'returncode': 0, 'stdout': listing})()
+    # cannot tell → keep it; silence is recoverable, a lost track is not
+    assert live_push.probe_codecs(cfg, broken) == ('hevc', 'aac')

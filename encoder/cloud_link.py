@@ -53,6 +53,7 @@ HEARTBEAT_INTERVAL = 15
 VERSION_CHECK_INTERVAL = 6 * 3600
 MEDIAMTX_API = 'http://127.0.0.1:9997'
 YOUTUBE_UNIT = 'playcall-encoder-youtube'
+LIVE_UNIT = 'playcall-encoder-live'
 
 
 def _http_json(url, headers=None, payload=None, timeout=6):
@@ -131,6 +132,27 @@ class CloudLink:
         self.write_live_target(a.get('live'))
         return self.handle_assignment(a)
 
+    def livepush_status(self):
+        """What the Multi-View leg last wrote, or None on a box that has
+        never run it. Imported inside the call, not at module load: the
+        push leg imports this module's neighbours and a cycle here would
+        take down the service that reports every other fault."""
+        try:
+            from . import live_push
+            st = live_push.status()
+        except Exception:
+            return None
+        if not st:
+            return None
+        return {'connected': bool(st.get('connected')),
+                'transport': st.get('transport') or '',
+                'angle': st.get('angle') or '',
+                'game': st.get('game') or '',
+                'kbps': int(st.get('kbps') or 0),
+                'backlog_ms': int(st.get('backlog_ms') or 0),
+                'reason': st.get('reason') or '',
+                'updated': st.get('updated')}
+
     def live_angle(self):
         """The angle name this box publishes under ('main' unless the
         settings page says otherwise)."""
@@ -160,7 +182,7 @@ class CloudLink:
         sig = (bool(a.get('assigned')), a.get('team_id'),
                a.get('bug_feed_url'), a.get('youtube_rtmp_url'),
                a.get('game_id'), a.get('push_bitrate_kbps'),
-               a.get('push_codec'))
+               a.get('push_codec'), a.get('live_transport'))
         if sig == self.last_assignment:
             return False
         self.last_assignment = sig
@@ -211,9 +233,26 @@ class CloudLink:
             restart_push = True
             log.info(f'push codec set from the cloud: {pc}')
 
+        # How the Multi-View feed travels, set from the site's stream
+        # sheet. Same contract as the push quality above: None means the
+        # cloud has no opinion and the box's own setting stands. This one
+        # restarts the LIVE unit, not the YouTube one — they are separate
+        # legs and restarting the wrong one would drop a stream that had
+        # nothing to do with the change.
+        restart_live = False
+        lt = a.get('live_transport')
+        if lt in ('auto', 'srt', 'https'):
+            lp = cfg.setdefault('live_push', {})
+            if lt != (lp.get('transport') or 'auto'):
+                lp['transport'] = lt
+                restart_live = True
+                log.info(f'multi-view transport set from the cloud: {lt}')
+
         self.cfg_save(cfg)
         if restart_push:
             self.runner(['systemctl', 'restart', YOUTUBE_UNIT])
+        if restart_live:
+            self.runner(['systemctl', 'restart', LIVE_UNIT])
         log.info(f"assignment: {a.get('team_name') or 'none'} "
                  f"(game {a.get('game_id')})")
         return True
@@ -394,6 +433,11 @@ class CloudLink:
             # the two guns never impersonate each other on the site
             'ble_radar': (self.ble_radar_health() if callable(
                 getattr(self, 'ble_radar_health', None)) else None),
+            # What the Multi-View leg is doing right now: the site's
+            # stream sheet has a GO LIVE button for it, and a button with
+            # no readout is a button you press twice. Written by
+            # live_push to tmpfs every second it is connected.
+            'livepush': self.livepush_status(),
             'version': __version__,
             # So the site can link straight to this box's settings page
             # instead of assuming playcall-encoder.local resolves.
