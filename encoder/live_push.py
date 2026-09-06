@@ -82,6 +82,13 @@ SRT_MIN_ALIVE = 20
 SRT_STRIKES = 3
 SRT_COOLDOWN_S = 600
 
+# An AAC frame smaller than this carries no sound. Digital silence codes
+# to six bytes a frame; the quietest audio anyone would actually ship —
+# 32 kbps mono — is around eighty, and a normal 128 kbps stereo frame is
+# three hundred and up. Anywhere in between is safe, and the gap is wide
+# enough that no real recording lands near it.
+SILENT_FRAME_BYTES = 24
+
 
 _ANGLE_OK = 'abcdefghijklmnopqrstuvwxyz0123456789-_'
 
@@ -154,38 +161,62 @@ def probe_codecs(cfg, runner=None):
             vcodec = st.get('codec_name') or ''
         elif st.get('codec_type') == 'audio' and not acodec:
             acodec = st.get('codec_name') or ''
-    if acodec and not _audio_flows(cfg, runner):
-        # DECLARED is not the same as PRESENT, and the difference is
-        # fatal downstream. mimoLive announces an AAC track and sends no
-        # samples in it; ffmpeg copies the empty track, the server's HLS
-        # carries it, and a browser then builds an audio SourceBuffer
-        # that never fills. HTMLMediaElement.buffered is the INTERSECTION
-        # of the source buffers, so a full video track and an empty audio
-        # one leave the element with nothing playable anywhere: frames
-        # decode, playback stalls, and not one error is raised by
-        # anything. It cost a whole evening on 6 Sep 2026 and read as
-        # five different faults, none of them this one.
-        log.info('audio track is declared but carries no samples — '
-                 'dropping it rather than shipping a track that can '
-                 'never fill')
-        acodec = ''
+    if acodec:
+        # DECLARED is not the same as USABLE, and the difference is fatal
+        # downstream. mimoLive announces a 48 kHz stereo AAC track and
+        # fills it with six-byte frames — digital silence, the shape AAC
+        # takes when the encoder is running and no sound is reaching it.
+        # A browser builds an audio SourceBuffer for that track and it
+        # never usefully fills. HTMLMediaElement.buffered is the
+        # INTERSECTION of the source buffers, so a full video track and a
+        # starved audio one leave the element with nothing playable
+        # ANYWHERE: frames decode, playback stalls, and not one error is
+        # raised by anything. It cost an evening on 6 Sep 2026 and read
+        # as five different faults, none of them this one.
+        sizes = _audio_frame_sizes(cfg, runner)
+        if sizes is None:
+            pass                 # could not ask → keep it, see below
+        elif not sizes:
+            log.info('audio track is declared but carries no samples — '
+                     'dropping it rather than shipping a track that can '
+                     'never fill')
+            acodec = ''
+        elif _median(sizes) < SILENT_FRAME_BYTES:
+            log.info('audio track carries only silence frames (median '
+                     f'{_median(sizes)} bytes) — dropping it rather than '
+                     'shipping a track that can never fill')
+            acodec = ''
     return vcodec, acodec
 
 
-def _audio_flows(cfg, runner):
-    """Does the audio track actually carry samples? Asked separately
-    because the stream listing cannot answer it — a track with no data
-    still appears in the listing, with a codec name and everything."""
+def _median(sizes):
+    return sorted(sizes)[len(sizes) // 2]
+
+
+def _audio_frame_sizes(cfg, runner):
+    """The sizes of the first few seconds of audio frames, or None when
+    the question could not be asked.
+
+    Asked separately because the stream listing cannot answer it — a
+    track carrying nothing worth hearing still appears there, with a
+    codec name, a sample rate and a channel count. Sizes rather than a
+    mere count because BOTH failure modes have to be caught: a track with
+    no packets at all, and a track whose packets are all silence."""
     try:
         r = runner(['ffprobe', '-v', 'error', '-rtsp_transport', 'tcp',
                     '-select_streams', 'a:0', '-read_intervals', '%+3',
-                    '-show_entries', 'packet=pts_time', '-of', 'csv=p=0',
+                    '-show_entries', 'packet=size', '-of', 'csv=p=0',
                     rtsp_in(cfg)], timeout=20)
     except Exception:
-        return True          # cannot tell → do not throw audio away
+        return None          # cannot tell → do not throw audio away
     if getattr(r, 'returncode', 1) != 0:
-        return True
-    return bool((getattr(r, 'stdout', '') or '').strip())
+        return None
+    sizes = []
+    for line in (getattr(r, 'stdout', '') or '').split('\n'):
+        line = line.strip().rstrip(',')
+        if line.isdigit():
+            sizes.append(int(line))
+    return sizes
 
 
 def build_ffmpeg_cmd(cfg, vcodec='', acodec=''):
@@ -209,30 +240,18 @@ def build_ffmpeg_cmd(cfg, vcodec='', acodec=''):
     """
     fix = ['-bsf:v', 'h264_metadata=level=auto'] if vcodec == 'h264' else []
     # -an, not just an unmapped optional stream: '-map 0:a:0?' still maps
-    # a track that exists, and an existing EMPTY track is precisely the
-    # thing that stalls a player forever (see probe_codecs).
+    # a track that exists, and an existing UNFILLABLE track is precisely
+    # the thing that stalls a player forever (see probe_codecs).
     #
-    # aac_adtstoasc is NOT optional here, and the reason is the flag on
-    # the next line but one. ffmpeg inserts this filter automatically for
-    # AAC entering MP4 — except that +empty_moov switches automatic
-    # bitstream filtering OFF. It says so and carries on:
-    #
-    #   [mp4] Empty MOOV enabled; disabling automatic bitstream filtering
-    #   Input  stream #0:1 (audio): 284 packets read
-    #   Output stream #0:1 (audio):   0 packets muxed
-    #
-    # Exit 0. No error. The track is declared in the init and never
-    # carries a sample, so a browser builds an audio SourceBuffer that
-    # can never fill; buffered is the INTERSECTION of the source buffers,
-    # so the video track is unreachable too and playback stalls with
-    # nothing to report. That cost an evening on 6 Sep 2026 and was read
-    # as five different faults. We cannot drop +empty_moov — it is what
-    # makes the init segment self-contained for the server's splitter —
-    # so the filter is named explicitly.
+    # No audio bitstream filter, deliberately. AAC arriving over RTSP is
+    # RAW — frames plus a two-byte ASC in the SDP — which is already the
+    # framing MP4 wants, so a copy needs nothing. aac_adtstoasc converts
+    # the OTHER framing, ADTS, and belongs on the server's MPEG-TS input
+    # where SRT delivers it; pointed at this road it is worse than
+    # useless, because it rejects any frame shorter than the seven-byte
+    # ADTS header it expects to find and a silence frame is six.
     if not acodec:
         audio = ['-an']
-    elif acodec == 'aac':
-        audio = ['-map', '0:a:0?', '-bsf:a', 'aac_adtstoasc']
     else:
         audio = ['-map', '0:a:0?']
     return ['ffmpeg', '-hide_banner', '-loglevel', 'warning',

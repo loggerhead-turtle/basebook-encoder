@@ -362,7 +362,13 @@ def test_probe_reads_the_true_track_list_over_rtsp():
             {'codec_type': 'video', 'codec_name': 'hevc'},
             {'codec_type': 'audio', 'codec_name': 'aac'}]})
 
+    class Sizes:
+        returncode = 0
+        stdout = '341\n337\n344\n'      # real audio, so it is kept
+
     def runner(cmd, **kw):
+        if '-read_intervals' in cmd:      # the packet probe, asked second
+            return Sizes()
         seen['cmd'] = cmd
         return R()
     cfg = {'local_ingest_key': 'abc123'}
@@ -646,7 +652,7 @@ def test_a_declared_audio_track_is_checked_for_actual_samples():
             return type('R', (), {'returncode': 0, 'stdout': runner.audio})()
         return type('R', (), {'returncode': 0, 'stdout': listing})()
 
-    runner.audio = '1.234000\n2.345000\n'
+    runner.audio = '341\n337\n344\n'                 # real audio
     assert live_push.probe_codecs(cfg, runner) == ('hevc', 'aac')
     runner.audio = ''                                # declared, never sent
     assert live_push.probe_codecs(cfg, runner) == ('hevc', '')
@@ -659,31 +665,57 @@ def test_a_declared_audio_track_is_checked_for_actual_samples():
     assert live_push.probe_codecs(cfg, broken) == ('hevc', 'aac')
 
 
-def test_aac_survives_the_move_into_fragmented_mp4():
-    """ffmpeg inserts aac_adtstoasc automatically for AAC entering MP4 —
-    except that +empty_moov switches automatic bitstream filtering OFF.
-    It announces this and carries on:
+def test_a_silent_audio_track_is_dropped_like_an_absent_one():
+    """mimoLive announces 48 kHz stereo AAC and fills it with SIX-BYTE
+    frames — the size AAC codes to when the encoder is running and no
+    sound is reaching it. Counting packets says the track is fine; there
+    were 284 of them. Measuring them says it is silence.
 
-        [mp4] Empty MOOV enabled; disabling automatic bitstream filtering
-        Input  stream #0:1 (audio): 284 packets read
-        Output stream #0:1 (audio):   0 packets muxed
-
-    Exit 0, no error, and an audio track declared in the init that never
-    carries a sample. A browser then builds an audio SourceBuffer that
-    can never fill, and because buffered is the INTERSECTION of the
-    source buffers the VIDEO becomes unreachable too: frames decode,
-    playback stalls, nothing anywhere reports a fault.
-
-    +empty_moov cannot be dropped — it is what makes the init segment
-    self-contained for the server's splitter — so the filter must be
-    named. The same root cause broke the SRT road earlier the same night,
-    loudly; this road failed at it in silence."""
+    It has to be dropped for the same reason an empty track does. The
+    browser builds an audio SourceBuffer that never usefully fills, and
+    buffered is the INTERSECTION of the source buffers, so the VIDEO
+    becomes unreachable too: frames decode, the clock advances, nothing
+    plays, and no layer reports a fault (6 Sep 2026)."""
     cfg = {'local_ingest_key': 'k'}
+    listing = json.dumps({'streams': [{'codec_type': 'video',
+                                       'codec_name': 'hevc'},
+                                      {'codec_type': 'audio',
+                                       'codec_name': 'aac'}]})
+
+    def runner(cmd, timeout=None):
+        if '-read_intervals' in cmd:
+            assert 'packet=size' in cmd     # sizes, not a mere count
+            return type('R', (), {'returncode': 0, 'stdout': runner.audio})()
+        return type('R', (), {'returncode': 0, 'stdout': listing})()
+
+    runner.audio = '6\n' * 284                       # what mimoLive sent
+    assert live_push.probe_codecs(cfg, runner) == ('hevc', '')
+    runner.audio = '85\n84\n86\n'                    # 32 kbps mono, real
+    assert live_push.probe_codecs(cfg, runner) == ('hevc', 'aac')
+    # a stray small frame among real ones is not silence — the median is
+    # what decides, so one runt cannot throw a whole track away
+    runner.audio = '6\n341\n337\n344\n339\n'
+    assert live_push.probe_codecs(cfg, runner) == ('hevc', 'aac')
+
+
+def test_no_audio_bitstream_filter_on_the_https_road():
+    """AAC over RTSP is RAW — frames plus a two-byte ASC from the SDP —
+    which is already what MP4 wants, so a copy needs no filter.
+
+    aac_adtstoasc converts the OTHER framing. It belongs on the server's
+    MPEG-TS input, where SRT delivers ADTS and the MP4 muxer refuses it
+    without one. Pointed at THIS road it is worse than useless: it
+    rejects any frame shorter than the seven-byte ADTS header it expects
+    to find, and mimoLive's silence frames are six, so every packet was
+    dropped and the audio track shipped empty — the precise failure the
+    filter was added to prevent (6 Sep 2026).
+
+    +empty_moov is why this cannot be left to ffmpeg either way: it turns
+    automatic bitstream filtering off and says so. The framing has to be
+    settled here, from what the source actually sends."""
+    cfg = {'local_ingest_key': 'k'}
+    for acodec in ('aac', 'opus', ''):
+        assert '-bsf:a' not in live_push.build_ffmpeg_cmd(cfg, 'hevc', acodec)
+    # and the flag that forces the question is still the one in use
     cmd = live_push.build_ffmpeg_cmd(cfg, 'hevc', 'aac')
-    assert cmd[cmd.index('-bsf:a') + 1] == 'aac_adtstoasc'
-    # applied to this output, and alongside the flag that necessitates it
-    assert cmd.index('-bsf:a') < cmd.index('pipe:1')
     assert '+empty_moov' in cmd[cmd.index('-movflags') + 1]
-    # only for AAC: the filter errors outright on anything else
-    assert '-bsf:a' not in live_push.build_ffmpeg_cmd(cfg, 'hevc', 'opus')
-    assert '-bsf:a' not in live_push.build_ffmpeg_cmd(cfg, 'hevc', '')
