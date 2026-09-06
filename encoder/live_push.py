@@ -211,7 +211,30 @@ def build_ffmpeg_cmd(cfg, vcodec='', acodec=''):
     # -an, not just an unmapped optional stream: '-map 0:a:0?' still maps
     # a track that exists, and an existing EMPTY track is precisely the
     # thing that stalls a player forever (see probe_codecs).
-    audio = ['-map', '0:a:0?'] if acodec else ['-an']
+    #
+    # aac_adtstoasc is NOT optional here, and the reason is the flag on
+    # the next line but one. ffmpeg inserts this filter automatically for
+    # AAC entering MP4 — except that +empty_moov switches automatic
+    # bitstream filtering OFF. It says so and carries on:
+    #
+    #   [mp4] Empty MOOV enabled; disabling automatic bitstream filtering
+    #   Input  stream #0:1 (audio): 284 packets read
+    #   Output stream #0:1 (audio):   0 packets muxed
+    #
+    # Exit 0. No error. The track is declared in the init and never
+    # carries a sample, so a browser builds an audio SourceBuffer that
+    # can never fill; buffered is the INTERSECTION of the source buffers,
+    # so the video track is unreachable too and playback stalls with
+    # nothing to report. That cost an evening on 6 Sep 2026 and was read
+    # as five different faults. We cannot drop +empty_moov — it is what
+    # makes the init segment self-contained for the server's splitter —
+    # so the filter is named explicitly.
+    if not acodec:
+        audio = ['-an']
+    elif acodec == 'aac':
+        audio = ['-map', '0:a:0?', '-bsf:a', 'aac_adtstoasc']
+    else:
+        audio = ['-map', '0:a:0?']
     return ['ffmpeg', '-hide_banner', '-loglevel', 'warning',
             '-rtsp_transport', 'tcp', '-i', rtsp_in(cfg),
             '-map', '0:v:0'] + audio + ['-c', 'copy'] + fix + [

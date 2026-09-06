@@ -657,3 +657,33 @@ def test_a_declared_audio_track_is_checked_for_actual_samples():
         return type('R', (), {'returncode': 0, 'stdout': listing})()
     # cannot tell → keep it; silence is recoverable, a lost track is not
     assert live_push.probe_codecs(cfg, broken) == ('hevc', 'aac')
+
+
+def test_aac_survives_the_move_into_fragmented_mp4():
+    """ffmpeg inserts aac_adtstoasc automatically for AAC entering MP4 —
+    except that +empty_moov switches automatic bitstream filtering OFF.
+    It announces this and carries on:
+
+        [mp4] Empty MOOV enabled; disabling automatic bitstream filtering
+        Input  stream #0:1 (audio): 284 packets read
+        Output stream #0:1 (audio):   0 packets muxed
+
+    Exit 0, no error, and an audio track declared in the init that never
+    carries a sample. A browser then builds an audio SourceBuffer that
+    can never fill, and because buffered is the INTERSECTION of the
+    source buffers the VIDEO becomes unreachable too: frames decode,
+    playback stalls, nothing anywhere reports a fault.
+
+    +empty_moov cannot be dropped — it is what makes the init segment
+    self-contained for the server's splitter — so the filter must be
+    named. The same root cause broke the SRT road earlier the same night,
+    loudly; this road failed at it in silence."""
+    cfg = {'local_ingest_key': 'k'}
+    cmd = live_push.build_ffmpeg_cmd(cfg, 'hevc', 'aac')
+    assert cmd[cmd.index('-bsf:a') + 1] == 'aac_adtstoasc'
+    # applied to this output, and alongside the flag that necessitates it
+    assert cmd.index('-bsf:a') < cmd.index('pipe:1')
+    assert '+empty_moov' in cmd[cmd.index('-movflags') + 1]
+    # only for AAC: the filter errors outright on anything else
+    assert '-bsf:a' not in live_push.build_ffmpeg_cmd(cfg, 'hevc', 'opus')
+    assert '-bsf:a' not in live_push.build_ffmpeg_cmd(cfg, 'hevc', '')
