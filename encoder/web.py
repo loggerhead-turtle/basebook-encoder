@@ -292,6 +292,15 @@ STATUS_PAGE = """<!doctype html><html><head>
     <label>Angle name (what viewers see)</label>
     <input type="text" name="angle" value="{{ live_push.angle }}"
            placeholder="main" maxlength="24">
+    <label>How it travels</label>
+    <select name="transport">
+      <option value="auto" {{ 'selected' if live_push.transport == 'auto' }}>
+        Automatic — SRT when the server offers it</option>
+      <option value="srt" {{ 'selected' if live_push.transport == 'srt' }}>
+        SRT only — best on a link that loses packets (Starlink, cellular)</option>
+      <option value="https" {{ 'selected' if live_push.transport == 'https' }}>
+        HTTPS only — survives a link that drops out entirely</option>
+    </select>
     <label><input type="checkbox" name="enabled" value="1"
       {{ 'checked' if live_push.enabled }}> Send to the site's stream server</label>
     <button class="btn" type="submit">Save Multi-View</button>
@@ -369,23 +378,6 @@ STATUS_PAGE = """<!doctype html><html><head>
         <option value="off" {{ 'selected' if radar_cfg.get('enabled') == 'off' }}>Off</option>
       </select>
     </label>
-    <label>Gun baud
-      <select name="baud">
-        {% for b in [19200, 9600, 4800, 38400, 57600, 115200] %}
-        <option value="{{ b }}" {{ 'selected' if (radar_cfg.get('baud') or 19200)|int == b }}>{{ b }}{{ ' — Stalker default' if b == 19200 }}</option>
-        {% endfor %}
-      </select>
-    </label>
-    <label>Bluetooth gun adapter (BT578…) MAC
-      <input name="bluetooth_mac" value="{{ radar_cfg.get('bluetooth_mac') or '' }}"
-             placeholder="00:11:22:33:44:55 — blank for cabled">
-    </label>
-    <label>LED board output
-      <select name="display_format">
-        <option value="speed" {{ 'selected' if radar_cfg.get('display_format', 'speed') != 'raw' }}>Speed (default)</option>
-        <option value="raw" {{ 'selected' if radar_cfg.get('display_format') == 'raw' }}>Raw passthrough</option>
-      </select>
-    </label>
     <label>Pocket Radar Smart Coach (BLE)
       <select name="smart_coach">
         <option value="auto" {{ 'selected' if radar_cfg.get('smart_coach', 'auto') != 'off' }}>Auto (default)</option>
@@ -413,6 +405,25 @@ STATUS_PAGE = """<!doctype html><html><head>
       phone app is NOT connected (BLE allows one client at a time)
     {% endif %}
   </p>
+    <label>Gun baud
+      <select name="baud">
+        {% for b in [19200, 9600, 4800, 38400, 57600, 115200] %}
+        <option value="{{ b }}" {{ 'selected' if (radar_cfg.get('baud') or 19200)|int == b }}>{{ b }}{{ ' — Stalker default' if b == 19200 }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>Bluetooth gun adapter (BT578…) MAC
+      <input name="bluetooth_mac" value="{{ radar_cfg.get('bluetooth_mac') or '' }}"
+             placeholder="00:11:22:33:44:55 — blank for cabled">
+    </label>
+    <label>LED board output
+      <select name="display_format">
+        <option value="speed" {{ 'selected' if radar_cfg.get('display_format', 'speed') != 'raw' }}>Speed (default)</option>
+        <option value="raw" {{ 'selected' if radar_cfg.get('display_format') == 'raw' }}>Raw passthrough</option>
+      </select>
+    </label>
+    <button class="btn" type="submit">Save radar settings</button>
+  </form>
   <form method="post" action="/radar/forget" style="margin-top:.5rem"
         onsubmit="return confirm('Forget the learned cable roles? The box re-learns them from the next real velocity.')">
     <button class="btn" type="submit">Forget learned cables</button>
@@ -465,6 +476,7 @@ STATUS_PAGE = """<!doctype html><html><head>
   {% endif %}
 </div>
 
+<div class="card">
 <div class="card">
   <h2>Logs</h2>
   <button class="btn2" onclick="copyBundle()">&#128203; Copy logs for AI help</button>
@@ -632,13 +644,17 @@ def live_push_view(cfg):
     lp = cfg.get('live_push') or {}
     st = live_push.status()
     if st.get('connected'):
-        line = (f"Sending as '{st.get('angle')}' · {st.get('kbps', 0)} kbps"
+        how = 'SRT' if st.get('transport') == 'srt' else 'HTTPS'
+        line = (f"Sending as '{st.get('angle')}' over {how} · "
+                f"{st.get('kbps', 0)} kbps"
                 + (f" · {st['backlog_ms'] // 1000}s behind"
                    if st.get('backlog_ms', 0) >= 2000 else ''))
     else:
         line = st.get('reason') or ''
+    mode = (lp.get('transport') or 'auto').lower()
     return {'enabled': lp.get('enabled', True) is not False,
             'angle': live_push.safe_angle(lp.get('angle') or 'main'),
+            'transport': mode if mode in ('auto', 'srt', 'https') else 'auto',
             'status': line}
 
 
@@ -905,9 +921,11 @@ def create_app(cloud=None):
     def livepush():
         from .live_push import safe_angle
         cfg = config.load()
+        mode = (request.form.get('transport') or 'auto').lower()
         cfg['live_push'] = {
             'enabled': bool(request.form.get('enabled')),
             'angle': safe_angle(request.form.get('angle')),
+            'transport': mode if mode in ('auto', 'srt', 'https') else 'auto',
         }
         config.save(cfg)
         system.systemctl('restart', 'playcall-encoder-live')

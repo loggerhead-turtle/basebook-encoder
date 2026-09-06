@@ -238,11 +238,39 @@ harmless on boxes that will never use it.
 
     Mevo / mimoLive / OBS ─RTMP or SRT→ MediaMTX ─loopback RTSP→ live_push
                                                  └─→ recording + clips
-    live_push ─fragmented MP4 over HTTPS→ stream server ─HLS→ Multi-View page
+    live_push ─SRT, or fragmented MP4 over HTTPS→ stream server
+                                              ─HLS→ Multi-View page
 
 Settings page → **Multi-View**: the angle name viewers see (one per box, so
-two boxes at one game do not collide) and an on/off switch. The card shows
-the live state — angle, kbps, and how far behind the uplink is running.
+two boxes at one game do not collide), how it travels, and an on/off switch.
+The card shows the live state — angle, transport, kbps, and how far behind
+the uplink is running.
+
+### How it travels — and why "automatic" is the right answer
+
+Neither road is simply better, so the default asks and falls back:
+
+* **SRT** is for a link that **loses packets**. TCP reads every loss as
+  congestion and halves its window, so a Starlink or LTE uplink at one
+  percent loss sawtooths a 6 Mb/s feed down to two and reports a growing
+  backlog on a link with capacity to spare. SRT retransmits inside a fixed
+  window without touching the send rate, and holds its bitrate.
+* **HTTPS** is for a link that **goes away**. SRT abandons anything it
+  cannot recover inside that window — gone, permanently. The chunk queue
+  holds unsent video and delivers it late. For a recording, late beats gone.
+
+On **Automatic** the box asks the server for an SRT port each time it
+starts a push, uses it if it gets one, and posts chunks if it does not —
+including when SRT keeps dying in the first few seconds, which is what a
+firewall eating outbound UDP looks like from here. Both roads land in the
+same session on the server, so the recording is identical either way; the
+server needs `LIVE_SRT_PORTS` set and the range open for SRT to be on
+offer at all.
+
+**The phone camera page cannot use SRT.** There is no UDP, and so no SRT,
+API in a browser — the phones stay on the chunked HTTPS path, which is
+also the one that survives a dropout. A phone that must send SRT needs a
+native app (Larix Broadcaster is free and speaks SRT and HEVC).
 
     systemctl status playcall-encoder-live      # is it pushing?
     journalctl -u playcall-encoder-live -n 50   # why not

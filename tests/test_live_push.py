@@ -173,10 +173,13 @@ def test_a_push_is_start_then_feeds_then_stop(monkeypatch):
     p, calls = _pusher(monkeypatch, [b'a' * 700_000, b'b' * 700_000])
     p.run_once()
     urls = [c[0] for c in calls]
-    assert urls[0] == 'https://live.example.org/ingest/start'
-    assert calls[0][1]['token'] == 'tok.sig'
-    assert calls[0][1]['capture_start'] > 0        # the box's clock, for PDT
-    assert calls[0][1]['codec'] == 'hevc'          # what the camera sends
+    # On 'auto' the SRT port is asked for first; this fake server has none,
+    # so the chunk path takes over. That fallback IS the behaviour here.
+    assert urls[0] == 'https://live.example.org/ingest/srt'
+    assert urls[1] == 'https://live.example.org/ingest/start'
+    assert calls[1][1]['token'] == 'tok.sig'
+    assert calls[1][1]['capture_start'] > 0        # the box's clock, for PDT
+    assert calls[1][1]['codec'] == 'hevc'          # what the camera sends
     feeds = [c for c in calls if c[0].endswith('/feed')]
     assert feeds and all(isinstance(c[1], bytes) for c in feeds)
     assert b''.join(c[1] for c in feeds) == b'a' * 700_000 + b'b' * 700_000
@@ -261,11 +264,20 @@ def test_settings_card_renders_and_saves(monkeypatch):
     c.post('/login', data={'pin': '123456'})
     page = c.get('/').get_data(as_text=True)
     assert 'Multi-View' in page and 'name="angle"' in page
+    assert 'name="transport"' in page
 
-    r = c.post('/livepush', data={'angle': 'Third Base', 'enabled': '1'})
+    r = c.post('/livepush', data={'angle': 'Third Base', 'enabled': '1',
+                                  'transport': 'srt'})
     assert r.status_code == 302
     saved = config.load()['live_push']
-    assert saved == {'enabled': True, 'angle': 'third-base'}
+    assert saved == {'enabled': True, 'angle': 'third-base',
+                     'transport': 'srt'}
+
+    # An unknown value must not become the stored setting: 'auto' is the
+    # one that always has a working answer.
+    c.post('/livepush', data={'angle': 'main', 'enabled': '1',
+                              'transport': 'carrier-pigeon'})
+    assert config.load()['live_push']['transport'] == 'auto'
     assert ('restart', 'playcall-encoder-live') in restarts
 
     c.post('/livepush', data={'angle': 'main'})       # box unchecked
@@ -376,3 +388,210 @@ def test_live_push_imports_nothing_from_the_youtube_leg():
             assert 'youtube_push' not in (node.module or '')
         elif isinstance(node, _ast.Import):
             assert all('youtube_push' not in a.name for a in node.names)
+
+
+# ── SRT: the road for links that lose packets ────────────────────────────
+
+class _Err(Exception):
+    def __init__(self, code):
+        self.code = code
+
+
+def _pusher_with(monkeypatch, tmp_path, http, cfg=None, transport='auto'):
+    cfg = cfg or {'local_ingest_key': 'k',
+                  'live_push': {'enabled': True, 'angle': 'main',
+                                'transport': transport}}
+    monkeypatch.setenv('PLAYCALL_ENCODER_STATE', str(tmp_path))
+    p = live_push.LivePusher(cfg_load=lambda: cfg,
+                             status=live_push.StatusWriter(
+                                 tmp_path / 'livepush.json'),
+                             http=http)
+    return p
+
+
+def test_srt_sends_mpegts_and_keeps_the_level_fix():
+    """The server remuxes what arrives straight through, so a bitstream
+    that lies about its H.264 level would carry that lie all the way to
+    the phone that then refuses to decode it. The fix belongs here."""
+    cmd = live_push.build_srt_cmd({'local_ingest_key': 'k'}, 'h264',
+                                  'srt://s:8890?x=1', 'aac')
+    assert cmd[cmd.index('-f') + 1] == 'mpegts'
+    assert cmd[-1] == 'srt://s:8890?x=1'
+    assert cmd[cmd.index('-c:v') + 1] == 'copy'
+    assert cmd[cmd.index('-c:a') + 1] == 'copy'      # already AAC
+    assert '-bsf:v' in cmd and 'h264_metadata=level=auto' in cmd
+    assert cmd[cmd.index('-i') + 1].startswith('rtsp://127.0.0.1:8554/')
+    # Counters for the settings card: with SRT the box is not the one
+    # queueing bytes, so ffmpeg's own numbers are the only honest source.
+    assert '-progress' in cmd and cmd[cmd.index('-progress') + 1] == 'pipe:1'
+
+
+def test_hevc_keeps_the_level_filter_off():
+    """h264_metadata on an HEVC stream is not a no-op, it is an error."""
+    cmd = live_push.build_srt_cmd({'local_ingest_key': 'k'}, 'hevc', 'srt://s')
+    assert '-bsf:v' not in cmd
+
+
+def test_a_server_without_srt_is_not_asked_again_all_game(monkeypatch,
+                                                          tmp_path):
+    """501 is a property of the server, not of the attempt. Re-asking
+    every few seconds would be noise on every poll for two hours."""
+    calls = []
+
+    def http(url, payload=None, headers=None, timeout=None):
+        calls.append(url)
+        raise _Err(501)
+    p = _pusher_with(monkeypatch, tmp_path, http)
+    t = {'ingest': 'https://s/ingest', 'token': 'tok', 'game': 'g',
+         'angle': 'main'}
+    assert p.request_srt(t, 'hevc') is None
+    assert p.transport(p.cfg_load()) == 'https'      # cooled off
+    assert p.request_srt(t, 'hevc') is None
+    assert len(calls) == 2                            # transport() is the gate
+
+
+def test_a_busy_pool_is_retried_but_a_missing_one_is_not(monkeypatch,
+                                                          tmp_path):
+    """All ports busy is temporary — another angle will finish."""
+    p = _pusher_with(monkeypatch, tmp_path,
+                     lambda *a, **k: (_ for _ in ()).throw(_Err(503)))
+    t = {'ingest': 'https://s/ingest', 'token': 'tok'}
+    assert p.request_srt(t, 'hevc') is None
+    assert p.transport(p.cfg_load()) == 'auto'        # still willing
+
+
+def test_a_ticket_is_used_as_given(monkeypatch, tmp_path):
+    def http(url, payload=None, headers=None, timeout=None):
+        assert url.endswith('/ingest/srt') and payload['token'] == 'tok'
+        return {'ok': True, 'session': 'ls_1', 'run': 'r003',
+                'srt': {'url': 'srt://s:8891?mode=caller', 'port': 8891,
+                        'passphrase': 'p' * 32, 'latency_ms': 2000}}
+    p = _pusher_with(monkeypatch, tmp_path, http)
+    got = p.request_srt({'ingest': 'https://s/ingest', 'token': 'tok'}, 'hevc')
+    assert got['session'] == 'ls_1' and got['port'] == 8891
+    assert got['url'] == 'srt://s:8891?mode=caller'
+
+
+def test_a_reply_without_a_url_is_not_a_ticket(monkeypatch, tmp_path):
+    p = _pusher_with(monkeypatch, tmp_path,
+                     lambda *a, **k: {'ok': True, 'session': 'ls_1',
+                                      'srt': {}})
+    assert p.request_srt({'ingest': 'https://s/ingest', 'token': 't'},
+                         'hevc') is None
+
+
+@pytest.mark.parametrize('mode, want', [
+    ('auto', 'auto'), ('srt', 'srt'), ('https', 'https'),
+    ('SRT', 'srt'), ('', 'auto'), ('nonsense', 'auto'),
+])
+def test_transport_setting(monkeypatch, tmp_path, mode, want):
+    p = _pusher_with(monkeypatch, tmp_path, lambda *a, **k: {},
+                     transport=mode)
+    assert p.transport(p.cfg_load()) == want
+
+
+def test_srt_only_never_silently_posts_chunks(monkeypatch, tmp_path):
+    """Someone who chose SRT deliberately should be told it is not
+    happening, not quietly given a different transport."""
+    p = _pusher_with(monkeypatch, tmp_path,
+                     lambda *a, **k: (_ for _ in ()).throw(_Err(501)),
+                     transport='srt')
+    monkeypatch.setattr(live_push, 'read_target',
+                        lambda *a: {'ingest': 'https://s/ingest',
+                                    'token': 't', 'game': 'g',
+                                    'angle': 'main'})
+    monkeypatch.setattr(p, '_probe', lambda cfg: ('hevc', 'aac'))
+    monkeypatch.setattr(p, 'push_https',
+                        lambda *a: pytest.fail('fell back without saying so'))
+    assert p.run_once() == 0
+    assert 'SRT' in (live_push.status(tmp_path / 'livepush.json')
+                     .get('reason') or '')
+
+
+def test_repeated_short_srt_attempts_fall_back(monkeypatch, tmp_path):
+    """UDP blocked on the way out looks exactly like this: a ticket
+    issued, ffmpeg up, and nothing ever connecting. A working feed beats
+    being right about the transport."""
+    p = _pusher_with(monkeypatch, tmp_path, lambda *a, **k: {})
+    for _ in range(live_push.SRT_STRIKES - 1):
+        p._note_srt_attempt(1.0)
+        assert p.transport(p.cfg_load()) == 'auto'
+    p._note_srt_attempt(1.0)
+    assert p.transport(p.cfg_load()) == 'https'
+
+
+def test_an_srt_push_that_lasts_clears_the_strikes(monkeypatch, tmp_path):
+    p = _pusher_with(monkeypatch, tmp_path, lambda *a, **k: {})
+    p._note_srt_attempt(1.0)
+    p._note_srt_attempt(live_push.SRT_MIN_ALIVE + 1)
+    for _ in range(live_push.SRT_STRIKES - 1):
+        p._note_srt_attempt(1.0)
+    assert p.transport(p.cfg_load()) == 'auto'
+
+
+def test_auto_uses_srt_when_the_server_offers_it(monkeypatch, tmp_path):
+    used = {}
+
+    def http(url, payload=None, headers=None, timeout=None):
+        return {'ok': True, 'session': 'ls_9',
+                'srt': {'url': 'srt://s:8890', 'port': 8890,
+                        'latency_ms': 2000, 'passphrase': 'p' * 32}}
+    p = _pusher_with(monkeypatch, tmp_path, http)
+    monkeypatch.setattr(live_push, 'read_target',
+                        lambda *a: {'ingest': 'https://s/ingest',
+                                    'token': 't', 'game': 'g',
+                                    'angle': 'main'})
+    monkeypatch.setattr(p, '_probe', lambda cfg: ('hevc', 'aac'))
+    def _srt(cfg, t, ticket, v, a=''):
+        used['url'] = ticket['url']
+        return 99
+    monkeypatch.setattr(p, 'push_srt', _srt)
+    monkeypatch.setattr(p, 'push_https',
+                        lambda *a: pytest.fail('ignored a good ticket'))
+    assert p.run_once() == 99
+    assert used['url'] == 'srt://s:8890'
+
+
+def test_audio_always_leaves_the_box_as_aac_over_srt():
+    """The server remuxes MPEG-TS to fragmented MP4 and must convert AAC's
+    framing on the way (ADTS → ASC). It applies that filter blind — it
+    cannot know the codec before the stream arrives — and the filter
+    errors outright on anything that is not AAC. A WHIP publisher on this
+    box's MediaMTX sends Opus. So the end that knows the codec is the one
+    that has to guarantee it."""
+    for codec in ('opus', 'mp3', 'ac3'):
+        cmd = live_push.build_srt_cmd({'local_ingest_key': 'k'}, 'hevc',
+                                      'srt://s', codec)
+        assert cmd[cmd.index('-c:a') + 1] == 'aac', codec
+        assert '-b:a' in cmd and '-ar' in cmd
+    for codec in ('aac', ''):
+        cmd = live_push.build_srt_cmd({'local_ingest_key': 'k'}, 'hevc',
+                                      'srt://s', codec)
+        assert cmd[cmd.index('-c:a') + 1] == 'copy', codec
+    # video is never re-encoded whatever the audio does
+    assert live_push.build_srt_cmd({'local_ingest_key': 'k'}, 'hevc',
+                                   'srt://s', 'opus')[
+        live_push.build_srt_cmd({'local_ingest_key': 'k'}, 'hevc',
+                                'srt://s', 'opus').index('-c:v') + 1] == 'copy'
+
+
+def test_the_probed_audio_codec_reaches_the_srt_push(monkeypatch, tmp_path):
+    """Probing it and then not passing it on would be the same bug with
+    extra steps."""
+    seen = {}
+
+    def http(url, payload=None, headers=None, timeout=None):
+        return {'ok': True, 'session': 'ls_1',
+                'srt': {'url': 'srt://s:8890', 'port': 8890,
+                        'latency_ms': 2000, 'passphrase': 'p' * 32}}
+    p = _pusher_with(monkeypatch, tmp_path, http)
+    monkeypatch.setattr(live_push, 'read_target',
+                        lambda *a: {'ingest': 'https://s/ingest',
+                                    'token': 't', 'game': 'g',
+                                    'angle': 'main'})
+    monkeypatch.setattr(p, '_probe', lambda cfg: ('hevc', 'opus'))
+    monkeypatch.setattr(p, 'push_srt',
+                        lambda cfg, t, ticket, v, a='': seen.update(
+                            v=v, a=a) or 5)
+    assert p.run_once() == 5
+    assert seen == {'v': 'hevc', 'a': 'opus'}

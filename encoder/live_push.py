@@ -27,6 +27,27 @@ oldest chunk still waiting. The stream desk reads it in the source card,
 and a backlog past MAX_BACKLOG_S means the uplink is gone — the run is
 restarted rather than left to rot, and the server marks the seam with a
 playlist discontinuity.
+
+TWO ROADS, and neither is simply better:
+
+    SRT    MediaMTX → ffmpeg -c copy -f mpegts → srt://server:port
+    HTTPS  MediaMTX → ffmpeg -c copy -f mp4    → POST /start /feed /stop
+
+  * SRT is for a link that LOSES PACKETS. TCP reads every loss as
+    congestion and halves its window, so a Starlink or LTE uplink at one
+    percent loss sawtooths a 6 Mb/s feed down to two and reports a
+    backlog on a link with capacity to spare. SRT retransmits inside a
+    fixed window without touching the send rate, and holds its bitrate.
+
+  * HTTPS is for a link that GOES AWAY. SRT abandons anything it cannot
+    recover inside that window — gone, permanently. The chunk queue holds
+    unsent video and delivers it late. For a recording, late beats gone.
+
+So `transport` is auto by default: ask the server for an SRT ticket, use
+it if it answers, and fall back to chunked HTTPS if it does not — or if
+SRT keeps dying, which is what a firewall eating UDP looks like from
+here. Both land in the same session on the server, so the recording on
+disk is identical either way.
 """
 
 import json
@@ -52,6 +73,14 @@ FLUSH_BYTES = 512 * 1024    # post a chunk once it reaches this…
 FLUSH_SECONDS = 1.0         # …or this much wall time, whichever comes first
 MAX_BACKLOG_S = 30          # unsent video past this = the uplink is gone
 HTTP_TIMEOUT = 20
+
+# An SRT attempt that dies faster than this never really connected —
+# almost always UDP blocked on the way out. A few of those in a row and we
+# stop asking for a while, because HTTPS works and video matters more than
+# being right about the transport.
+SRT_MIN_ALIVE = 20
+SRT_STRIKES = 3
+SRT_COOLDOWN_S = 600
 
 
 _ANGLE_OK = 'abcdefghijklmnopqrstuvwxyz0123456789-_'
@@ -156,6 +185,44 @@ def build_ffmpeg_cmd(cfg, vcodec=''):
             'pipe:1']
 
 
+def build_srt_cmd(cfg, vcodec, url, acodec=''):
+    """Read the published feed, write MPEG-TS straight into an SRT socket.
+
+    MPEG-TS rather than fragmented MP4 because SRT carries a stream of
+    fixed-size packets with no framing of its own, and TS is the container
+    every SRT receiver expects. The server remuxes it back to fragmented
+    MP4 on arrival, still in copy mode, so the recording is byte-for-byte
+    the video this box would have posted.
+
+    The same h264_metadata level fix as the HTTPS path: it corrects what
+    the BITSTREAM declares, so it has to happen here — the server's remux
+    copies the level along with the frames and would carry a bad one all
+    the way to the phone that refuses to decode it.
+
+    -progress pipe:1 is how the settings card gets a bitrate. With SRT the
+    box is not the one queueing bytes, so there is no outbox to measure;
+    ffmpeg's own counters are the honest source.
+
+    Audio leaves here as AAC, always. The server remuxes MPEG-TS to
+    fragmented MP4 and must convert AAC's framing on the way (ADTS to
+    ASC) — a filter it has to apply blind, because it cannot know the
+    codec before the stream arrives, and which errors outright on
+    anything that is not AAC. A WHIP publisher on this box's MediaMTX
+    sends Opus; youtube_push transcodes it for its own reasons. So the
+    end that KNOWS the codec is the one that guarantees it.
+    """
+    fix = ['-bsf:v', 'h264_metadata=level=auto'] if vcodec == 'h264' else []
+    audio = (['-c:a', 'copy'] if acodec in ('aac', '')
+             else ['-c:a', 'aac', '-b:a', '128k', '-ar', '48000'])
+    return ['ffmpeg', '-hide_banner', '-loglevel', 'warning',
+            '-progress', 'pipe:1', '-nostats',
+            '-rtsp_transport', 'tcp', '-i', rtsp_in(cfg),
+            '-map', '0:v:0', '-map', '0:a:0?',
+            '-c:v', 'copy'] + fix + audio + [
+            '-muxdelay', '0', '-muxpreload', '0',
+            '-f', 'mpegts', url]
+
+
 class StatusWriter:
     """Atomic live-push status JSON, for the settings page and heartbeat."""
 
@@ -211,6 +278,10 @@ class LivePusher:
         self.running = True
         self.proc = None
         self.session = None
+        self.progress = {}
+        # SRT is asked for again after this; see _note_srt_attempt.
+        self._srt_off_until = 0.0
+        self._srt_strikes = 0
 
     # ── the stream server ───────────────────────────────────────────────
     @staticmethod
@@ -237,6 +308,43 @@ class LivePusher:
             raise RuntimeError(f'stream server refused the ticket: {r}')
         return sid
 
+    def request_srt(self, target, codec):
+        """Ask for an SRT port. None means "post chunks instead".
+
+        A server without SRT configured answers 501, and that is a
+        property of the server, not of this attempt — so it is cached,
+        rather than re-asked every few seconds for the rest of the game.
+        """
+        try:
+            r = self.http(target['ingest'] + '/srt',
+                          {'token': target['token'],
+                           'capture_start': time.time(),
+                           'tier_kbps': 0, 'codec': codec})
+        except Exception as e:
+            code = getattr(e, 'code', None)
+            if code == 501:
+                self._srt_off_until = time.time() + SRT_COOLDOWN_S
+                log.info('stream server has no SRT ingest — posting chunks')
+            elif code == 503:
+                log.info('stream server SRT ports all busy — posting chunks')
+            else:
+                log.info(f'srt ticket refused ({e}) — posting chunks')
+            return None
+        t = (r or {}).get('srt') or {}
+        if not (t.get('url') and (r or {}).get('session')):
+            return None
+        return dict(t, session=r['session'], run=r.get('run'))
+
+    def transport(self, cfg):
+        """'srt', 'https', or 'auto' resolved against the cooldown."""
+        mode = ((cfg.get('live_push') or {}).get('transport')
+                or 'auto').lower()
+        if mode not in ('auto', 'srt', 'https'):
+            mode = 'auto'
+        if mode == 'auto' and time.time() < self._srt_off_until:
+            return 'https'
+        return mode
+
     def feed(self, target, sid, data, backlog_ms):
         return self.http(f"{target['ingest']}/{sid}/feed", data,
                          {'X-Backlog-Ms': str(int(backlog_ms))})
@@ -258,11 +366,105 @@ class LivePusher:
         if not cfg.get('local_ingest_key'):
             self.status.write(False, reason='box not provisioned')
             return 0
-        vcodec, _acodec = self._probe(cfg)
+        vcodec, acodec = self._probe(cfg)
         if not vcodec:
             self.status.write(False, reason='no camera publishing')
             return 0
 
+        mode = self.transport(cfg)
+        if mode != 'https':
+            ticket = self.request_srt(target, vcodec)
+            if ticket:
+                return self.push_srt(cfg, target, ticket, vcodec, acodec)
+            if mode == 'srt':
+                # Asked for explicitly, so do not quietly do something
+                # else — say why nothing is going out.
+                self.status.write(False,
+                                  reason='SRT unavailable on the server')
+                return 0
+        return self.push_https(cfg, target, vcodec)
+
+    # ── SRT: ffmpeg holds the socket, we watch ──────────────────────────
+    def push_srt(self, cfg, target, ticket, vcodec, acodec=''):
+        started = time.monotonic()
+        self.session = ticket['session']
+        self.progress = {}
+        self.proc = subprocess.Popen(
+            build_srt_cmd(cfg, vcodec, ticket['url'], acodec),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        threading.Thread(target=self._drain_stderr, daemon=True).start()
+        threading.Thread(target=self._read_progress, daemon=True).start()
+        log.info(f"live push start via SRT (angle={target['angle']}, "
+                 f"game={target['game']}, port={ticket.get('port')}, "
+                 f"latency={ticket.get('latency_ms')}ms, "
+                 f"in={vcodec}/{acodec or 'none'})")
+        try:
+            self._watch_srt(target, ticket)
+        except Exception as e:
+            log.info(f'live push (srt) ended: {e}')
+        finally:
+            self._teardown(target)
+        alive = time.monotonic() - started
+        self._note_srt_attempt(alive)
+        return alive
+
+    def _watch_srt(self, target, ticket):
+        """Once a second: is ffmpeg still there, is the ticket still ours,
+        and what do the counters say. There is no outbox to drain — SRT
+        does the queueing, inside its own latency window — so backlog is
+        reported as zero rather than invented."""
+        sent = 0
+        window = deque()
+        while self.running:
+            rc = self.proc.poll()
+            if rc is not None:
+                raise RuntimeError(f'ffmpeg exited ({rc})')
+            if _changed(target, read_target()):
+                raise RuntimeError('assignment changed')
+            total = int(self.progress.get('total_size') or 0)
+            if total > sent:
+                now = time.monotonic()
+                window.append((now, total - sent))
+                sent = total
+                while window and window[0][0] < now - 10:
+                    window.popleft()
+            self.status.write(True, transport='srt', kbps=_kbps(window),
+                              bytes=sent, backlog_ms=0,
+                              angle=target['angle'], game=target['game'],
+                              session=self.session, dropped=0,
+                              srt_port=ticket.get('port'),
+                              srt_latency_ms=ticket.get('latency_ms'))
+            time.sleep(1)
+
+    def _read_progress(self):
+        """ffmpeg -progress writes key=value lines on stdout."""
+        try:
+            for raw in self.proc.stdout:
+                line = raw.decode(errors='replace').strip()
+                key, _, val = line.partition('=')
+                if key:
+                    self.progress[key] = val
+        except (OSError, ValueError):
+            pass
+
+    def _note_srt_attempt(self, alive):
+        """UDP blocked on the way out looks exactly like this: a ticket
+        issued, ffmpeg up, and nothing ever connecting. After a few of
+        those, take the HTTPS road for a while — a working feed beats
+        being right about the transport."""
+        if alive >= SRT_MIN_ALIVE:
+            self._srt_strikes = 0
+            return
+        self._srt_strikes += 1
+        if self._srt_strikes >= SRT_STRIKES:
+            self._srt_strikes = 0
+            self._srt_off_until = time.time() + SRT_COOLDOWN_S
+            log.warning('SRT failed %d times in a row — posting chunks for '
+                        'the next %d minutes. UDP blocked on the way out is '
+                        'the usual cause.', SRT_STRIKES, SRT_COOLDOWN_S // 60)
+
+    # ── HTTPS: we do the queueing ───────────────────────────────────────
+    def push_https(self, cfg, target, vcodec):
         started = time.monotonic()
         self.proc = subprocess.Popen(build_ffmpeg_cmd(cfg, vcodec),
                                      stdout=subprocess.PIPE,
@@ -280,17 +482,20 @@ class LivePusher:
             log.info(f'live push ended: {e}')
         finally:
             outbox.close()
-            if self.proc and self.proc.poll() is None:
-                self.proc.terminate()
-                try:
-                    self.proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    self.proc.kill()
-            if self.session:
-                self.stop_session(target, self.session)
-                self.session = None
-            self.status.write(False)
+            self._teardown(target)
         return time.monotonic() - started
+
+    def _teardown(self, target):
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+        if self.session:
+            self.stop_session(target, self.session)
+            self.session = None
+        self.status.write(False)
 
     def _probe(self, cfg):
         return probe_codecs(cfg, self.runner)
@@ -350,8 +555,8 @@ class LivePusher:
             window.append((now, len(data)))
             while window and window[0][0] < now - 10:
                 window.popleft()
-            self.status.write(True, kbps=_kbps(window), bytes=sent,
-                              backlog_ms=int(backlog * 1000),
+            self.status.write(True, transport='https', kbps=_kbps(window),
+                              bytes=sent, backlog_ms=int(backlog * 1000),
                               angle=target['angle'], game=target['game'],
                               session=self.session,
                               dropped=(r or {}).get('dropped') or 0)

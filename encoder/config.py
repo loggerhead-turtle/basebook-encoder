@@ -64,7 +64,12 @@ DEFAULTS = {
     # this leg sits idle, which is why it can default on. 'angle' is the
     # name viewers see — one per box, so two boxes at one game do not
     # collide.
-    'live_push': {'enabled': True, 'angle': 'main'},
+    # 'transport': how the video travels. 'auto' asks the server for an
+    # SRT port and falls back to chunked HTTPS if it has none or if SRT
+    # keeps dying (UDP blocked). 'srt' insists; 'https' never asks. SRT
+    # holds its bitrate on a link that loses packets; HTTPS survives a
+    # link that goes away. See encoder/live_push.py.
+    'live_push': {'enabled': True, 'angle': 'main', 'transport': 'auto'},
     'version_check': {'url': '', 'enabled': True},
 }
 
