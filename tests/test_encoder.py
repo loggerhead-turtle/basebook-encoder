@@ -394,7 +394,8 @@ def test_heartbeat_payload_shape():
     assert all(u.startswith('rtmp://') for u in hb['rtmp_urls'])
     assert hb['rtmp_urls'][-1].split('/live/')[0].endswith('.local:1935')
     assert set(hb['ingest']) == {'connected', 'kbps'}
-    assert set(hb['push']) == {'connected', 'kbps', 'reconnects_5m'}
+    assert set(hb['push']) == {'connected', 'kbps', 'reconnects_5m',
+                               'codec'}
     assert hb['push']['reconnects_5m'] == 1          # only the recent one
     assert hb['push']['kbps'] == 3050
     assert isinstance(hb['cpu'], float)
@@ -2290,15 +2291,140 @@ def test_an_hevc_camera_is_read_over_rtsp():
 
 def test_an_h264_camera_keeps_the_rtmp_copy_path():
     """The battle-tested default is untouched: H.264 + AAC (Mevo) still
-    reads over loopback RTMP, byte-identical copy."""
+    reads over loopback RTMP, byte-identical copy — on CONFIRMATION of
+    both tracks."""
     from encoder import youtube_push as yp
     cfg = {'local_ingest_key': 'k'}
-    for vcodec in ('', 'h264'):                # '' = probe saw nobody yet
-        cmd = yp.build_ffmpeg_cmd(cfg, 'aac', 'rtmp://yt/x', hw='',
+    cmd = yp.build_ffmpeg_cmd(cfg, 'aac', 'rtmp://yt/x', hw='',
+                              vcodec='h264')
+    assert 'rtmp://127.0.0.1:1935/live/k' in cmd
+    assert '-rtsp_transport' not in cmd
+    assert cmd[cmd.index('-c:v') + 1] == 'copy'
+    assert ['-c:a', 'copy'] == cmd[cmd.index('-c:a'):cmd.index('-c:a') + 2]
+
+
+# Field report (Provo Bulldogs, N150 v1.2.73, 9/8): 'in=unknown/assume-aac
+# via rtmp', push dead 210 ms later, every 30 s from 20:29 to 20:36 — the
+# whole pregame — while the local ingest sat healthy at 3.7 Mbps and
+# YouTube held the broadcast at liveStarting, starved. At 20:36 one probe
+# finally landed ('in=hevc/aac via rtsp') and the same box worked. An
+# EMPTY probe result was being read as 'no obstacle' and sent down the
+# RTMP path — the one path an HEVC camera cannot use.
+
+def test_source_quality_copies_an_hevc_camera_as_hevc():
+    """'Source quality' means what it says — including an HEVC camera,
+    which rides enhanced RTMP as HEVC. Whether YouTube can read that is
+    not the box's call to make blind: the SITE gates GO LIVE on YouTube's
+    own health report and sets this box to H.264 itself if YouTube
+    starves. The box sends the best thing it has and the site holds the
+    fallback, so a person who chose HEVC gets HEVC."""
+    from encoder import youtube_push as yp
+    cfg = {'local_ingest_key': 'k'}            # no push_bitrate_kbps at all
+    cmd = yp.build_ffmpeg_cmd(cfg, 'aac', 'rtmp://yt/x', hw='vaapi',
+                              caps={'h264': True, 'hevc': True},
+                              vcodec='hevc')
+    assert cmd[cmd.index('-c:v') + 1] == 'copy'
+    assert 'h264_vaapi' not in cmd and 'hevc_vaapi' not in cmd
+    assert yp.effective_video(cfg, vcodec='hevc', hw='vaapi') == (0, '')
+    assert yp.outgoing_codec(cfg, vcodec='hevc', hw='vaapi') == 'hevc'
+
+
+def test_the_outgoing_codec_is_the_truth_not_the_setting():
+    """A copy of an HEVC camera is HEVC whatever push_codec says; a
+    transcode is its target. The heartbeat carries this so the site's
+    go-live gate reasons about what is actually leaving."""
+    from encoder import youtube_push as yp
+    k = {'local_ingest_key': 'k'}
+    assert yp.outgoing_codec(k, vcodec='h264', hw='vaapi') == 'h264'
+    assert yp.outgoing_codec(k, vcodec='hevc', hw='') == 'hevc'
+    assert yp.outgoing_codec(dict(k, push_bitrate_kbps=3000),
+                             vcodec='hevc', hw='vaapi',
+                             caps={'hevc': False}) == 'h264'
+    assert yp.outgoing_codec(dict(k, push_bitrate_kbps=3000,
+                                  push_codec='hevc'),
+                             vcodec='h264', hw='vaapi',
+                             caps={'hevc': True}) == 'hevc'
+    assert yp.outgoing_codec(k, vcodec='', hw='vaapi') == ''
+
+
+def test_the_status_file_carries_the_outgoing_codec(tmp_path):
+    import json as _json
+    from encoder import youtube_push as yp
+    st = yp.StatusWriter(tmp_path / 'push.json')
+    st.write(True, 2200, codec='hevc')
+    assert _json.loads((tmp_path / 'push.json').read_text())['codec'] == 'hevc'
+    st.write(False)                        # a later write keeps it
+    assert _json.loads((tmp_path / 'push.json').read_text())['codec'] == 'hevc'
+
+
+def test_a_chosen_bitrate_still_wins():
+    from encoder import youtube_push as yp
+    cfg = {'local_ingest_key': 'k', 'push_bitrate_kbps': 2500,
+           'push_codec': 'hevc'}
+    assert yp.effective_video(cfg, vcodec='hevc', hw='vaapi',
+                              caps={'hevc': True}) == (2500, 'hevc')
+
+
+def test_an_unreadable_probe_falls_back_to_rtsp_not_rtmp():
+    """Unknown is not safe. RTSP carries every track whatever the camera
+    turns out to be, so it is what we fall back TO — never what we fall
+    back FROM."""
+    from encoder import youtube_push as yp
+    cfg = {'local_ingest_key': 'k'}
+    for vcodec, acodec in (('', ''), ('', 'aac'), ('h264', ''),
+                           ('hevc', ''), ('', 'opus')):
+        cmd = yp.build_ffmpeg_cmd(cfg, acodec, 'rtmp://yt/x', hw='',
                                   vcodec=vcodec)
-        assert 'rtmp://127.0.0.1:1935/live/k' in cmd
-        assert '-rtsp_transport' not in cmd
-        assert cmd[cmd.index('-c:v') + 1] == 'copy'
+        assert '-rtsp_transport' in cmd, (vcodec, acodec)
+        assert 'rtsp://127.0.0.1:8554/live/k' in cmd, (vcodec, acodec)
+        assert 'rtmp://127.0.0.1:1935/live/k' not in cmd, (vcodec, acodec)
+        # the picture is still copied — the fallback changes the READ,
+        # not the video; and audio we cannot NAME is re-encoded to
+        # something flv is certain to carry, while confirmed AAC still
+        # rides across untouched
+        assert cmd[cmd.index('-c:v') + 1] == 'copy', (vcodec, acodec)
+        want = 'copy' if acodec == 'aac' else 'aac'
+        assert cmd[cmd.index('-c:a') + 1] == want, (vcodec, acodec)
+
+
+def test_a_push_that_dies_instantly_logs_why(tmp_path, caplog):
+    """Seven minutes of bare 'push ended — reconnecting' is what sent a
+    person to the ballpark with a laptop. ffmpeg had already said why on
+    stderr; nothing was reading it."""
+    import logging
+    import subprocess
+    from encoder import youtube_push as yp
+
+    class _Proc:
+        stdout = iter(())
+        stderr = iter(('rtsp://127.0.0.1:8554/live/k: Invalid data found\n',))
+
+        def wait(self):
+            return 1
+
+        def terminate(self):
+            pass
+
+    def _probe_failed(cmd, **kw):
+        return type('R', (), {'returncode': 1, 'stdout': ''})()
+
+    pusher = yp.YouTubePusher(
+        cfg_load=lambda: {
+            'local_ingest_key': 'k',
+            'youtube': {'key': 'yt-key',
+                        'url': 'rtmp://a.rtmp.youtube.com/live2'}},
+        runner=_probe_failed,
+        status=yp.StatusWriter(tmp_path / 'push.json'))
+    real_popen = subprocess.Popen
+    subprocess.Popen = lambda *a, **kw: _Proc()
+    try:
+        with caplog.at_level(logging.WARNING, logger='youtube_push'):
+            alive = pusher.run_once()
+    finally:
+        subprocess.Popen = real_popen
+    assert alive < 5
+    assert any('Invalid data found' in r.message for r in caplog.records), \
+        [r.message for r in caplog.records]
 
 
 def test_probe_codecs_reads_both_tracks_and_fails_closed():

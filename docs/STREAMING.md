@@ -23,8 +23,20 @@ can rotate it from the settings page.
 3. URL: `rtmp://playcall-encoder.local:1935/live`
    Stream key: `<your-key>` (some versions take the full URL in one field —
    that works too).
-4. Go live in the app. The encoder's status page shows "Receiving" within
+4. In the same streaming settings: **H.264**, 1080p30, 3–4.5 Mbps,
+   keyframe interval **2 s**. Set the bitrate for your *uplink*, not
+   your LAN.
+5. Go live in the app. The encoder's status page shows "Receiving" within
    a couple of seconds.
+
+> **H.264 is the quiet default.** Mevo cameras that offer HEVC will
+> happily send it, and the box ingests, records and clips it fine — but
+> the loopback RTMP read cannot carry it (the box falls back to RTSP),
+> and reaching YouTube then costs a transcode. H.264 out of the camera
+> skips both. Send HEVC if you want it: the box handles it, and the
+> quality selector decides separately what YouTube gets — see the
+> HEVC-to-YouTube section in `N150.md` for how to test that leg
+> properly before trusting it on a game night.
 
 ## Larix Broadcaster (iPhone / Android)
 
@@ -66,3 +78,9 @@ srt://<encoder-ip>:8890?streamid=publish:live/<your-key>
 |---|---|---|
 | Good (10+ Mbps up) | 4.5–6 Mbps 1080p30 | YouTube gets the full picture |
 | Field LTE / hotspot | 2.5–3.5 Mbps 720p30 | Copy mode means what you send is what YouTube gets — size it for the *uplink*, not the LAN |
+
+Every camera: **H.264**, keyframe interval **2 s**. The 📺 quality
+selector on the site's Encoders card decides what YouTube gets from
+there; leave it on **Source quality** for an H.264 camera (a
+byte-identical copy) and it will transcode by itself only when the
+camera sends something YouTube cannot take.

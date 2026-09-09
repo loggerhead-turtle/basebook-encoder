@@ -300,14 +300,18 @@ class CloudLink:
         try:
             data = json.loads(path.read_text())
         except (OSError, ValueError):
-            return {'connected': False, 'kbps': None, 'reconnects_5m': 0}
+            return {'connected': False, 'kbps': None, 'reconnects_5m': 0,
+                    'codec': ''}
         fresh = time.time() - data.get('updated', 0) < 30
         cutoff = time.time() - 300
         reconnects = sum(1 for t in data.get('reconnect_times', [])
                          if t >= cutoff)
         return {'connected': bool(data.get('connected')) and fresh,
                 'kbps': data.get('kbps') if fresh else None,
-                'reconnects_5m': reconnects}
+                'reconnects_5m': reconnects,
+                # what is actually leaving for YouTube; the site's go-live
+                # gate switches this box to H.264 if YouTube starves on it
+                'codec': str(data.get('codec') or '') if fresh else ''}
 
     def clips_status(self):
         """{'pending','uploaded','failed','last_error'} from clipper.py's

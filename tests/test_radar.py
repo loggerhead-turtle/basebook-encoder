@@ -1049,3 +1049,85 @@ def test_sender_failure_keeps_events_and_mid_post_arrivals_survive():
     sent = [p for _u, p in link.posts if p.get('events')][-1]['events']
     assert [e['peak'] for e in sent] == [77.0]
     assert [e['peak'] for e in svc.pending] == [81.0]    # mid-POST arrival
+
+
+# ── the rolldown measurement ────────────────────────────────────────────
+# plate ÷ peak: how much the ball slowed on its way to the gun. Measured
+# here, judged in the cloud's own time — see the note above ROLL_FLAT.
+
+def _live(mph, peak=None, rpm=None):
+    return {'live': mph, 'peak': peak, 'rpm': rpm, 'alive': True}
+
+
+def _run(eng, seq, t0=0.0, step=0.1):
+    t = t0
+    for f in seq:
+        eng.feed(f, t=t)
+        t += step
+    return eng.feed(parse_frame(IDLE), t=t + 3.0)
+
+
+def test_a_pitch_carries_its_rolldown():
+    """An 85 leaves the hand and crosses at about 77 — the decay a ball
+    cannot fake over 55 feet."""
+    eng = BurstEngine()
+    ev = _run(eng, [_live(v, peak=85.0)
+                    for v in (85.0, 83.1, 81.0, 79.4, 77.6)])
+    assert ev['kind'] == 'pitch'
+    assert ev['roll'] == round(77.6 / 85.0, 3)
+
+
+def test_a_track_that_never_slows_is_measured_as_flat():
+    eng = BurstEngine()
+    ev = _run(eng, [_live(45.0, peak=45.0) for _ in range(6)])
+    assert ev['roll'] == 1.0
+
+
+def test_a_burst_too_short_to_measure_reports_no_rolldown():
+    """None, never a guessed 1.0 — an absent measurement has to stay
+    distinguishable from a measured one."""
+    eng = BurstEngine()
+    ev = _run(eng, [_live(85.0, peak=85.0) for _ in range(3)])
+    assert ev['roll'] is None
+    # …and long enough in frames but not in TIME says nothing either
+    eng2 = BurstEngine()
+    ev2 = _run(eng2, [_live(85.0 - i, peak=85.0) for i in range(5)],
+               step=0.02)
+    assert ev2['roll'] is None
+
+
+def test_a_peak_only_gun_reports_no_rolldown():
+    """Some guns latch a peak and stream no live field at all. They still
+    score; they simply have nothing to say about deceleration."""
+    eng = BurstEngine()
+    ev = _run(eng, [{'live': None, 'peak': 85.0, 'rpm': None, 'alive': True}
+                    for _ in range(6)])
+    assert ev['roll'] is None
+    assert ev['kind'] == 'pitch'
+
+
+def test_the_rolldown_reads_the_tail_not_the_windup():
+    """Taken after the fastest sample: before it the ball has not been
+    seen at release speed yet, and a slow first frame would read as a
+    deceleration that never happened."""
+    eng = BurstEngine()
+    ev = _run(eng, [_live(v, peak=85.0)
+                    for v in (60.0, 85.0, 82.0, 80.0, 78.0)])
+    assert ev['roll'] == round(78.0 / 85.0, 3)
+
+
+def test_one_stray_last_frame_cannot_decide_a_pitch():
+    """The slowest of the tail, not the last of it."""
+    eng = BurstEngine()
+    ev = _run(eng, [_live(v, peak=85.0)
+                    for v in (85.0, 82.0, 79.0, 77.0, 84.0)])
+    assert ev['roll'] == round(77.0 / 85.0, 3)
+
+
+def test_measuring_the_rolldown_changes_no_verdict():
+    """It rides along; it does not vote. A flat track that is otherwise
+    pitch-shaped still files as a pitch until real data sets a
+    threshold."""
+    eng = BurstEngine()
+    ev = _run(eng, [_live(45.0, peak=45.0) for _ in range(6)])
+    assert ev['kind'] == 'pitch' and ev['roll'] == 1.0

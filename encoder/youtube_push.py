@@ -35,6 +35,7 @@ RECONNECT_BASE = 3        # seconds; doubles per consecutive fast failure
 RECONNECT_MAX = 30
 
 
+
 def rtmp_in(cfg):
     return f"rtmp://127.0.0.1:1935/live/{cfg['local_ingest_key']}"
 
@@ -109,31 +110,66 @@ def push_codec(cfg, caps=None):
     return 'hevc' if caps.get('hevc') else 'h264'
 
 
+def effective_video(cfg, vcodec='', hw=None, caps=None):
+    """(kbps, encoder codec) the push will really use — (0, '') for copy.
+
+    'Source quality' is a copy, byte-identical, ~0 CPU — including an
+    HEVC camera, which rides enhanced RTMP as HEVC. Whether YouTube can
+    read that is not this box's call to make blind: the site gates GO
+    LIVE on YouTube's own health report and, if YouTube starves on the
+    HEVC, sets this box to H.264 itself (the assignment poll picks it up
+    inside ~5 s). So the box sends the best thing it has and the site
+    holds the fallback, instead of the box quietly transcoding what the
+    person chose not to."""
+    hw = system.hw_encoder() if hw is None else hw
+    kbps = push_bitrate(cfg, hw=hw)
+    if kbps:
+        return kbps, push_codec(cfg, caps=caps)
+    return 0, ''
+
+
+def outgoing_codec(cfg, vcodec='', hw=None, caps=None):
+    """The codec that actually leaves for YouTube: the transcode target,
+    or the camera's own when copying. Reported in the heartbeat so the
+    site's go-live gate reasons about the truth, not the setting."""
+    kbps, codec = effective_video(cfg, vcodec=vcodec, hw=hw, caps=caps)
+    return codec if kbps else (vcodec or '')
+
+
 def build_ffmpeg_cmd(cfg, acodec, push_url, hw=None, caps=None, vcodec=''):
     # The INPUT leg must carry every track. Loopback RTMP only carries
     # H.264 + AAC — MediaMTX drops anything else from an RTMP read
     # ('skipping track (H265)'), which handed ffmpeg an audio-only
     # stream from an HEVC camera and crash-looped the push while the
-    # local ingest was perfectly healthy. So: RTMP only when BOTH tracks
-    # are RTMP-safe; any other camera (HEVC video, Opus audio) is read
-    # over loopback RTSP, which carries the true track list.
-    rtmp_safe = (not acodec or acodec == 'aac') \
-        and (not vcodec or vcodec == 'h264')
+    # local ingest was perfectly healthy.
+    #
+    # So RTMP is taken only on POSITIVE confirmation of both tracks.
+    # UNKNOWN is not safe — it is the case that broke: a probe that came
+    # back empty (nobody publishing yet, or ffprobe timed out) used to
+    # read the empty string as 'no obstacle' and pick RTMP, so an HEVC
+    # camera died on an audio-only input in 200 ms, every 30 s, for a
+    # whole pregame (Provo, 9/8: 'in=unknown … via rtmp', 7 minutes of
+    # it, until one probe finally landed and the same box went straight
+    # to work over RTSP). RTSP carries the true track list, so it is
+    # what we fall back TO, never what we fall back FROM.
+    rtmp_safe = vcodec == 'h264' and acodec == 'aac'
     if rtmp_safe:
         input_args = ['-rw_timeout', '10000000', '-i', rtmp_in(cfg)]
     else:
         input_args = ['-rtsp_transport', 'tcp', '-i', rtsp_in(cfg)]
-    audio_args = (['-c:a', 'copy'] if not acodec or acodec == 'aac'
+    # Same rule for audio: copy only what we KNOW is AAC. Copying an
+    # unidentified track into flv is how a phone's Opus killed the push;
+    # a camera with no audio at all ignores the encoder option anyway.
+    audio_args = (['-c:a', 'copy'] if acodec == 'aac'
                   else ['-c:a', 'aac', '-b:a', '128k', '-ar', '48000'])
-    kbps = push_bitrate(cfg, hw=hw)
+    kbps, codec = effective_video(cfg, vcodec=vcodec, hw=hw, caps=caps)
     if kbps:
         # QuickSync via VA-API: decode on CPU (cheap), upload frames to
         # the GPU, encode there. CBR-ish with a 2x buffer and a 2 s GOP —
         # what YouTube's ingest guidance wants for live. HEVC rides
         # enhanced RTMP (ffmpeg writes the hvc1 fourcc into flv) at the
         # same bitrate — ~35% more quality per bit on the same uplink.
-        enc = ('hevc_vaapi' if push_codec(cfg, caps=caps) == 'hevc'
-               else 'h264_vaapi')
+        enc = 'hevc_vaapi' if codec == 'hevc' else 'h264_vaapi'
         video_args = ['-vaapi_device', '/dev/dri/renderD128',
                       '-vf', 'format=nv12,hwupload',
                       '-c:v', enc,
@@ -179,8 +215,11 @@ class StatusWriter:
         self.reconnect_times = deque(maxlen=100)
         self.stderr_tail = deque(maxlen=40)
 
-    def write(self, connected, kbps=None):
+    def write(self, connected, kbps=None, codec=None):
+        if codec is not None:
+            self.codec = codec
         data = {'connected': connected, 'kbps': kbps,
+                'codec': getattr(self, 'codec', ''),
                 'updated': time.time(),
                 'reconnect_times': list(self.reconnect_times)[-50:],
                 'stderr_tail': list(self.stderr_tail)}
@@ -213,33 +252,36 @@ class YouTubePusher:
             self.status.write(False)
             return 0
         vcodec, acodec = probe_codecs(cfg, self.runner)
+        if not (vcodec and acodec):
+            log.info('could not read the camera tracks (nobody '
+                     'publishing yet, or the probe timed out) — reading '
+                     'over RTSP, which carries every track whatever the '
+                     'camera turns out to be')
         cmd = build_ffmpeg_cmd(cfg, acodec, url, vcodec=vcodec)
-        kbps = push_bitrate(cfg)
+        kbps, codec = effective_video(cfg, vcodec=vcodec)
         want = int(cfg.get('push_bitrate_kbps') or 0)
         if want > 0 and not kbps:
             # configured for a box class this box is not — say so once
             # per attempt, then do the right thing anyway
             log.info(f'push_bitrate_kbps={want} configured but this box '
                      'has no hardware encoder — pushing source copy')
-        codec = push_codec(cfg) if kbps else ''
         if kbps and (cfg.get('push_codec') or 'h264') == 'hevc' \
-                and codec != 'hevc':
+                and codec != 'hevc' and want > 0:
             log.info('push_codec=hevc configured but this box cannot '
                      'encode/mux HEVC — transcoding to H.264 instead')
         if vcodec and vcodec != 'h264' and not kbps:
-            # copying non-H.264 into flv needs enhanced-RTMP muxing; a
-            # too-old ffmpeg will fail here, so leave a breadcrumb that
-            # names the camera codec instead of a bare reconnect loop
             log.info(f'camera sends {vcodec} and no transcode is '
-                     'configured — copying it to YouTube as-is (needs '
-                     'an enhanced-RTMP-capable ffmpeg)')
+                     'configured — copying it to YouTube as-is over '
+                     'enhanced RTMP. If YouTube cannot read it, the site '
+                     'switches this box to H.264 when GO LIVE is pressed.')
         log.info('push start ('
-                 + f"in={vcodec or 'unknown'}/{acodec or 'assume-aac'}"
+                 + f"in={vcodec or 'unknown'}/{acodec or 'unknown'}"
                  + (' via rtsp' if '-rtsp_transport' in cmd else ' via rtmp')
                  + ', video='
                  + (f'{kbps}k {codec} transcode' if kbps else 'copy') + ')')
         started = time.monotonic()
         state = {}
+        self.status.codec = outgoing_codec(cfg, vcodec=vcodec)
         self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                      stderr=subprocess.PIPE, text=True)
         import threading
@@ -247,7 +289,8 @@ class YouTubePusher:
         def _drain_stderr():
             for line in self.proc.stderr:
                 self.status.stderr_tail.append(line.rstrip())
-        threading.Thread(target=_drain_stderr, daemon=True).start()
+        drain = threading.Thread(target=_drain_stderr, daemon=True)
+        drain.start()
 
         for line in self.proc.stdout:
             kbps = parse_progress_line(line, state)
@@ -257,8 +300,22 @@ class YouTubePusher:
                 self.proc.terminate()
                 break
         self.proc.wait()
+        # Let the stderr reader finish before anyone asks what it saw:
+        # on a failure this fast the drain thread has often not run at
+        # all yet, and the reason we are about to log would be an empty
+        # deque.
+        drain.join(timeout=2)
         self.status.write(False)
-        return time.monotonic() - started
+        alive = time.monotonic() - started
+        if alive < 5:
+            # A push that dies this fast died on its INPUT, and ffmpeg
+            # already said why on stderr — where it stayed, unread, while
+            # the journal showed nothing but 'push ended — reconnecting'
+            # for seven minutes of pregame. The reason belongs in the log
+            # the first time, not after somebody drives to the ballpark.
+            for line in list(self.status.stderr_tail)[-4:]:
+                log.warning(f'push failed after {alive:.1f}s: {line}')
+        return alive
 
     def run_forever(self):
         backoff = RECONNECT_BASE

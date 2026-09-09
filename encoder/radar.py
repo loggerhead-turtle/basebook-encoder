@@ -55,6 +55,30 @@ ALIVE_INTERVAL = 10           # keepalive push while idle
 GAP_S = 1.0                   # quiet gap that closes a burst
 MIN_FRAMES = 3                # fewer = ghost
 PITCH_MAX_DUR = 1.6           # longer in the beam = a throw, not a pitch
+# ── the ROLLDOWN measurement ────────────────────────────────────────────
+# A ball thrown 55 ft AT the gun always slows measurably on the way: about
+# a mile an hour per seven feet, so 8-12% between release and the plate
+# (an 85 leaves the hand and crosses at 76-78). A vehicle crossing the
+# outfield has no reason to show that — its speed is set by a throttle,
+# not by drag over 55 ft — which makes the ratio plate ÷ peak the most
+# promising way to tell the two apart (field report: "multiple pitches
+# today that were 45 miles an hour instead of 85… they ended up in the
+# book as a pitch").
+#
+# It is MEASURED here and judged nowhere. Rejecting a burst on this ratio
+# means betting that every gun, in every mode, streams the decay — and
+# this repo's own constant-on fixture streams a flat live value for a
+# ball, so that bet is not one the evidence supports yet. A threshold set
+# wrong here does not cost a stray reading; it costs every velocity in
+# the game, silently. So the number rides along to the cloud on every
+# burst, where a season of them can set the threshold from data instead
+# of from physics-flavoured guessing. The guard that actually protects
+# the book today compares a pitcher against HIMSELF — see
+# cloud/scorekeeper/radar.py::_out_of_family.
+ROLL_MIN_SAMPLES = 4          # live readings needed before roll is measured
+ROLL_MIN_SPAN = 0.20          # …spread over at least this many seconds
+ROLL_FLAT = 0.985             # what "no decay at all" would look like
+
 BAND = (30.0, 110.0)          # plausible pitch band (pref: set the GUN's
                               # LO threshold BELOW the slowest pitcher and
                               # let software filter — see the roadmap doc)
@@ -136,11 +160,13 @@ class BurstEngine:
     frames carrying values, closed by GAP_S of quiet."""
 
     def __init__(self, gap=GAP_S, min_frames=MIN_FRAMES,
-                 pitch_max_dur=PITCH_MAX_DUR, band=BAND):
+                 pitch_max_dur=PITCH_MAX_DUR, band=BAND,
+                 roll_flat=ROLL_FLAT):
         self.gap = gap
         self.min_frames = min_frames
         self.pitch_max_dur = pitch_max_dur
         self.band = band
+        self.roll_flat = roll_flat
         self._frames = []            # (t, live, peak, rpm)
         self._last_value_t = None
 
@@ -207,6 +233,7 @@ class BurstEngine:
             return None
         peak = max(speeds)
         dur = round(frames[-1][0] - frames[0][0], 2)
+        roll = self._rolldown(frames, peak)
         if len(frames) < self.min_frames \
                 or not self.band[0] <= peak <= self.band[1]:
             kind = 'ghost'
@@ -217,7 +244,29 @@ class BurstEngine:
         return {'kind': kind, 'peak': round(peak, 1),
                 'plate': round(lives[-1], 1) if lives else None,
                 'rpm': round(max(rpms), 1) if rpms else None,
+                'roll': roll,
                 'frames': len(frames), 'dur': dur}
+
+    @staticmethod
+    def _rolldown(frames, peak):
+        """plate ÷ peak across the tail of the track, or None when the
+        burst does not carry enough live readings to have measured it.
+
+        Deliberately returns None rather than a guess: an absent
+        measurement has to stay distinguishable from a measured 1.0, or
+        the first thing anyone does with this column is average the two
+        together. Read off the frames after
+        the fastest live sample — before it the ball has not been seen
+        at its release speed yet — and taken as the SLOWEST of them, so
+        one stray frame at the end cannot decide a pitch."""
+        live = [(t, lv) for t, lv, _pk, _r in frames if lv]
+        if len(live) < ROLL_MIN_SAMPLES or not peak:
+            return None
+        fastest = max(range(len(live)), key=lambda i: live[i][1])
+        tail = live[fastest:]
+        if len(tail) < 2 or tail[-1][0] - tail[0][0] < ROLL_MIN_SPAN:
+            return None
+        return round(min(v for _t, v in tail) / peak, 3)
 
 
 def find_ports(cfg=None):
