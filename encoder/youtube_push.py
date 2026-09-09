@@ -267,6 +267,17 @@ class StatusWriter:
             pass
 
 
+# A hardware decode that LIVES but decodes nothing. Maeser, 9/9 15:58:
+# ffmpeg stayed up on VAAPI HEVC with "hardware accelerator failed to
+# decode picture" on every frame and 0 bytes out — alive, so the
+# fast-death fallback never fired, and YouTube saw nothing. Either
+# symptom below turns the chip off for the next attempt.
+HW_DECODE_ERRORS_MAX = 25      # stderr decode failures in one attempt
+HW_NO_OUTPUT_SECS = 20         # connected this long with no bytes out
+_HW_DECODE_ERROR_MARKS = ('hardware accelerator failed to decode',
+                          'Failed to end picture decode')
+
+
 class YouTubePusher:
     def __init__(self, cfg_load=config.load, runner=None, status=None):
         self.cfg_load = cfg_load
@@ -274,6 +285,7 @@ class YouTubePusher:
         self.status = status or StatusWriter()
         self.running = True
         self.proc = None
+        self.fell_back = False
 
     def push_url(self):
         from .provisioning import youtube_push_url
@@ -326,12 +338,17 @@ class YouTubePusher:
                                      stderr=subprocess.PIPE, text=True)
         import threading
 
+        hw_errors = [0]
+
         def _drain_stderr():
             for line in self.proc.stderr:
                 self.status.stderr_tail.append(line.rstrip())
+                if any(m in line for m in _HW_DECODE_ERROR_MARKS):
+                    hw_errors[0] += 1
         drain = threading.Thread(target=_drain_stderr, daemon=True)
         drain.start()
 
+        self.fell_back = False
         for line in self.proc.stdout:
             kbps = parse_progress_line(line, state)
             if kbps is not None:
@@ -339,6 +356,22 @@ class YouTubePusher:
             if not self.running:
                 self.proc.terminate()
                 break
+            if hw_decode and transcoding and not self.fell_back:
+                alive_s = time.monotonic() - started
+                out_bytes = int(state.get('total_size') or 0)
+                if hw_errors[0] >= HW_DECODE_ERRORS_MAX \
+                        or (alive_s > HW_NO_OUTPUT_SECS and not out_bytes):
+                    # alive and decoding nothing: the chip refused this
+                    # stream without dying. Decode on the CPU instead.
+                    self.fell_back = True
+                    self.hw_decode = False
+                    log.warning(
+                        'hardware decode is producing nothing '
+                        f'({hw_errors[0]} decode errors, {out_bytes} bytes '
+                        f'out after {alive_s:.0f}s) — restarting with CPU '
+                        'decode')
+                    self.proc.terminate()
+                    break
         self.proc.wait()
         # Let the stderr reader finish before anyone asks what it saw:
         # on a failure this fast the drain thread has often not run at
@@ -373,7 +406,7 @@ class YouTubePusher:
             # A push that survived a while resets the backoff; consecutive
             # instant failures (no publisher yet / bad key) back off so we
             # don't hammer YouTube.
-            backoff = RECONNECT_BASE if alive > 30 else \
+            backoff = RECONNECT_BASE if alive > 30 or self.fell_back else \
                 min(RECONNECT_MAX, backoff * 2)
             self.status.reconnect_times.append(time.time())
             log.info(f'push ended — reconnecting in {backoff}s')

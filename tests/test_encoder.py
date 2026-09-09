@@ -2525,3 +2525,68 @@ def test_probe_codecs_reads_both_tracks_and_fails_closed():
     assert yp.probe_codecs(cfg, lambda c, **kw: _R(0, 'junk')) == ('', '')
     # the shell-parity wrapper still answers audio-only
     assert yp.probe_audio_codec(cfg, lambda c, **kw: _R(0, ok)) == 'aac'
+
+
+def test_a_chip_that_lives_but_decodes_nothing_falls_back_to_the_cpu(
+        tmp_path):
+    """Maeser, 9/9 15:58: VAAPI HEVC stayed up with 'hardware accelerator
+    failed to decode picture' on every frame and 0 bytes out. Alive, so
+    the fast-death fallback never fired. Enough of those lines — or 20 s
+    connected with nothing out — and the next attempt decodes on the
+    CPU, without waiting for a death that never comes."""
+    import subprocess
+    import threading
+    import time as _time
+    from encoder import youtube_push as yp
+
+    class _Proc:
+        def __init__(self, finite=False):
+            self.dead = threading.Event()
+            if finite:                 # the CPU attempt: ends on its own
+                self.dead.set()
+            self.stderr = iter(['[hevc @ 0x1] hardware accelerator failed '
+                                'to decode picture\n'] * 40)
+
+        @property
+        def stdout(self):
+            def gen():
+                while not self.dead.is_set():
+                    for l in ('total_size=0\n', 'out_time_us=1000000\n',
+                              'speed=1.19x\n', 'progress=continue\n'):
+                        yield l
+                    _time.sleep(0.01)
+            return gen()
+
+        def wait(self):
+            return 0
+
+        def terminate(self):
+            self.dead.set()
+
+    seen = []
+    real = subprocess.Popen
+    subprocess.Popen = lambda cmd, **kw: seen.append(cmd) or _Proc(
+        finite=len(seen) > 1)
+    try:
+        pusher = yp.YouTubePusher(
+            cfg_load=lambda: {'local_ingest_key': 'k', 'push_bitrate_kbps': 2500,
+                              'push_codec': 'hevc',
+                              'youtube': {'key': 'yt', 'url': 'rtmp://a/b'}},
+            runner=lambda c, **kw: type('R', (), {'returncode': 0, 'stdout':
+                '{"streams":[{"codec_type":"video","codec_name":"hevc"},'
+                '{"codec_type":"audio","codec_name":"aac"}]}'})(),
+            status=yp.StatusWriter(tmp_path / 'push.json'))
+        import encoder.system as system
+        real_hw = system.hw_encoder
+        system.hw_encoder = lambda: 'vaapi'
+        try:
+            t0 = _time.monotonic()
+            pusher.run_once()
+            assert _time.monotonic() - t0 < 10, 'waited for a death instead'
+            assert pusher.fell_back and pusher.hw_decode is False
+            pusher.run_once()
+        finally:
+            system.hw_encoder = real_hw
+    finally:
+        subprocess.Popen = real
+    assert '-hwaccel' in seen[0] and '-hwaccel' not in seen[1]
