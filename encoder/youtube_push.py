@@ -136,7 +136,8 @@ def outgoing_codec(cfg, vcodec='', hw=None, caps=None):
     return codec if kbps else (vcodec or '')
 
 
-def build_ffmpeg_cmd(cfg, acodec, push_url, hw=None, caps=None, vcodec=''):
+def build_ffmpeg_cmd(cfg, acodec, push_url, hw=None, caps=None, vcodec='',
+                     hw_decode=True):
     # The INPUT leg must carry every track. Loopback RTMP only carries
     # H.264 + AAC — MediaMTX drops anything else from an RTMP read
     # ('skipping track (H265)'), which handed ffmpeg an audio-only
@@ -164,17 +165,31 @@ def build_ffmpeg_cmd(cfg, acodec, push_url, hw=None, caps=None, vcodec=''):
                   else ['-c:a', 'aac', '-b:a', '128k', '-ar', '48000'])
     kbps, codec = effective_video(cfg, vcodec=vcodec, hw=hw, caps=caps)
     if kbps:
-        # QuickSync via VA-API: decode on CPU (cheap), upload frames to
-        # the GPU, encode there. CBR-ish with a 2x buffer and a 2 s GOP —
+        # QuickSync via VA-API, both halves on the chip. The decode used
+        # to run on the CPU ('cheap') — which it is for H.264 and is NOT
+        # for a Mevo's 1080p HEVC on an N150: the transcode ran at 0.63×
+        # real time, YouTube received 2940 kbps of a 4665 kbps picture and
+        # called it starved, on a gigabit line (Maeser, 9/9). Decoding on
+        # the chip keeps the whole pipeline on the GPU; hw_decode=False is
+        # the CPU path kept for a stream the chip refuses (run_once falls
+        # back to it after one fast death). CBR-ish, 2x buffer, 2 s GOP —
         # what YouTube's ingest guidance wants for live. HEVC rides
-        # enhanced RTMP (ffmpeg writes the hvc1 fourcc into flv) at the
-        # same bitrate — ~35% more quality per bit on the same uplink.
+        # enhanced RTMP at the same bitrate.
         enc = 'hevc_vaapi' if codec == 'hevc' else 'h264_vaapi'
-        video_args = ['-vaapi_device', '/dev/dri/renderD128',
-                      '-vf', 'format=nv12,hwupload',
-                      '-c:v', enc,
-                      '-b:v', f'{kbps}k', '-maxrate', f'{kbps}k',
-                      '-bufsize', f'{kbps * 2}k', '-g', '60']
+        if hw_decode:
+            input_args = ['-hwaccel', 'vaapi',
+                          '-hwaccel_output_format', 'vaapi',
+                          '-vaapi_device', '/dev/dri/renderD128'] + input_args
+            video_args = ['-vf', 'scale_vaapi=format=nv12',
+                          '-c:v', enc,
+                          '-b:v', f'{kbps}k', '-maxrate', f'{kbps}k',
+                          '-bufsize', f'{kbps * 2}k', '-g', '60']
+        else:
+            video_args = ['-vaapi_device', '/dev/dri/renderD128',
+                          '-vf', 'format=nv12,hwupload',
+                          '-c:v', enc,
+                          '-b:v', f'{kbps}k', '-maxrate', f'{kbps}k',
+                          '-bufsize', f'{kbps * 2}k', '-g', '60']
     else:
         video_args = ['-c:v', 'copy']
     return (['ffmpeg', '-hide_banner', '-loglevel', 'warning',
@@ -207,6 +222,19 @@ def parse_progress_line(line, state):
     return int((size - prev_size) * 8 / dt / 1000)     # kbps
 
 
+def progress_speed(state):
+    """ffmpeg's own 'speed=0.63x' from the progress block, as a float,
+    or None. Below 1.0 the transcode is not keeping up with the camera —
+    the ONE number that says so, and the kbps above cannot: it is bytes
+    per media-second, not per wall-second, which is exactly how a box
+    reported 4665 kbps while YouTube received 2940."""
+    v = str(state.get('speed') or '').strip().rstrip('x')
+    try:
+        return float(v) if v else None
+    except ValueError:
+        return None
+
+
 class StatusWriter:
     """Atomic push-status JSON the cloud_link heartbeat reads."""
 
@@ -215,11 +243,18 @@ class StatusWriter:
         self.reconnect_times = deque(maxlen=100)
         self.stderr_tail = deque(maxlen=40)
 
-    def write(self, connected, kbps=None, codec=None):
+    def write(self, connected, kbps=None, codec=None, speed=None,
+              in_codec=None):
         if codec is not None:
             self.codec = codec
+        if in_codec is not None:
+            self.in_codec = in_codec
+        if speed is not None:
+            self.speed = speed
         data = {'connected': connected, 'kbps': kbps,
                 'codec': getattr(self, 'codec', ''),
+                'in_codec': getattr(self, 'in_codec', ''),
+                'speed': getattr(self, 'speed', None) if connected else None,
                 'updated': time.time(),
                 'reconnect_times': list(self.reconnect_times)[-50:],
                 'stderr_tail': list(self.stderr_tail)}
@@ -257,7 +292,9 @@ class YouTubePusher:
                      'publishing yet, or the probe timed out) — reading '
                      'over RTSP, which carries every track whatever the '
                      'camera turns out to be')
-        cmd = build_ffmpeg_cmd(cfg, acodec, url, vcodec=vcodec)
+        hw_decode = getattr(self, 'hw_decode', True)
+        cmd = build_ffmpeg_cmd(cfg, acodec, url, vcodec=vcodec,
+                               hw_decode=hw_decode)
         kbps, codec = effective_video(cfg, vcodec=vcodec)
         want = int(cfg.get('push_bitrate_kbps') or 0)
         if want > 0 and not kbps:
@@ -282,6 +319,9 @@ class YouTubePusher:
         started = time.monotonic()
         state = {}
         self.status.codec = outgoing_codec(cfg, vcodec=vcodec)
+        self.status.in_codec = vcodec or ''
+        self.status.speed = None
+        transcoding = bool(kbps)
         self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                      stderr=subprocess.PIPE, text=True)
         import threading
@@ -295,7 +335,7 @@ class YouTubePusher:
         for line in self.proc.stdout:
             kbps = parse_progress_line(line, state)
             if kbps is not None:
-                self.status.write(True, kbps)
+                self.status.write(True, kbps, speed=progress_speed(state))
             if not self.running:
                 self.proc.terminate()
                 break
@@ -307,6 +347,13 @@ class YouTubePusher:
         drain.join(timeout=2)
         self.status.write(False)
         alive = time.monotonic() - started
+        if alive < 5 and transcoding and hw_decode:
+            # the chip refused this stream (a profile it will not decode):
+            # the next attempt decodes on the CPU, which is slow for HEVC
+            # but is a picture rather than a crash loop
+            self.hw_decode = False
+            log.warning('hardware decode failed inside 5 s — the next '
+                        'attempt decodes on the CPU')
         if alive < 5:
             # A push that dies this fast died on its INPUT, and ffmpeg
             # already said why on stderr — where it stayed, unread, while

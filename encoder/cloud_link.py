@@ -301,7 +301,7 @@ class CloudLink:
             data = json.loads(path.read_text())
         except (OSError, ValueError):
             return {'connected': False, 'kbps': None, 'reconnects_5m': 0,
-                    'codec': ''}
+                    'codec': '', 'speed': None, 'in_codec': ''}
         fresh = time.time() - data.get('updated', 0) < 30
         cutoff = time.time() - 300
         reconnects = sum(1 for t in data.get('reconnect_times', [])
@@ -311,7 +311,13 @@ class CloudLink:
                 'reconnects_5m': reconnects,
                 # what is actually leaving for YouTube; the site's go-live
                 # gate switches this box to H.264 if YouTube starves on it
-                'codec': str(data.get('codec') or '') if fresh else ''}
+                'codec': str(data.get('codec') or '') if fresh else '',
+                # ffmpeg's own speed: below 1.0 the transcode is not
+                # keeping up, whatever the kbps says
+                'speed': data.get('speed') if fresh else None,
+                # what the camera sends — the site names it when the
+                # transcode cannot keep up with it
+                'in_codec': str(data.get('in_codec') or '') if fresh else ''}
 
     def clips_status(self):
         """{'pending','uploaded','failed','last_error'} from clipper.py's
@@ -406,7 +412,8 @@ class CloudLink:
         return {
             'state': state,
             'ingest': {'connected': ingest['connected'],
-                       'kbps': ingest['kbps']},
+                       'kbps': ingest['kbps'],
+                       'codec': push.get('in_codec') or ''},
             'push': push,
             'clips': self.clips_status(),
             # Recording-disk health. The stream never touches the disk,

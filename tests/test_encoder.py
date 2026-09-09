@@ -393,9 +393,9 @@ def test_heartbeat_payload_shape():
     assert isinstance(hb['rtmp_urls'], list) and hb['rtmp_urls']
     assert all(u.startswith('rtmp://') for u in hb['rtmp_urls'])
     assert hb['rtmp_urls'][-1].split('/live/')[0].endswith('.local:1935')
-    assert set(hb['ingest']) == {'connected', 'kbps'}
+    assert set(hb['ingest']) == {'connected', 'kbps', 'codec'}
     assert set(hb['push']) == {'connected', 'kbps', 'reconnects_5m',
-                               'codec'}
+                               'codec', 'speed', 'in_codec'}
     assert hb['push']['reconnects_5m'] == 1          # only the recent one
     assert hb['push']['kbps'] == 3050
     assert isinstance(hb['cpu'], float)
@@ -2363,6 +2363,85 @@ def test_a_chosen_bitrate_still_wins():
            'push_codec': 'hevc'}
     assert yp.effective_video(cfg, vcodec='hevc', hw='vaapi',
                               caps={'hevc': True}) == (2500, 'hevc')
+
+
+# Maeser, 9/9, gigabit line: the box reported 4665 kbps out, YouTube
+# received 2940 and starved. The transcode was decoding the Mevo's 1080p
+# HEVC on the CPU at 0.63× real time — and the kbps could not say so,
+# being bytes per MEDIA second. Decode on the chip; report the speed.
+
+def test_a_transcode_decodes_on_the_chip():
+    from encoder import youtube_push as yp
+    cfg = {'local_ingest_key': 'k', 'push_bitrate_kbps': 3000}
+    cmd = yp.build_ffmpeg_cmd(cfg, 'aac', 'rtmp://yt/x', hw='vaapi',
+                              vcodec='hevc')
+    i = cmd.index('-i')
+    head = cmd[:i]
+    assert '-hwaccel' in head and head[head.index('-hwaccel') + 1] == 'vaapi'
+    assert '-hwaccel_output_format' in head and '-vaapi_device' in head
+    assert cmd[cmd.index('-vf') + 1] == 'scale_vaapi=format=nv12'
+    assert 'hwupload' not in ' '.join(cmd)
+    assert 'h264_vaapi' in cmd
+    # the CPU path survives as the fallback, byte for byte as before
+    cpu = yp.build_ffmpeg_cmd(cfg, 'aac', 'rtmp://yt/x', hw='vaapi',
+                              vcodec='hevc', hw_decode=False)
+    assert '-hwaccel' not in cpu
+    assert cpu[cpu.index('-vf') + 1] == 'format=nv12,hwupload'
+    # a copy needs neither
+    copy = yp.build_ffmpeg_cmd({'local_ingest_key': 'k'}, 'aac',
+                               'rtmp://yt/x', hw='vaapi', vcodec='h264')
+    assert '-hwaccel' not in copy and copy[copy.index('-c:v') + 1] == 'copy'
+
+
+def test_the_speed_is_read_off_ffmpeg_and_reported(tmp_path):
+    import json as _json
+    from encoder import youtube_push as yp
+    assert yp.progress_speed({'speed': '0.63x'}) == 0.63
+    assert yp.progress_speed({'speed': ' 1.01x '}) == 1.01
+    assert yp.progress_speed({}) is None
+    assert yp.progress_speed({'speed': 'N/A'}) is None
+    st = yp.StatusWriter(tmp_path / 'push.json')
+    st.write(True, 4665, codec='h264', speed=0.63, in_codec='hevc')
+    d = _json.loads((tmp_path / 'push.json').read_text())
+    assert d['speed'] == 0.63 and d['in_codec'] == 'hevc'
+    st.write(False)                      # a dead push has no speed
+    assert _json.loads((tmp_path / 'push.json').read_text())['speed'] is None
+
+
+def test_a_chip_that_refuses_the_stream_falls_back_to_the_cpu(tmp_path):
+    """One fast death with hardware decode, and the next attempt decodes
+    on the CPU — slow for HEVC, but a picture rather than a loop."""
+    import subprocess
+    from encoder import youtube_push as yp
+
+    class _Proc:
+        stdout = iter(())
+        stderr = iter(('Failed to create a VAAPI decoder\n',))
+        def wait(self): return 1
+        def terminate(self): pass
+
+    seen = []
+    real = subprocess.Popen
+    subprocess.Popen = lambda cmd, **kw: seen.append(cmd) or _Proc()
+    try:
+        pusher = yp.YouTubePusher(
+            cfg_load=lambda: {'local_ingest_key': 'k', 'push_bitrate_kbps': 3000,
+                              'youtube': {'key': 'yt', 'url': 'rtmp://a/b'}},
+            runner=lambda c, **kw: type('R', (), {'returncode': 0, 'stdout':
+                '{"streams":[{"codec_type":"video","codec_name":"hevc"},'
+                '{"codec_type":"audio","codec_name":"aac"}]}'})(),
+            status=yp.StatusWriter(tmp_path / 'push.json'))
+        import encoder.system as system
+        real_hw = system.hw_encoder
+        system.hw_encoder = lambda: 'vaapi'
+        try:
+            pusher.run_once()
+            pusher.run_once()
+        finally:
+            system.hw_encoder = real_hw
+    finally:
+        subprocess.Popen = real
+    assert '-hwaccel' in seen[0] and '-hwaccel' not in seen[1]
 
 
 def test_an_unreadable_probe_falls_back_to_rtsp_not_rtmp():
