@@ -379,7 +379,9 @@ def test_heartbeat_payload_shape():
     assert set(hb) == {'state', 'ingest', 'push', 'cpu', 'temp',
                        'version', 'log_tail', 'hostname', 'ip', 'clips',
                        'pin', 'rtmp_urls', 'radar', 'ble_radar',
-                       'temp_max', 'storage', 'livepush', 'transcode'}
+                       'temp_max', 'storage', 'livepush', 'transcode',
+                       'hardware'}
+    assert isinstance(hb['hardware'], str)
     # a Pi (no hardware encoder) reports not-capable, copy target
     assert hb['transcode'] == {'capable': False, 'hevc': False,
                                'target_kbps': 0, 'codec': 'h264'}

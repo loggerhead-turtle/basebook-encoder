@@ -454,6 +454,8 @@ class CloudLink:
             # instead of assuming playcall-encoder.local resolves.
             'ip': system.lan_ip(),
             'hostname': system.hostname(),
+            # Pi or N150 — the site names the box's YouTube push by it
+            'hardware': system.hardware(),
             # The full camera-facing ingest URLs (IP first, mDNS second).
             # Field routers hand out a NEW address most weeks and mDNS
             # regularly fails on hotspots, so the site shows THESE — always

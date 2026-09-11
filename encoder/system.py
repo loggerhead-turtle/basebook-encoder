@@ -250,6 +250,34 @@ def hostname():
         return 'playcall-encoder'
 
 
+_HARDWARE = None
+
+
+def hardware():
+    """What this box is, for the site's camera picker: the Pi's
+    device-tree model ('Raspberry Pi 5 Model B Rev 1.0') or the CPU's
+    model name ('Intel(R) N150'). Cached; '' when neither is readable."""
+    global _HARDWARE
+    if _HARDWARE is not None:
+        return _HARDWARE
+    out = ''
+    try:
+        out = open('/proc/device-tree/model', 'rb').read() \
+            .decode('utf-8', 'ignore').strip('\x00 \n')
+    except OSError:
+        pass
+    if not out:
+        try:
+            for line in open('/proc/cpuinfo'):
+                if line.lower().startswith('model name'):
+                    out = line.split(':', 1)[-1].strip()
+                    break
+        except OSError:
+            pass
+    _HARDWARE = out[:80]
+    return _HARDWARE
+
+
 def lan_ip():
     r = run(['hostname', '-I'])
     parts = (r.stdout or '').split()
