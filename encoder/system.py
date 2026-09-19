@@ -54,6 +54,24 @@ UPDATE_UNITS = ('playcall-encoder-mediamtx', 'playcall-encoder-youtube',
                 'playcall-encoder')
 
 
+def _version_tuple(v):
+    """'1.2.78' → (1, 2, 78); anything unreadable sorts lowest, so a
+    garbled VERSION never blocks a real one and never counts as newer."""
+    try:
+        return tuple(int(x) for x in str(v).strip().split('.'))
+    except (ValueError, AttributeError):
+        return ()
+
+
+def installed_version(install_dir=None):
+    """The VERSION file of the running install, '' when there is none."""
+    try:
+        with open(os.path.join(install_dir or INSTALL_DIR, 'VERSION')) as fh:
+            return fh.read().strip()
+    except OSError:
+        return ''
+
+
 def self_update(repo_url=None, install_dir=None):
     """One-button code update: shallow-clone the release repo and lay the
     same payload the installer lays (encoder/, VERSION, mediamtx.yml,
@@ -79,6 +97,20 @@ def self_update(repo_url=None, install_dir=None):
         if not (os.path.isdir(os.path.join(src, 'encoder'))
                 and os.path.isfile(os.path.join(src, 'VERSION'))):
             return False, 'download was missing the encoder payload'
+        # Never lay OLDER code over a box. The release repo is published
+        # by hand, and the site announces a version the moment it deploys
+        # — so a box can be offered an 'update' whose download is behind
+        # what it already runs (18 Sep 2026: a box hand-installed at
+        # 1.2.78, the release repo still at what it had before, and both
+        # update buttons a downgrade away). Same version is a re-download
+        # and fine; older is refused with nothing touched.
+        with open(os.path.join(src, 'VERSION')) as fh:
+            got = fh.read().strip()
+        have = installed_version(install_dir)
+        if have and _version_tuple(got) < _version_tuple(have):
+            return False, (f'the download is v{got}, older than the v{have} '
+                           'this box runs — the release repo has not been '
+                           'published yet; nothing was changed')
         shutil.copytree(os.path.join(src, 'encoder'),
                         os.path.join(install_dir, 'encoder'),
                         dirs_exist_ok=True)

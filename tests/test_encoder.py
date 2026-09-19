@@ -356,6 +356,38 @@ def test_unassignment_clears_push_target():
     assert config.load()['youtube']['key'] == ''
 
 
+def test_the_cloud_can_tell_an_assigned_box_to_stop_pushing():
+    """youtube_push 'off': the scorepad sent this game's broadcast to a
+    BaseStream angle, or to nobody. YouTube takes one publisher per key,
+    so the box has to actually STOP — being assigned with no URL used to
+    leave it pushing whatever it had, which is a second publisher on the
+    key the relay was just handed."""
+    _paired_cfg()
+    cmds = []
+    link = cloud_link.CloudLink(on_feed_change=lambda f: None,
+                                runner=lambda cmd, **kw: cmds.append(cmd),
+                                http=lambda *a, **kw: dict(ASSIGNMENT))
+    link.poll_assignment_once()
+    assert config.load()['youtube']['key'] == 'war-key'
+    cmds.clear()
+    link.http = lambda *a, **kw: dict(ASSIGNMENT, youtube_rtmp_url=None,
+                                      youtube_push='off')
+    assert link.poll_assignment_once() is True
+    assert config.load()['youtube']['key'] == ''
+    assert ['systemctl', 'restart', 'playcall-encoder-youtube'] in cmds
+    # …and back on: the key returns with the URL
+    link.http = lambda *a, **kw: dict(ASSIGNMENT, youtube_push='on')
+    assert link.poll_assignment_once() is True
+    assert config.load()['youtube']['key'] == 'war-key'
+    # an older cloud — assigned, no URL, no opinion — leaves the box's
+    # own target alone, as it always did
+    cmds.clear()
+    link.http = lambda *a, **kw: dict(ASSIGNMENT, youtube_rtmp_url=None)
+    link.poll_assignment_once()
+    assert config.load()['youtube']['key'] == 'war-key'
+    assert ['systemctl', 'restart', 'playcall-encoder-youtube'] not in cmds
+
+
 def test_heartbeat_payload_shape():
     _paired_cfg()
     # Fake MediaMTX API + a fresh push status file.
@@ -396,7 +428,7 @@ def test_heartbeat_payload_shape():
     assert all(u.startswith('rtmp://') for u in hb['rtmp_urls'])
     assert hb['rtmp_urls'][-1].split('/live/')[0].endswith('.local:1935')
     assert set(hb['ingest']) == {'connected', 'kbps', 'codec'}
-    assert set(hb['push']) == {'connected', 'kbps', 'reconnects_5m',
+    assert set(hb['push']) == {'connected', 'kbps', 'reconnects_5m', 'waiting', 'audio',
                                'codec', 'speed', 'in_codec'}
     assert hb['push']['reconnects_5m'] == 1          # only the recent one
     assert hb['push']['kbps'] == 3050
@@ -760,6 +792,38 @@ def test_self_update_reports_download_failure(tmp_path, monkeypatch):
     ok, detail = system.self_update(install_dir=str(install))
     assert not ok and 'unable to access' in detail
     assert not (install / 'VERSION').exists()      # nothing half-laid
+
+
+def test_self_update_refuses_a_download_older_than_the_box(tmp_path, monkeypatch):
+    """18 Sep 2026: a box hand-installed at a version the release repo
+    did not have yet; the site announced that version the moment it
+    deployed, so the box offered an 'update' whose download was older
+    than what it ran. Older is refused, and nothing is touched. The
+    same version is a re-download and goes through."""
+    from encoder import system
+
+    def fake_run(cmd, **kw):
+        _fake_release_tree(Path(cmd[5]))          # lays VERSION 9.9.9
+
+        class R:
+            returncode = 0
+            stderr = ''
+        return R()
+    monkeypatch.setattr(system, 'run', fake_run)
+    install = tmp_path / 'opt'
+    (install / 'encoder').mkdir(parents=True)
+    (install / 'VERSION').write_text('9.9.10\n')
+    (install / 'encoder' / '__init__.py').write_text("__version__ = '9.9.10'\n")
+    ok, detail = system.self_update(install_dir=str(install))
+    assert not ok and 'older than the v9.9.10' in detail, detail
+    assert 'not been published' in detail
+    assert (install / 'VERSION').read_text().strip() == '9.9.10'
+    assert '9.9.10' in (install / 'encoder' / '__init__.py').read_text()
+    assert not (install / 'mediamtx.yml').exists()  # nothing half-laid
+    (install / 'VERSION').write_text('9.9.9\n')
+    ok, detail = system.self_update(install_dir=str(install))
+    assert ok and detail == '9.9.9'
+    assert system._version_tuple('garbage') == () and system.installed_version(str(tmp_path / 'nope')) == ''
 
 
 class _CloudStub:
@@ -1445,8 +1509,10 @@ def test_a_bitrate_on_capable_hardware_transcodes():
     assert cmd[cmd.index('-maxrate') + 1] == '3000k'
     assert cmd[cmd.index('-bufsize') + 1] == '6000k'
     assert '-vaapi_device' in cmd
-    # audio path untouched by the video ladder
+    # audio path untouched by the video ladder: confirmed AAC copies,
+    # and it is mapped explicitly
     assert ['-c:a', 'copy'] == cmd[cmd.index('-c:a'):cmd.index('-c:a') + 2]
+    assert '-map' in cmd and '0:a:0?' in cmd
 
 
 def test_a_bitrate_on_a_pi_degrades_to_copy():
@@ -2287,8 +2353,11 @@ def test_an_hevc_camera_is_read_over_rtsp():
     assert '-rtsp_transport' in cmd            # video survives the read
     assert 'rtsp://127.0.0.1:8554/live/k' in cmd
     assert 'hevc_vaapi' in cmd                 # …and transcodes to HEVC
-    # AAC audio still copies — the RTSP hop does not force a re-encode
+    # AAC audio still copies — the RTSP hop and the HEVC transcode do
+    # not force a re-encode of a track the probe named (the everyday
+    # HEVC-camera-into-N150 case; 16 Sep 2026: "I use hevc as well")
     assert ['-c:a', 'copy'] == cmd[cmd.index('-c:a'):cmd.index('-c:a') + 2]
+    assert 'aresample' not in ' '.join(cmd)
 
 
 def test_an_h264_camera_keeps_the_rtmp_copy_path():
@@ -2460,12 +2529,18 @@ def test_an_unreadable_probe_falls_back_to_rtsp_not_rtmp():
         assert 'rtsp://127.0.0.1:8554/live/k' in cmd, (vcodec, acodec)
         assert 'rtmp://127.0.0.1:1935/live/k' not in cmd, (vcodec, acodec)
         # the picture is still copied — the fallback changes the READ,
-        # not the video; and audio we cannot NAME is re-encoded to
-        # something flv is certain to carry, while confirmed AAC still
-        # rides across untouched
+        # not the video; audio we cannot NAME is re-encoded to something
+        # flv is certain to carry, while confirmed AAC still rides across
+        # untouched — and either way it is mapped explicitly
         assert cmd[cmd.index('-c:v') + 1] == 'copy', (vcodec, acodec)
         want = 'copy' if acodec == 'aac' else 'aac'
         assert cmd[cmd.index('-c:a') + 1] == want, (vcodec, acodec)
+        # …unless the probe NAMED the video and found no audio: then the
+        # box's own silent track is mapped in its place (1.2.78)
+        if vcodec and not acodec:
+            assert '1:a:0' in cmd and 'lavfi' in cmd, (vcodec, acodec)
+        else:
+            assert '0:a:0?' in cmd, (vcodec, acodec)
 
 
 def test_a_push_that_dies_instantly_logs_why(tmp_path, caplog):
@@ -2592,3 +2667,285 @@ def test_a_chip_that_lives_but_decodes_nothing_falls_back_to_the_cpu(
     finally:
         subprocess.Popen = real
     assert '-hwaccel' in seen[0] and '-hwaccel' not in seen[1]
+
+
+# ── the settings page's radar card ─────────────────────────────────────────
+
+def _radar_client(monkeypatch):
+    from encoder import web
+    provisioning.headless_setup()
+    monkeypatch.setattr(web.system, 'journal_tail', lambda *a, **k: [])
+    app = web.create_app()
+    client = app.test_client()
+    client.post('/login', data={'pin': config.load()['device']['pin']})
+    return web, client
+
+
+def test_the_radar_card_is_one_form_with_every_field_in_it(monkeypatch):
+    """It was two: the template closed the form after the Smart Coach
+    rows, and the gun baud, the BT578 adapter's MAC and the LED board
+    format sat below it, outside any form. They looked editable and were
+    not — nothing they said was ever submitted."""
+    web, client = _radar_client(monkeypatch)
+    html = client.get('/').get_data(as_text=True)
+    card = html[html.index('🔫 Radar'):html.index('Save radar settings')]
+    assert card.count('<form') - card.count('</form>') == 1   # one open form
+    for field in ('name="baud"', 'name="bluetooth_mac"',
+                  'name="display_format"', 'name="smart_coach_mac"',
+                  'name="smart_coach"'):
+        assert html.count(field) == 1, field                  # once, not twice
+        assert field in card                                  # and inside it
+
+
+def test_saving_radar_settings_no_longer_wipes_the_serial_adapter(monkeypatch):
+    """While that field sat outside the form, every save silently
+    cleared a BT578 adapter's address — and the next boot had nothing to
+    bind /dev/rfcomm0 to."""
+    web, client = _radar_client(monkeypatch)
+    cfg = config.load()
+    cfg['radar'] = {'bluetooth_mac': 'AA:BB:CC:DD:EE:FF', 'baud': 19200}
+    config.save(cfg)
+    # a post WITHOUT the field (what the broken page sent) leaves it alone
+    client.post('/radar', data={'enabled': 'auto'})
+    assert config.load()['radar']['bluetooth_mac'] == 'AA:BB:CC:DD:EE:FF'
+    # …and the real form, which carries it, still edits it
+    client.post('/radar', data={'enabled': 'auto', 'bluetooth_mac': ''})
+    assert config.load()['radar']['bluetooth_mac'] == ''
+
+
+# ── no camera, no dial ───────────────────────────────────────────────────────
+#
+# 15 Sep 2026: a box whose last input was six days old kept starting
+# ffmpeg against its own empty MediaMTX. ffmpeg died on the RTSP 404 in
+# 200 ms, the loop retried in 30 s, and every retry was a connect-then-
+# vanish against YouTube's ingest — nine in five minutes. YouTube called
+# the broadcast starved (correctly) and, worse, each blink was enough for
+# the website to decide this box owned the broadcast and stand the relay
+# down. The red light was the retry loop, not the camera.
+
+class _Status:
+    def __init__(self):
+        self.writes = []
+    def write(self, connected, **kw):
+        self.writes.append((connected, kw))
+
+
+def _pusher(http, runner):
+    from encoder import youtube_push as yp
+    cfg = {'youtube': {'key': 'k'}, 'local_ingest_key': 'abcd1234'}
+    st = _Status()
+    p = yp.YouTubePusher(cfg_load=lambda: cfg, runner=runner, status=st,
+                         http=http)
+    p.push_url = lambda: 'rtmps://a.rtmp.youtube.com/live2/k'
+    # Hold the attempt at the gate: anything past it means we dialled.
+    p.probe_codecs = None
+    return p, st
+
+
+def test_nobody_publishing_means_no_ffmpeg_and_a_reason_in_the_status(monkeypatch):
+    from encoder import youtube_push as yp
+    spawned = []
+    monkeypatch.setattr(yp, 'probe_streams',
+                        lambda *a, **k: spawned.append('probe') or ('', '', None))
+    p, st = _pusher(http=lambda url, **kw: {'items': [
+        {'name': 'live/abcd1234', 'ready': False}]}, runner=lambda *a, **k: None)
+    assert p.publisher_ready(p.cfg_load()) is False
+    assert p.run_once() == 0
+    assert spawned == [], 'the gate must hold BEFORE the probe, let alone ffmpeg'
+    assert st.writes == [(False, {'waiting': 'camera'})]
+
+
+def test_an_unknown_path_is_nobody_publishing_too():
+    p, st = _pusher(http=lambda url, **kw: {'items': [
+        {'name': 'live/other', 'ready': True}]}, runner=lambda *a, **k: None)
+    assert p.publisher_ready(p.cfg_load()) is False
+
+
+def test_a_dead_mediamtx_api_fails_open(monkeypatch):
+    """An API hiccup on a box mid-game must never take down a working
+    push: None means 'could not ask', and the dial goes ahead."""
+    from encoder import youtube_push as yp
+    def boom(url, **kw):
+        raise OSError('connection refused')
+    p, st = _pusher(http=boom, runner=lambda *a, **k: None)
+    assert p.publisher_ready(p.cfg_load()) is None
+    reached = []
+    monkeypatch.setattr(yp, 'probe_streams',
+                        lambda *a, **k: reached.append('probe') or ('', '', None))
+    # past the gate the attempt needs the real machinery; stop it there
+    monkeypatch.setattr(yp, 'build_ffmpeg_cmd',
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError('past the gate')))
+    try:
+        p.run_once()
+    except RuntimeError as e:
+        assert 'past the gate' in str(e)
+    assert reached == ['probe'], 'a dead API must not hold the dial'
+    assert (False, {'waiting': 'camera'}) not in st.writes
+
+
+def test_a_publisher_lets_the_dial_proceed(monkeypatch):
+    from encoder import youtube_push as yp
+    p, st = _pusher(http=lambda url, **kw: {'items': [
+        {'name': 'live/abcd1234', 'ready': True}]}, runner=lambda *a, **k: None)
+    assert p.publisher_ready(p.cfg_load()) is True
+    reached = []
+    monkeypatch.setattr(yp, 'probe_streams',
+                        lambda *a, **k: reached.append('probe') or ('h264', 'aac', None))
+    monkeypatch.setattr(yp, 'build_ffmpeg_cmd',
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError('past the gate')))
+    try:
+        p.run_once()
+    except RuntimeError:
+        pass
+    assert reached == ['probe']
+
+
+def test_push_status_carries_why_it_is_waiting():
+    from encoder import cloud_link, config
+    state = config.state_dir()
+    state.mkdir(parents=True, exist_ok=True)
+    (state / 'push.json').write_text(json.dumps(
+        {'connected': False, 'kbps': None, 'waiting': 'camera',
+         'updated': time.time(), 'reconnect_times': []}))
+    link = cloud_link.CloudLink(http=lambda *a, **k: {})
+    assert link.push_status()['waiting'] == 'camera'
+    # stale file: nothing is claimed, including the reason
+    (state / 'push.json').write_text(json.dumps(
+        {'connected': False, 'waiting': 'camera', 'updated': time.time() - 120,
+         'reconnect_times': []}))
+    assert link.push_status()['waiting'] is None
+
+
+
+# ── audio: the box says what it is sending ───────────────────────────────────
+#
+# 15 Sep 2026: MediaMTX handed the push two tracks (H265, MPEG-4 Audio),
+# the camera was not muted, and YouTube reported audio bitrate 0. The
+# desk told the operator to check the camera's audio source. The box had
+# the answer and never said it.
+
+def _acfg():
+    return {'youtube': {'key': 'k'}, 'local_ingest_key': 'abcd1234',
+            'push_bitrate_kbps': 2000, 'push_codec': 'h264'}
+
+
+def test_the_push_maps_audio_explicitly_and_tolerates_none():
+    from encoder import youtube_push as yp
+    cmd = yp.build_ffmpeg_cmd(_acfg(), 'aac', 'rtmps://y/k', vcodec='hevc',
+                              hw_decode=False, caps={})
+    i = cmd.index('-map')
+    assert cmd[i:i + 4] == ['-map', '0:v:0', '-map', '0:a:0?']
+    assert cmd.index('-i') < i < cmd.index('-c:a')
+
+
+def test_named_aac_is_copied_whatever_the_video_and_unnamed_audio_is_not():
+    """The audio rule, in both halves. A probe that NAMED the track as
+    AAC → copied, over RTMP (H.264) and over RTSP (HEVC into an N150 —
+    the everyday case; 16 Sep 2026: "I use hevc as well from the
+    encoder"). A probe that could not name it, or named something else
+    → re-encoded to AAC 48 kHz stereo and re-clocked, never copied
+    blind."""
+    from encoder import youtube_push as yp
+    for vcodec in ('h264', 'hevc', ''):
+        cmd = yp.build_ffmpeg_cmd(_acfg(), 'aac', 'rtmps://y/k', vcodec=vcodec,
+                                  hw_decode=False, caps={})
+        assert cmd[cmd.index('-c:a') + 1] == 'copy', vcodec
+        assert 'aresample=async=1:first_pts=0' not in cmd, vcodec
+    for acodec, vcodec in (('', ''), ('opus', 'hevc'), ('pcm_mulaw', 'hevc')):
+        cmd = yp.build_ffmpeg_cmd(_acfg(), acodec, 'rtmps://y/k', vcodec=vcodec,
+                                  hw_decode=False, caps={})
+        assert cmd[cmd.index('-c:a') + 1] == 'aac', acodec
+        assert cmd[cmd.index('-ar') + 1] == '48000'
+        assert cmd[cmd.index('-ac') + 1] == '2'
+        assert cmd[cmd.index('-af') + 1] == 'aresample=async=1:first_pts=0'
+
+
+def test_probe_streams_reports_the_audio_the_camera_sends():
+    from encoder import youtube_push as yp
+    class R:
+        returncode = 0
+        stdout = json.dumps({'streams': [
+            {'codec_type': 'video', 'codec_name': 'hevc'},
+            {'codec_type': 'audio', 'codec_name': 'aac',
+             'sample_rate': '48000', 'channels': 2}]})
+    v, a, d = yp.probe_streams({'local_ingest_key': 'x'}, runner=lambda *a, **k: R())
+    assert (v, a) == ('hevc', 'aac')
+    assert d == {'codec': 'aac', 'sample_rate': 48000, 'channels': 2}
+    assert yp.probe_codecs({'local_ingest_key': 'x'}, runner=lambda *a, **k: R()) == ('hevc', 'aac')
+    class N:
+        returncode = 0
+        stdout = json.dumps({'streams': [{'codec_type': 'video', 'codec_name': 'h264'}]})
+    assert yp.probe_streams({'local_ingest_key': 'x'}, runner=lambda *a, **k: N()) == ('h264', '', None)
+
+
+def test_the_status_says_what_happened_to_the_audio(monkeypatch):
+    from encoder import youtube_push as yp
+    st = _Status()
+    p = yp.YouTubePusher(cfg_load=_acfg, runner=lambda *a, **k: None, status=st,
+                         http=lambda url, **kw: {'items': [
+                             {'name': 'live/abcd1234', 'ready': True}]})
+    p.push_url = lambda: 'rtmps://y/k'
+    monkeypatch.setattr(yp, 'probe_streams', lambda *a, **k: (
+        'hevc', 'aac', {'codec': 'aac', 'sample_rate': 48000, 'channels': 2}))
+    monkeypatch.setattr(yp, 'build_ffmpeg_cmd',
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError('past the gate')))
+    try:
+        p.run_once()
+    except RuntimeError:
+        pass
+    # HEVC + named AAC: the track is copied, and the status says so
+    assert st.audio == {'in': 'aac', 'sample_rate': 48000, 'channels': 2,
+                        'out': 'copy', 'mapped': True}
+    # HEVC and no audio track: the box sends silence and says so
+    monkeypatch.setattr(yp, 'probe_streams', lambda *a, **k: ('hevc', '', None))
+    try:
+        p.run_once()
+    except RuntimeError:
+        pass
+    assert st.audio['mapped'] is True and st.audio['out'] == 'silence'
+    # an empty probe is unknown, not silent
+    monkeypatch.setattr(yp, 'probe_streams', lambda *a, **k: ('', '', None))
+    try:
+        p.run_once()
+    except RuntimeError:
+        pass
+    assert st.audio['mapped'] is False and st.audio['out'] == ''
+
+
+def test_a_camera_with_no_audio_track_gets_silence_so_youtube_starts():
+    """17 Sep 2026: Mevo → box → YouTube, video active, 'audio bitrate
+    (0)', broadcast never left 'created'. YouTube starts nothing without
+    audio, so a camera that sends none gets a silent AAC track made on
+    the box — on a POSITIVE probe only. An empty probe is unknown and
+    keeps the optional map: a real track is never talked over."""
+    from encoder import youtube_push as yp
+    cmd = yp.build_ffmpeg_cmd(_acfg(), '', 'rtmps://y/k', vcodec='hevc',
+                              hw_decode=False, caps={})
+    i = cmd.index('-f')
+    assert cmd[i:i + 3] == ['-f', 'lavfi', '-i'], cmd
+    assert cmd[i + 3].startswith('anullsrc=') and 'sample_rate=48000' in cmd[i + 3]
+    assert cmd.index('-i') < i < cmd.index('-map')       # after the camera input
+    m = cmd.index('-map')
+    assert cmd[m:m + 4] == ['-map', '0:v:0', '-map', '1:a:0'], cmd
+    assert cmd[cmd.index('-c:a') + 1] == 'aac' and '-shortest' in cmd
+    assert 'aresample=async=1:first_pts=0' not in cmd
+    cmd = yp.build_ffmpeg_cmd(_acfg(), '', 'rtmps://y/k', vcodec='',
+                              hw_decode=False, caps={})
+    assert 'lavfi' not in cmd and cmd[cmd.index('-map') + 3] == '0:a:0?'
+    assert '-shortest' not in cmd
+    for vcodec in ('h264', 'hevc'):                       # a named track is never replaced
+        cmd = yp.build_ffmpeg_cmd(_acfg(), 'aac', 'rtmps://y/k', vcodec=vcodec,
+                                  hw_decode=False, caps={})
+        assert 'lavfi' not in cmd
+
+
+def test_push_status_carries_the_audio_report():
+    from encoder import cloud_link, config
+    state = config.state_dir(); state.mkdir(parents=True, exist_ok=True)
+    (state / 'push.json').write_text(json.dumps(
+        {'connected': True, 'kbps': 1800, 'updated': time.time(),
+         'audio': {'in': 'aac', 'out': 'aac', 'mapped': True,
+                   'sample_rate': 48000, 'channels': 2},
+         'reconnect_times': []}))
+    link = cloud_link.CloudLink(http=lambda *a, **k: {})
+    assert link.push_status()['audio']['mapped'] is True

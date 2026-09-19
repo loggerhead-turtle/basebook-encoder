@@ -21,6 +21,7 @@ Additions: ffmpeg -progress parsing → live kbps, and a status JSON
 import json
 import logging
 import os
+import urllib.request
 import subprocess
 import sys
 import time
@@ -28,6 +29,13 @@ from collections import deque
 from pathlib import Path
 
 from . import config, system
+
+MEDIAMTX_API = os.environ.get('MEDIAMTX_API', 'http://127.0.0.1:9997').rstrip('/')
+
+
+def _http_json(url, timeout=2):
+    with urllib.request.urlopen(url, timeout=timeout) as r:
+        return json.loads(r.read().decode() or '{}')
 
 log = logging.getLogger('youtube_push')
 
@@ -44,30 +52,51 @@ def rtsp_in(cfg):
     return f"rtsp://127.0.0.1:8554/live/{cfg['local_ingest_key']}"
 
 
-def probe_codecs(cfg, runner=None):
-    """(video, audio) codecs of the currently-published stream via loopback
-    RTSP (RTSP sees the true track list; RTMP silently DROPS any track it
-    cannot carry — an Opus audio track, and H.265 video: MediaMTX logs
-    'skipping track (H265)' and hands the reader audio only). Both empty
-    when nobody is publishing yet."""
+def probe_streams(cfg, runner=None):
+    """(video, audio, audio_detail) of the currently-published stream via
+    loopback RTSP (RTSP sees the true track list; RTMP silently DROPS any
+    track it cannot carry — an Opus audio track, and H.265 video: MediaMTX
+    logs 'skipping track (H265)' and hands the reader audio only). All
+    empty when nobody is publishing yet.
+
+    audio_detail is {'codec', 'sample_rate', 'channels'} or None: what the
+    camera is actually sending, so the box can SAY it. On 15 Sep 2026
+    YouTube reported audio bitrate 0 from a camera that was sending AAC,
+    the desk told the operator to check the camera's audio source, and
+    the operator was right that it was fine. The box knew the track was
+    there and never said so."""
     runner = runner or system.run
     r = runner(['ffprobe', '-v', 'error', '-rtsp_transport', 'tcp',
-                '-show_entries', 'stream=codec_type,codec_name',
+                '-show_entries',
+                'stream=codec_type,codec_name,sample_rate,channels',
                 '-of', 'json', rtsp_in(cfg)],
                timeout=15)
     if r.returncode != 0:
-        return '', ''
+        return '', '', None
     try:
         streams = json.loads(r.stdout or '{}').get('streams') or []
     except (ValueError, AttributeError):
-        return '', ''
+        return '', '', None
     vcodec = acodec = ''
+    detail = None
     for s in streams:
         if s.get('codec_type') == 'video' and not vcodec:
             vcodec = s.get('codec_name') or ''
         elif s.get('codec_type') == 'audio' and not acodec:
             acodec = s.get('codec_name') or ''
-    return vcodec, acodec
+            try:
+                detail = {'codec': acodec,
+                          'sample_rate': int(s.get('sample_rate') or 0),
+                          'channels': int(s.get('channels') or 0)}
+            except (TypeError, ValueError):
+                detail = {'codec': acodec, 'sample_rate': 0, 'channels': 0}
+    return vcodec, acodec, detail
+
+
+def probe_codecs(cfg, runner=None):
+    """(video, audio) — see probe_streams."""
+    v, a, _d = probe_streams(cfg, runner)
+    return v, a
 
 
 def probe_audio_codec(cfg, runner=None):
@@ -158,11 +187,41 @@ def build_ffmpeg_cmd(cfg, acodec, push_url, hw=None, caps=None, vcodec='',
         input_args = ['-rw_timeout', '10000000', '-i', rtmp_in(cfg)]
     else:
         input_args = ['-rtsp_transport', 'tcp', '-i', rtsp_in(cfg)]
-    # Same rule for audio: copy only what we KNOW is AAC. Copying an
-    # unidentified track into flv is how a phone's Opus killed the push;
-    # a camera with no audio at all ignores the encoder option anyway.
-    audio_args = (['-c:a', 'copy'] if acodec == 'aac'
-                  else ['-c:a', 'aac', '-b:a', '128k', '-ar', '48000'])
+    # The maps are EXPLICIT: first video, first audio if there is one
+    # ('?' makes a camera with no audio track not fatal). Default stream
+    # selection usually does this, and 'usually' is the problem — it is
+    # one of the ways an audio track that was there can fail to reach
+    # the output with nothing in the log.
+    map_args = ['-map', '0:v:0', '-map', '0:a:0?']
+    # A camera with NO audio track gets one: silence, generated here.
+    # YouTube will not start a broadcast without audio (17 Sep 2026:
+    # a Mevo with its mic off, video active at YouTube, "audio bitrate
+    # (0)", and the game stuck at 'armed' — the box knew the track was
+    # missing and still sent a stream YouTube would never start). Only
+    # on a POSITIVE probe: video named, audio absent. An empty probe is
+    # unknown, not silent, and keeps the optional map — a real track
+    # must never be talked over.
+    silent = bool(vcodec) and not acodec
+    # Audio is COPIED when the probe NAMED it as AAC — whatever the
+    # video is. An HEVC camera into an N150 (the everyday case here) is
+    # read over RTSP and transcoded on the chip; its AAC still rides
+    # across untouched, because a re-encode of a good track buys nothing
+    # and a transcode is not a reason to touch the audio. Audio we could
+    # not name, or that is not AAC, is re-encoded to AAC 48 kHz stereo
+    # with aresample=async so FLV is certain to carry it on a steady
+    # clock. What changed on 15 Sep 2026 is the explicit map above and
+    # the status block below — the box now SAYS what audio it sends.
+    if silent:
+        input_args = input_args + ['-f', 'lavfi', '-i',
+                                   'anullsrc=channel_layout=stereo:sample_rate=48000']
+        map_args = ['-map', '0:v:0', '-map', '1:a:0']
+        audio_args = ['-c:a', 'aac', '-b:a', '128k', '-ar', '48000',
+                      '-ac', '2', '-shortest']    # ends with the picture
+    elif acodec == 'aac':
+        audio_args = ['-c:a', 'copy']
+    else:
+        audio_args = ['-c:a', 'aac', '-b:a', '128k', '-ar', '48000',
+                      '-ac', '2', '-af', 'aresample=async=1:first_pts=0']
     kbps, codec = effective_video(cfg, vcodec=vcodec, hw=hw, caps=caps)
     if kbps:
         # QuickSync via VA-API, both halves on the chip. The decode used
@@ -194,7 +253,7 @@ def build_ffmpeg_cmd(cfg, acodec, push_url, hw=None, caps=None, vcodec='',
         video_args = ['-c:v', 'copy']
     return (['ffmpeg', '-hide_banner', '-loglevel', 'warning',
              '-progress', 'pipe:1', '-nostats']
-            + input_args + video_args + audio_args
+            + input_args + map_args + video_args + audio_args
             + ['-f', 'flv', push_url])
 
 
@@ -244,14 +303,21 @@ class StatusWriter:
         self.stderr_tail = deque(maxlen=40)
 
     def write(self, connected, kbps=None, codec=None, speed=None,
-              in_codec=None):
+              in_codec=None, waiting=None):
         if codec is not None:
             self.codec = codec
         if in_codec is not None:
             self.in_codec = in_codec
         if speed is not None:
             self.speed = speed
-        data = {'connected': connected, 'kbps': kbps,
+        # 'waiting': why a disconnected push is disconnected, for the
+        # heartbeat and the desk — 'camera' means nobody is publishing to
+        # this box, which is not a YouTube problem and must not read as one.
+        # 'audio': what the camera sends and what the push does with it,
+        # so 'YouTube hears no audio' can be met with 'the box is sending
+        # AAC 48 kHz stereo' instead of 'check the camera'.
+        data = {'connected': connected, 'kbps': kbps, 'waiting': waiting,
+                'audio': getattr(self, 'audio', None),
                 'codec': getattr(self, 'codec', ''),
                 'in_codec': getattr(self, 'in_codec', ''),
                 'speed': getattr(self, 'speed', None) if connected else None,
@@ -279,10 +345,11 @@ _HW_DECODE_ERROR_MARKS = ('hardware accelerator failed to decode',
 
 
 class YouTubePusher:
-    def __init__(self, cfg_load=config.load, runner=None, status=None):
+    def __init__(self, cfg_load=config.load, runner=None, status=None, http=None):
         self.cfg_load = cfg_load
         self.runner = runner or system.run
         self.status = status or StatusWriter()
+        self.http = http or _http_json
         self.running = True
         self.proc = None
         self.fell_back = False
@@ -291,6 +358,24 @@ class YouTubePusher:
         from .provisioning import youtube_push_url
         return youtube_push_url(self.cfg_load())
 
+    def publisher_ready(self, cfg):
+        """Is anything actually publishing to this box's own MediaMTX?
+
+        True, False, or None when the API could not be asked — and None
+        must fail OPEN: an API hiccup on a box mid-game must never take
+        down a working push. Only a definite 'nobody is publishing' holds
+        the dial.
+        """
+        want = f"live/{cfg.get('local_ingest_key', '')}"
+        try:
+            data = self.http(f'{MEDIAMTX_API}/v3/paths/list')
+        except Exception:
+            return None
+        for item in (data or {}).get('items') or []:
+            if item.get('name') == want:
+                return bool(item.get('ready'))
+        return False
+
     def run_once(self):
         """One ffmpeg attempt. Returns seconds the attempt survived."""
         cfg = self.cfg_load()
@@ -298,12 +383,50 @@ class YouTubePusher:
         if not url or not cfg.get('youtube', {}).get('key'):
             self.status.write(False)
             return 0
-        vcodec, acodec = probe_codecs(cfg, self.runner)
+        # NOBODY PUBLISHING, NO DIAL. This used to start ffmpeg anyway:
+        # ffmpeg died on the RTSP 404 in 200 ms, the loop retried in 30 s,
+        # and every retry was a connect-then-vanish against YouTube's
+        # ingest — nine in five minutes on 15 Sep 2026, on a box whose
+        # last input was six days old. YouTube marked the broadcast
+        # starved (correctly), and worse, each blink set push.connected
+        # long enough for the website to decide this box OWNED the
+        # broadcast, hand BaseStream an empty URL, and stand its own push
+        # down: a phone that was carrying a perfectly good picture went
+        # dark on YouTube because an empty box kept knocking. The red
+        # light the operator saw was the retry loop, not the camera.
+        ready = self.publisher_ready(cfg)
+        if ready is False:
+            log.info('no camera is publishing to this box yet — not '
+                     'dialling YouTube until one is')
+            self.status.write(False, waiting='camera')
+            return 0
+        vcodec, acodec, adetail = probe_streams(cfg, self.runner)
         if not (vcodec and acodec):
             log.info('could not read the camera tracks (nobody '
                      'publishing yet, or the probe timed out) — reading '
                      'over RTSP, which carries every track whatever the '
                      'camera turns out to be')
+        self.status.audio = {
+            'in': acodec or '',
+            'sample_rate': (adetail or {}).get('sample_rate') or 0,
+            'channels': (adetail or {}).get('channels') or 0,
+            # 'copy' rides the camera's own frames; 'aac' is re-encoded
+            # and re-clocked; '' means the probe saw no audio track at
+            # all, which is the one case that IS the camera's fault.
+            # 'silence' is the box's own track, generated because the
+            # camera has none (video named, audio absent); '' means the
+            # probe could not read the camera at all.
+            'out': (('copy' if acodec == 'aac' else 'aac') if acodec
+                    else ('silence' if vcodec else '')),
+            'mapped': bool(acodec or vcodec),
+        }
+        log.info('audio: ' + (f"{acodec} {self.status.audio['sample_rate']} Hz "
+                              f"{self.status.audio['channels']}ch → "
+                              f"{self.status.audio['out']}" if acodec
+                              else ('NO AUDIO TRACK from the camera — sending '
+                                    'silence so YouTube will start; for sound, '
+                                    'turn on the mic in the camera app' if vcodec
+                                    else 'camera tracks unknown')))
         hw_decode = getattr(self, 'hw_decode', True)
         cmd = build_ffmpeg_cmd(cfg, acodec, url, vcodec=vcodec,
                                hw_decode=hw_decode)

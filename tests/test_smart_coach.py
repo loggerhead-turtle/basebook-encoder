@@ -74,6 +74,7 @@ def test_a_pinned_decode_tries_nothing_else():
 # ── the pipeline ─────────────────────────────────────────────────────────────
 
 CHAR = '0000fff1-0000-1000-8000-00805f9b34fb'
+SERVICE = '0000fff0-0000-1000-8000-00805f9b34fb'
 
 
 def test_a_reading_posts_live_velo_and_a_one_frame_pitch():
@@ -145,6 +146,36 @@ def test_three_consistent_readings_learn_and_persist_the_gun():
     assert rad['smart_coach_decode'] == 'ascii'
 
 
+def test_the_learned_gun_carries_the_service_uuid_for_the_phones():
+    """The box has no use for the service UUID — bleak walks the whole
+    GATT tree. The PHONES do: a web page may only touch services it named
+    before it opened the chooser, so it can never discover an unpublished
+    vendor service for itself. The box can, and this is where that fact
+    starts its trip to them (health → heartbeat → /api/camera/radar/hints
+    → static/radar_ble.js)."""
+    saved = {}
+    svc = SmartCoachService(_FakeLink(), cfg_load=lambda: {},
+                            cfg_save=lambda c: saved.update(c))
+    svc.device = 'AA:BB:CC:DD:EE:FF'
+    for i, t in enumerate((1.0, 2.0, 3.0)):
+        svc.handle_notify(CHAR, b'8%d' % (5 + i), t=t, service_uuid=SERVICE)
+    assert svc.service == SERVICE
+    assert saved['radar']['smart_coach_service'] == SERVICE
+    assert svc.health()['service'] == SERVICE
+
+
+def test_a_box_that_never_saw_a_service_still_learns_the_rest():
+    """Older callers pass no service; the gun is still learned, the phones
+    just have one less hint."""
+    saved = {}
+    svc = SmartCoachService(_FakeLink(), cfg_load=lambda: {},
+                            cfg_save=lambda c: saved.update(c))
+    for t in (1.0, 2.0, 3.0):
+        svc.handle_notify(CHAR, b'88', t=t)
+    assert svc.learned and svc.service is None
+    assert 'smart_coach_service' not in saved['radar']
+
+
 def test_an_inconsistent_decode_resets_the_streak():
     """One lucky binary payload between real ASCII readings must not
     poison the learned identity — consistency, not volume."""
@@ -181,12 +212,29 @@ def test_a_config_that_cannot_save_never_blocks_capture():
 # ── coexistence guarantees ───────────────────────────────────────────────────
 
 def test_module_imports_without_bleak():
-    """bleak is optional exactly like pyserial: the import lives inside
-    loop(), so a box without it still boots everything else."""
+    """bleak is optional exactly like pyserial: every import of it is
+    INSIDE a function, so a box without it still boots everything else.
+
+    This used to be checked by looking for the substring above the class
+    definition, which broke the moment a second lazy importer (the
+    settings page's scan) was added below it. The property is about
+    indentation, not position — and the strongest evidence is right
+    here: this suite runs with bleak absent, so the module under test
+    imported without it a few lines ago."""
     src = open(smart_coach.__file__.rstrip('c')).read()
-    head = src.split('class SmartCoachService')[0]
-    assert 'import bleak' not in head
-    assert 'import bleak' in src        # ...but only inside loop()
+    top = [ln for ln in src.splitlines()
+           if ln.startswith(('import bleak', 'from bleak'))]
+    assert not top, f'bleak imported at module level: {top}'
+    assert 'import bleak' in src        # …but lazily, more than once now
+    try:
+        import bleak                    # noqa: F401
+        installed = True
+    except ImportError:
+        installed = False
+    if not installed:
+        # the real proof, free of charge: this module imported a few
+        # lines ago on a machine that has no bleak
+        assert smart_coach.SmartCoachService is not None
 
 
 def test_auto_mode_only_connects_to_something_named_pocket_radar():
@@ -197,7 +245,12 @@ def test_auto_mode_only_connects_to_something_named_pocket_radar():
     rad = {}
     assert svc._match(D('Pocket Radar', 'AA:00:00:00:00:01'), rad)
     assert svc._match(D('SR1100', 'AA:00:00:00:00:02'), rad)
+    # the name a real unit actually advertises — without this the box
+    # scans straight past its own gun unless somebody pins the MAC
+    assert svc._match(D('SC-236', 'AA:00:00:00:00:05'), rad)
+    assert svc._match(D('SC236', 'AA:00:00:00:00:06'), rad)
     assert not svc._match(D('JBL Flip 6', 'AA:00:00:00:00:03'), rad)
+    assert not svc._match(D('SCALE-9', 'AA:00:00:00:00:07'), rad)
     assert not svc._match(D(None, 'AA:00:00:00:00:04'), rad)
     # a pinned MAC is exact and ignores the name entirely
     rad = {'smart_coach_mac': 'aa:00:00:00:00:03'}

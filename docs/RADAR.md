@@ -200,47 +200,31 @@ male and female serial heads and Type-C for power.
 
 ---
 
-## Pocket Radar Smart Coach (BLE)
+## Pocket Radar Smart Coach — not supported over Bluetooth
 
-The Smart Coach (SR1100) has **no wired data output** — its micro-USB
-port is power and firmware updates only. Readings leave the gun
-exclusively as Bluetooth LE notifications to the Pocket Radar phone
-app, so the box runs a second, independent capture service
-(`encoder/smart_coach.py`) that plays the app's role. It feeds the same
-cloud endpoint as the Stalker reader; the pad tile, score bug and
-play-by-play stamps don't know or care which gun spoke.
+**The capture service is off by default and should stay off.** The gun
+will not give its readings to anything except Pocket Radar's own app.
+This was established against a real SR1100, from three directions, and
+the evidence is written up in `docs/POCKET_RADAR.md` in the site repo
+along with the cloud integration that replaces it.
 
-Setup is one step: turn the gun on near the box with the phone app
-**closed**. Pocket Radar has never published the protocol, so the box
-learns it — it connects to anything advertising as a Pocket Radar,
-subscribes to every notifying characteristic, and decodes defensively;
-after three consistent readings it writes the gun's MAC,
-characteristic and wire format to config
-(`radar.smart_coach_mac/_char/_decode`) and reconnects straight to it
-on every boot. The settings page can pin the MAC up front and switch
-the capture off (`radar.smart_coach: off`).
+The short version, so nobody spends another evening on it:
 
-Know what you're trading against the Stalker:
+* The box connects and BlueZ reports `failed to discover services,
+  device disconnected` — every time, against a gun visible on every
+  scan.
+* A browser gets further (it can see the one vendor service and
+  subscribe) and is handed **sixteen zero bytes** on every read, has
+  **every write refused**, and is dropped after **1.9 seconds** on the
+  dot.
+* `bluetoothctl pair` connects and never completes.
 
-* **One number per pitch.** No deceleration curve (no plate speed), no
-  spin, no track shape — so no throw detection either: every in-band
-  reading files as a one-frame pitch, out-of-band as a ghost.
-* **One client at a time.** While the box holds the connection the
-  phone app cannot connect, and a gun already connected to a phone is
-  invisible to the box's scan. Close the app at the field.
-* **Unofficial protocol.** A firmware update could change the wire
-  format. The learned decode is pinned, so a change shows up loudly as
-  "undecoded payloads" in the journal rather than as silently wrong
-  speeds — press **Forget learned cables** on the settings page and let
-  the box re-learn.
-* **Needs `python3-bleak`** (the installer adds it; without it the
-  service logs one line and stays out of the way).
+That is a product boundary, not a protocol nobody has guessed yet.
+`radar.smart_coach: auto` still turns the capture on for a firmware that
+one day behaves differently; nothing else about this box changes.
 
-Diagnose with `journalctl -u playcall-encoder | grep -i 'smart coach'`
-— the first raw payloads are logged hex-escaped, which settles the wire
-format in one glance, exactly like the serial reader's rx samples.
-
----
+**The Stalker on a cable is the supported gun**, and it gives spin as
+well as velocity, which a Smart Coach never does.
 
 ## When there is no velo
 

@@ -353,7 +353,7 @@ STATUS_PAGE = """<!doctype html><html><head>
 </div>
 {% endif %}
 
-<div class="card">
+<div class="card" id="radar">
   <h2>🔫 Radar</h2>
   <p class="hint">
     {% if radar and radar.get('connected') %}
@@ -371,6 +371,8 @@ STATUS_PAGE = """<!doctype html><html><head>
       radar capture runs in the encoder service
     {% endif %}
   </p>
+  {% if ble_line %}<p class="hint">{{ ble_line }}</p>{% endif %}
+
   <form method="post" action="/radar">
     <label>Capture
       <select name="enabled">
@@ -378,33 +380,17 @@ STATUS_PAGE = """<!doctype html><html><head>
         <option value="off" {{ 'selected' if radar_cfg.get('enabled') == 'off' }}>Off</option>
       </select>
     </label>
-    <label>Pocket Radar Smart Coach (BLE)
+    <label>Pocket Radar Smart Coach (BLE) — <b>off</b>: the gun will not
+      talk to anything but its own app (see docs/POCKET_RADAR.md)
       <select name="smart_coach">
-        <option value="auto" {{ 'selected' if radar_cfg.get('smart_coach', 'auto') != 'off' }}>Auto (default)</option>
-        <option value="off" {{ 'selected' if radar_cfg.get('smart_coach') == 'off' }}>Off</option>
+        <option value="off" {{ 'selected' if radar_cfg.get('smart_coach', 'off') != 'auto' }}>Off (default)</option>
+        <option value="auto" {{ 'selected' if radar_cfg.get('smart_coach') == 'auto' }}>Try anyway</option>
       </select>
     </label>
     <label>Smart Coach MAC (optional pin)
       <input name="smart_coach_mac" value="{{ radar_cfg.get('smart_coach_mac') or '' }}"
-             placeholder="blank — found by name, learned on first pitch">
+             placeholder="only used when the capture above is on">
     </label>
-    <button class="btn" type="submit">Save radar settings</button>
-  </form>
-  <p class="hint">
-    {% if ble_radar and ble_radar.get('connected') %}
-      🟢 Smart Coach connected: {{ ble_radar.get('name') or ble_radar.get('device') or '?' }}
-      {% if ble_radar.get('heard_s') is not none %}
-        — last reading {{ ble_radar.get('heard_s')|int }}s ago
-      {% else %} — no reading yet (pull the trigger once){% endif %}
-      {% if ble_radar.get('learned') %} · gun learned ✓{% endif %}
-    {% elif ble_radar and ble_radar.get('bleak') is false %}
-      ⚫ Smart Coach: BLE support not installed on this box
-      (apt install python3-bleak)
-    {% elif ble_radar %}
-      ⚫ Smart Coach: not found — turn the gun on and make sure the
-      phone app is NOT connected (BLE allows one client at a time)
-    {% endif %}
-  </p>
     <label>Gun baud
       <select name="baud">
         {% for b in [19200, 9600, 4800, 38400, 57600, 115200] %}
@@ -422,33 +408,8 @@ STATUS_PAGE = """<!doctype html><html><head>
         <option value="raw" {{ 'selected' if radar_cfg.get('display_format') == 'raw' }}>Raw passthrough</option>
       </select>
     </label>
-    <label>Pocket Radar Smart Coach (BLE)
-      <select name="smart_coach">
-        <option value="auto" {{ 'selected' if radar_cfg.get('smart_coach', 'auto') != 'off' }}>Auto (default)</option>
-        <option value="off" {{ 'selected' if radar_cfg.get('smart_coach') == 'off' }}>Off</option>
-      </select>
-    </label>
-    <label>Smart Coach MAC (optional pin)
-      <input name="smart_coach_mac" value="{{ radar_cfg.get('smart_coach_mac') or '' }}"
-             placeholder="blank — found by name, learned on first pitch">
-    </label>
     <button class="btn" type="submit">Save radar settings</button>
   </form>
-  <p class="hint">
-    {% if ble_radar and ble_radar.get('connected') %}
-      🟢 Smart Coach connected: {{ ble_radar.get('name') or ble_radar.get('device') or '?' }}
-      {% if ble_radar.get('heard_s') is not none %}
-        — last reading {{ ble_radar.get('heard_s')|int }}s ago
-      {% else %} — no reading yet (pull the trigger once){% endif %}
-      {% if ble_radar.get('learned') %} · gun learned ✓{% endif %}
-    {% elif ble_radar and ble_radar.get('bleak') is false %}
-      ⚫ Smart Coach: BLE support not installed on this box
-      (apt install python3-bleak)
-    {% elif ble_radar %}
-      ⚫ Smart Coach: not found — turn the gun on and make sure the
-      phone app is NOT connected (BLE allows one client at a time)
-    {% endif %}
-  </p>
   <form method="post" action="/radar/forget" style="margin-top:.5rem"
         onsubmit="return confirm('Forget the learned cable roles? The box re-learns them from the next real velocity.')">
     <button class="btn" type="submit">Forget learned cables</button>
@@ -682,6 +643,21 @@ def live_push_view(cfg):
             'status': line}
 
 
+def _ble_line(cloud):
+    """The Smart Coach status as one sentence, or '' on a box whose
+    encoder has no BLE service at all."""
+    h = (cloud.ble_radar_health()
+         if callable(getattr(cloud, 'ble_radar_health', None)) else None)
+    if not h:
+        return ''
+    try:
+        from . import smart_coach
+        return smart_coach.status_line(h)
+    except Exception:
+        log.debug('smart coach status line failed', exc_info=True)
+        return ''
+
+
 def create_app(cloud=None):
     app = Flask(__name__)
     app.secret_key = _session_secret()
@@ -845,6 +821,7 @@ def create_app(cloud=None):
                        if callable(getattr(cloud, 'ble_radar_health', None))
                        else None),
             radar_cfg=(cfg.get('radar') or {}),
+            ble_line=_ble_line(cloud),
             comms=comms_status(),
             comms_tok=comms_token(cfg),
             cloud_base=(cfg.get('cloud') or {}).get('base_url', ''),
@@ -1027,7 +1004,12 @@ def create_app(cloud=None):
                 'AA:BB:CC:DD:EE:FF (find it in the comms manager or '
                 'bluetoothctl devices)')))
         old_mac = (rd.get('bluetooth_mac') or '').upper()
-        rd['bluetooth_mac'] = mac
+        # Only when the field was actually submitted. It sat OUTSIDE this
+        # form in the template for a while, so every save from the
+        # settings page silently cleared a BT578 adapter's address — and
+        # the next boot had nothing to bind /dev/rfcomm0 to.
+        if 'bluetooth_mac' in request.form:
+            rd['bluetooth_mac'] = mac
         if request.form.get('display_format') in ('speed', 'raw'):
             rd['display_format'] = request.form.get('display_format')
         if request.form.get('smart_coach') in ('auto', 'off'):
@@ -1044,6 +1026,7 @@ def create_app(cloud=None):
             # else's — re-learn from its first pitch
             rd.pop('smart_coach_char', None)
             rd.pop('smart_coach_decode', None)
+            rd.pop('smart_coach_service', None)
         cfg['radar'] = rd
         config.save(cfg)
         if mac != old_mac:
@@ -1066,7 +1049,7 @@ def create_app(cloud=None):
                   # of fact — a replaced gun re-learns from its first
                   # pitch just like a replaced cable
                   'smart_coach_mac', 'smart_coach_char',
-                  'smart_coach_decode'):
+                  'smart_coach_decode', 'smart_coach_service'):
             rd.pop(k, None)
         cfg['radar'] = rd
         config.save(cfg)

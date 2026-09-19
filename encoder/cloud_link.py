@@ -182,7 +182,8 @@ class CloudLink:
         sig = (bool(a.get('assigned')), a.get('team_id'),
                a.get('bug_feed_url'), a.get('youtube_rtmp_url'),
                a.get('game_id'), a.get('push_bitrate_kbps'),
-               a.get('push_codec'), a.get('live_transport'))
+               a.get('push_codec'), a.get('live_transport'),
+               a.get('youtube_push'))
         if sig == self.last_assignment:
             return False
         self.last_assignment = sig
@@ -201,11 +202,19 @@ class CloudLink:
             if {'url': url, 'key': key} != cfg.get('youtube'):
                 cfg['youtube'] = {'url': url, 'key': key}
                 restart_push = True
-        elif not a.get('assigned'):
+        elif not a.get('assigned') or a.get('youtube_push') == 'off':
             # Unassigned → stop pushing whatever the previous team streamed.
+            # 'off' → still assigned, but the scorepad sent this game's
+            # broadcast elsewhere (a BaseStream angle, or nobody). YouTube
+            # takes one publisher per key, and this box is the one told to
+            # stand down; the key comes back with the next 'on'. An older
+            # cloud that sends neither leaves the box's own target alone.
             if cfg['youtube'].get('key'):
                 cfg['youtube']['key'] = ''
                 restart_push = True
+                if a.get('assigned'):
+                    log.info('YouTube push stopped: the site sent this '
+                             "game's broadcast elsewhere")
 
         # YouTube quality, set from the site's encoder card. None means
         # the cloud has no opinion (older cloud, or never set) — the
@@ -301,7 +310,8 @@ class CloudLink:
             data = json.loads(path.read_text())
         except (OSError, ValueError):
             return {'connected': False, 'kbps': None, 'reconnects_5m': 0,
-                    'codec': '', 'speed': None, 'in_codec': ''}
+                    'codec': '', 'speed': None, 'in_codec': '',
+                    'waiting': None, 'audio': None}
         fresh = time.time() - data.get('updated', 0) < 30
         cutoff = time.time() - 300
         reconnects = sum(1 for t in data.get('reconnect_times', [])
@@ -309,6 +319,12 @@ class CloudLink:
         return {'connected': bool(data.get('connected')) and fresh,
                 'kbps': data.get('kbps') if fresh else None,
                 'reconnects_5m': reconnects,
+                # why a disconnected push is disconnected — 'camera' means
+                # nobody is publishing to this box, which the desk must
+                # say instead of pointing the operator at YouTube
+                'waiting': (data.get('waiting') or None) if fresh else None,
+                # what the camera sends and what the push does with it
+                'audio': data.get('audio') if fresh else None,
                 # what is actually leaving for YouTube; the site's go-live
                 # gate switches this box to H.264 if YouTube starves on it
                 'codec': str(data.get('codec') or '') if fresh else '',

@@ -21,9 +21,18 @@ serial cables:
     band — and log the first payloads raw, so one
     `journalctl | grep 'smart coach'` settles the true wire format;
   * after a few consistent readings on one characteristic, write the
-    MAC, characteristic and decode back to config
-    (radar.smart_coach_mac/_char/_decode). Reboots reconnect straight
-    to the proven gun.
+    MAC, SERVICE, characteristic and decode back to config
+    (radar.smart_coach_mac/_service/_char/_decode). Reboots reconnect
+    straight to the proven gun.
+
+The service UUID is of no use to this module — bleak enumerates the
+whole GATT tree and never has to ask. It is learned for the PHONES: a
+web page may only touch services it named before it opened the chooser
+(there is no wildcard in Web Bluetooth), so a phone can never discover
+an unpublished vendor service for itself. This box can, and the answer
+rides the heartbeat to the cloud, which hands it to every phone on the
+team (/api/camera/radar/hints). One box meeting the gun once is what
+lets a phone behind the plate hold it — see static/radar_ble.js.
 
 What a Smart Coach cannot give: the deceleration curve (no plate
 speed), spin, or track shape. Each pitch is ONE peak number, so every
@@ -58,8 +67,14 @@ log = logging.getLogger('smartcoach')
 
 # What the gun calls itself over the air. Field units advertise with
 # "Pocket Radar" in the name; the model number covers a firmware that
-# says only that.
-NAME_RE = re.compile(r'pocket\s*radar|smart\s*coach|sr-?1100', re.I)
+# says only that; and a real unit turned up calling itself "SC-236" —
+# Smart Coach abbreviated plus a unit number — which matched none of
+# the above, so this box would have scanned straight past its own gun
+# for ever unless somebody pinned the MAC by hand. The trailing digit
+# is what keeps this from adopting every three-letter gadget in the
+# next dugout.
+NAME_RE = re.compile(r'pocket\s*radar|smart\s*coach|sr-?1100|^sc-?\d',
+                     re.I)
 
 # A decoded number is believed only inside this band (mph). Wider than
 # the pitch BAND on purpose: the gun itself measures 25–130, and a
@@ -84,23 +99,23 @@ def _band(v):
     return PLAUSIBLE[0] <= v <= PLAUSIBLE[1]
 
 
-def decode_reading(data, want=None):
-    """One notification payload → (mph, decode_name) or None.
+def candidates(data):
+    """Every encoding this payload COULD be, in the FIXED order the
+    decoder tries them: [(name, value), ...].
 
-    Tries the encodings a speed most plausibly travels as, in a FIXED
-    order, and accepts the first that lands in the plausible band —
-    determinism is what lets the learner demand the same decode three
-    times before trusting it. `want` pins one decoder (the learned
-    config) and tries nothing else, so a firmware update that changes
-    the format goes loudly unparsed instead of silently misread.
+    One ladder, three readers — decode_reading() below, the probe script
+    (scripts/radar_ble_probe.py) that prints the whole table when a gun
+    speaks a format nobody has seen, and its browser twin in
+    static/radar_ble.js. The order is not cosmetic: it is what makes
+    "the same decode three times" mean anything.
 
     Names: ascii, ascii_x10, u8, u16le, u16le_x10, u16le_cmps
     (hundredths of m/s — the SI-flavored encoding BLE sensors love),
     u16be, u16be_x10, f32le.
     """
-    if not data:
-        return None
     tries = []
+    if not data:
+        return tries
 
     def offer(name, v):
         if v is not None:
@@ -132,12 +147,84 @@ def decode_reading(data, want=None):
             offer('f32le', float(struct.unpack_from('<f', data)[0]))
         except struct.error:
             pass
-    for name, v in tries:
+    return tries
+
+
+def decode_reading(data, want=None):
+    """One notification payload → (mph, decode_name) or None.
+
+    The first encoding on the ladder that lands in the plausible band
+    wins. `want` pins one decoder (the learned config) and tries nothing
+    else, so a firmware update that changes the format goes loudly
+    unparsed instead of silently misread.
+    """
+    for name, v in candidates(data):
         if want is not None and name != want:
             continue
         if _band(v):
             return round(v, 1), name
     return None
+
+
+def status_line(h):
+    """The Smart Coach's state as one sentence for the settings page.
+
+    "Not found" used to cover four situations that want opposite things
+    done about them — no Bluetooth on this box, nothing in range,
+    plenty in range but none of it the pinned address, and has not
+    looked yet — and a field box sat on the third of those with a
+    correct-looking pin while its owner checked a gun that was fine.
+
+    The cloud says the same four on its own screens
+    (cloud/routes/scorekeeper.py: ble_gun_state); the wording is
+    deliberately close and the CASES are the contract.
+    """
+    h = h or {}
+    if h.get('bleak') is False:
+        return ('⚫ Smart Coach: Bluetooth support is not installed on this '
+                'box — sudo apt install -y python3-bleak (or sudo pip3 '
+                'install bleak --break-system-packages), then restart the '
+                'encoder')
+    if h.get('connected'):
+        who = h.get('name') or h.get('device') or '?'
+        heard = h.get('heard_s')
+        return ('🟢 Smart Coach connected: ' + str(who)
+                + (f' — last reading {int(heard)}s ago'
+                   if heard is not None else
+                   ' — no reading yet (pull the trigger once)')
+                + (' · gun learned ✓' if h.get('learned') else ''))
+    if h.get('connect_error') and h.get('found_s') is not None:
+        return ('🔴 Smart Coach: found ' + str(h.get('name') or h.get('device')
+                                               or 'the gun')
+                + ' and could not hold the connection — '
+                + str(h['connect_error'])
+                + f' (failed {int(h.get("connect_fails") or 0)}×). '
+                + 'The gun refuses everything to a client that is not its '
+                'own app — see docs/POCKET_RADAR.md. There is nothing to '
+                'fix on this box.')
+    if h.get('scan_error'):
+        return ('🔴 Smart Coach: this box cannot scan for Bluetooth at all '
+                f'— {h["scan_error"]}. Check: systemctl status bluetooth, '
+                'rfkill list, bluetoothctl show. The gun is not the '
+                'problem.')
+    if h.get('seen') is None:
+        return '⚫ Smart Coach: starting up — no scan has finished yet'
+    if not h.get('seen'):
+        return ('⚫ Smart Coach: nothing at all is advertising nearby '
+                '(0 devices in the last scan) — turn the gun on, and check '
+                'this box has a Bluetooth antenna')
+    names = ', '.join(n for n in (h.get('seen_names') or []) if n != '?')
+    seen = int(h.get('seen') or 0)
+    if h.get('pinned'):
+        return (f'⚫ Smart Coach: {seen} devices in range and NONE of them '
+                'has the pinned address. Either the pin is wrong, or this '
+                'gun advertises a rotating (random) address, which a pin '
+                'can never match — clear the MAC field and let it match by '
+                'name instead.'
+                + (f' Seen: {names}' if names else ''))
+    return (f'⚫ Smart Coach: {seen} devices in range, none named like a '
+            'Pocket Radar. Scan below and pin the gun by hand.'
+            + (f' Seen: {names}' if names else ''))
 
 
 class SmartCoachService:
@@ -169,6 +256,7 @@ class SmartCoachService:
         self.device = None                  # MAC once found
         self.device_name = None
         self.char = None                    # proven characteristic uuid
+        self.service = None                 # …and the service it lives in
         self.decode = None                  # proven decode name
         self.notifies = 0
         self.readings = 0
@@ -176,8 +264,17 @@ class SmartCoachService:
         self.last_gun_t = None
         self.learned = False                # persisted identity this run
         self.have_bleak = None              # None until the loop checks
+        self.scan_error = ''                # why the last scan failed
+        self.connect_error = ''             # …and why the last connect did
+        self.connect_fails = 0
+        self.found_at = None                # a scan last matched the gun
+        self.scan_at = None                 # when a scan last finished
+        self.seen = None                    # devices the last scan saw
+        self.seen_names = []                # …and what they call themselves
         # (uuid, decode) → consecutive in-band readings, for the learner
         self._streak = {}
+        # characteristic uuid → the service it was found under
+        self._svc_of = {}
 
     # ── cloud (same contract as radar.RadarService) ──────────────────────────
     def _post(self, payload):
@@ -285,6 +382,7 @@ class SmartCoachService:
             rad = dict(cfg.get('radar') or {})
             changed = []
             for k, v in (('smart_coach_mac', self.device),
+                         ('smart_coach_service', self.service),
                          ('smart_coach_char', self.char),
                          ('smart_coach_decode', self.decode)):
                 if v and rad.get(k) != v:
@@ -306,10 +404,15 @@ class SmartCoachService:
             return False
 
     # ── the pipeline (test entrypoint) ───────────────────────────────────────
-    def handle_notify(self, char_uuid, data, t=None):
+    def handle_notify(self, char_uuid, data, t=None, service_uuid=None):
         """One GATT notification through the whole pipeline. Returns the
-        event dict when the payload decoded, else None."""
+        event dict when the payload decoded, else None.
+
+        `service_uuid` is remembered, never judged: it is the one fact a
+        browser cannot find out for itself (see the module docstring)."""
         t = time.monotonic() if t is None else t
+        if service_uuid:
+            self._svc_of[str(char_uuid)] = str(service_uuid)
         self.notifies += 1
         data = bytes(data or b'')
         if self.notifies <= 3:
@@ -344,6 +447,7 @@ class SmartCoachService:
                             if k == key}        # consistency, not volume
             if self._streak[key] >= LEARN_READINGS:
                 self.char, self.decode = key
+                self.service = self._svc_of.get(self.char) or self.service
                 self._persist()
         # one reading = one whole burst. No track shape exists to call a
         # throw, so in-band is a pitch and out-of-band is a ghost — same
@@ -365,6 +469,7 @@ class SmartCoachService:
             'connected': bool(self.connected),
             'device': self.device,
             'name': self.device_name,
+            'service': self.service,
             'char': self.char,
             'decode': self.decode,
             'notifies': self.notifies,
@@ -374,12 +479,36 @@ class SmartCoachService:
                         if self.last_gun_t is not None else None),
             'learned': bool(self.learned),
             'bleak': self.have_bleak,
+            # the scan's own account of itself — the difference between
+            # "no Bluetooth on this box", "nothing in range", "plenty in
+            # range, none of it the pinned address" and "has not looked
+            # yet", all four of which used to print as "not found"
+            'scan_error': self.scan_error or '',
+            'connect_error': self.connect_error or '',
+            'connect_fails': self.connect_fails,
+            'found_s': (round(time.monotonic() - self.found_at, 1)
+                        if self.found_at is not None else None),
+            'seen': self.seen,
+            'seen_names': list(self.seen_names or []),
+            'pinned': bool((((self.cfg_load() or {}).get('radar') or {})
+                            .get('smart_coach_mac') or '').strip()),
+            'looked_s': (round(time.monotonic() - self.scan_at, 1)
+                         if self.scan_at is not None else None),
         }
 
     # ── BLE loop ─────────────────────────────────────────────────────────────
     def _want(self, cfg):
+        """OFF unless a box explicitly opts in.
+
+        The Smart Coach answers a connection from anything and then hands
+        a non-app client nothing: no services to the box, refused writes
+        and sixteen zero bytes to a browser, dropped after 1.9 s either
+        way. That is a deliberate product boundary, not a bug to find —
+        see docs/POCKET_RADAR.md — so the default is not to spend a scan
+        every fifteen seconds on a gun that will never answer. The
+        setting stays for a firmware that one day might."""
         rad = (cfg or {}).get('radar') or {}
-        if (rad.get('smart_coach') or 'auto') == 'off':
+        if (rad.get('smart_coach') or 'off') != 'auto':
             return None
         return rad
 
@@ -404,11 +533,17 @@ class SmartCoachService:
             # adopt a learned identity from config (fresh boot)
             self.char = self.char or rad.get('smart_coach_char') or None
             self.decode = self.decode or rad.get('smart_coach_decode') or None
+            self.service = self.service or rad.get('smart_coach_service') \
+                or None
             try:
                 devs = await bleak.BleakScanner.discover(timeout=SCAN_S)
             except Exception as e:
-                # no adapter / bluetoothd down — idle quietly, keep trying
+                # no adapter / bluetoothd down / rfkill — and until now
+                # this read on the settings page as "gun not found",
+                # which sent people to check a gun that was fine
                 self.connected = False
+                self.scan_error = str(e) or e.__class__.__name__
+                self.scan_at = time.monotonic()
                 if not getattr(self, '_scan_warned', False):
                     self._scan_warned = True
                     log.info(f'BLE scan unavailable ({e}) — Smart Coach '
@@ -416,6 +551,14 @@ class SmartCoachService:
                 await asyncio.sleep(30)
                 continue
             self._scan_warned = False
+            # What the scan actually SAW. A pinned MAC that never matches
+            # looks identical to a dead adapter without this, and the two
+            # want opposite things done about them.
+            self.scan_error = ''
+            self.scan_at = time.monotonic()
+            self.seen = len(devs or [])
+            self.seen_names = sorted({(getattr(d, 'name', '') or '?')
+                                      for d in (devs or [])})[:12]
             gun = next((d for d in devs if self._match(d, rad)), None)
             if gun is None:
                 self.connected = False
@@ -423,6 +566,7 @@ class SmartCoachService:
                 continue
             self.device = (gun.address or '').upper()
             self.device_name = gun.name or None
+            self.found_at = time.monotonic()
             log.info(f'Smart Coach found: {self.device_name or "?"} '
                      f'[{self.device}] — connecting')
             try:
@@ -438,9 +582,11 @@ class SmartCoachService:
                             if self.char and uuid != self.char:
                                 continue
 
-                            def _cb(sender, data, _u=uuid):
+                            def _cb(sender, data, _u=uuid,
+                                    _s=str(svc.uuid)):
                                 try:
-                                    self.handle_notify(_u, data)
+                                    self.handle_notify(_u, data,
+                                                       service_uuid=_s)
                                 except Exception:
                                     log.debug('smart coach notify failed',
                                               exc_info=True)
@@ -449,6 +595,7 @@ class SmartCoachService:
                                 subs.append(uuid)
                             except Exception as e:
                                 log.debug(f'start_notify {uuid} failed: {e}')
+                    self.connect_error = ''
                     if not subs:
                         log.warning('Smart Coach connected but offered no '
                                     'notifying characteristics — is the '
@@ -466,6 +613,12 @@ class SmartCoachService:
                         self.push()          # keepalive cadence
                         await asyncio.sleep(1.0)
             except Exception as e:
+                # FOUND IT AND COULD NOT HOLD IT. Until this was
+                # recorded, the settings page said "not found" about a
+                # gun the box had located on every scan for an hour —
+                # the same word for the opposite problem.
+                self.connect_error = str(e) or e.__class__.__name__
+                self.connect_fails += 1
                 log.warning(f'Smart Coach connection dropped ({e}) — '
                             'rescanning')
             self.connected = False
@@ -477,8 +630,11 @@ class SmartCoachService:
             import bleak
         except ImportError:
             self.have_bleak = False
-            log.info('bleak not installed — Smart Coach capture disabled '
-                     '(apt install python3-bleak, or pip3 install bleak)')
+            log.info('bleak not installed — Smart Coach capture disabled. '
+                     'sudo apt install -y python3-bleak (or sudo pip3 '
+                     'install bleak --break-system-packages — Debian 12+ '
+                     'refuses a bare pip install), then restart this '
+                     'service')
             return
         self.have_bleak = True
         self.ensure_sender()                 # all HTTP off the BLE loop
