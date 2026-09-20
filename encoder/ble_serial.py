@@ -61,6 +61,17 @@ UART_SERVICES = (
 )
 
 SCAN_S = 8.0
+# One LE scan per process at a time. BlueZ allows one discovery per
+# D-Bus client, and every bleak scanner in this process is that one
+# client: with the Smart Coach module scanning in its own thread, the
+# bridge's scan failed 'org.bluez.Error.InProgress: Operation already
+# in progress' on every pass, for an hour (19 Sep 2026). A scan holds
+# this; a connect by ADDRESS holds it too, since bleak resolves an
+# address with a scan of its own. Held across an await on purpose —
+# each module runs its own event loop in its own thread, so blocking
+# the thread is the same as blocking the loop, and nothing else runs
+# on it.
+SCAN_LOCK = threading.Lock()
 RESCAN_IDLE_S = 15
 RECONNECT_S = 3
 
@@ -271,16 +282,18 @@ class BleSerialBridge:
         looks exactly like one that found nothing. Returns the devices,
         or None after saying why."""
         try:
-            try:
-                return await asyncio.wait_for(
-                    bleak.BleakScanner.discover(timeout=SCAN_S,
-                                                return_adv=True),
-                    SCAN_S + 15)
-            except TypeError:
-                # older bleak: no return_adv — fall back to devices only
-                found = await asyncio.wait_for(
-                    bleak.BleakScanner.discover(timeout=SCAN_S), SCAN_S + 15)
-                return {d.address: (d, None) for d in found}
+            with SCAN_LOCK:
+                try:
+                    return await asyncio.wait_for(
+                        bleak.BleakScanner.discover(timeout=SCAN_S,
+                                                    return_adv=True),
+                        SCAN_S + 15)
+                except TypeError:
+                    # older bleak: no return_adv — fall back to devices only
+                    found = await asyncio.wait_for(
+                        bleak.BleakScanner.discover(timeout=SCAN_S),
+                        SCAN_S + 15)
+                    return {d.address: (d, None) for d in found}
         except asyncio.TimeoutError:
             self.scan_error = (f'the Bluetooth scan hung for {SCAN_S + 15:.0f}s '
                                '(bluetoothd stuck? — sudo systemctl restart '
@@ -514,7 +527,15 @@ class BleSerialBridge:
             log.info(f'BLE serial adapter found: {self.device_name or "?"} '
                      f'[{mac}] — connecting')
             try:
-                async with bleak.BleakClient(dev) as client:
+                client_cm = bleak.BleakClient(dev)
+                if isinstance(dev, str):
+                    # bleak resolves a bare address with a scan of its
+                    # own — one discovery per process (SCAN_LOCK)
+                    with SCAN_LOCK:
+                        client = await client_cm.__aenter__()
+                else:
+                    client = await client_cm.__aenter__()
+                try:
                     subs = []
                     for svc in client.services:
                         for ch in svc.characteristics:
@@ -547,6 +568,11 @@ class BleSerialBridge:
                             self._persist_kind()  # the form put 'auto' back
                         self.publish_link()     # see publish_link()
                         await asyncio.sleep(1.0)
+                finally:
+                    try:
+                        await client_cm.__aexit__(None, None, None)
+                    except Exception:
+                        pass
             except Exception as e:
                 self.connect_error = str(e) or e.__class__.__name__
                 log.warning(f'BLE serial lead dropped ({self.connect_error}) '

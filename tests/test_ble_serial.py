@@ -832,3 +832,45 @@ def test_the_n150s_bluetoothctl_disconnect_wording_counts_as_success(monkeypatch
     monkeypatch.setattr(ble_serial.subprocess, 'run', lambda argv, **kw: F())
     b2 = ble_serial.BleSerialBridge(cfg_load=lambda: {})
     assert b2._bluez_disconnect('88:0A:98:19:08:16') is False
+
+
+# ── one LE scan per process ──────────────────────────────────────────────────
+
+def test_the_bridge_scans_and_connects_by_address_under_the_scan_lock(run_dir, monkeypatch):
+    cfg = {'radar': {'bluetooth_mac': '88:0A:98:19:08:16', 'bluetooth_kind': 'ble'}}
+    seen = {'scan': None, 'connect': None}
+    bleak, state = _fake_bleak({}, [FRAME.encode('latin-1')])
+
+    async def discover(timeout=0, return_adv=False):
+        seen['scan'] = ble_serial.SCAN_LOCK.locked()
+        return {}
+    bleak.BleakScanner.discover = discover
+    orig_enter = bleak.BleakClient.__aenter__
+
+    async def enter(self):
+        seen['connect'] = ble_serial.SCAN_LOCK.locked()
+        return await orig_enter(self)
+    bleak.BleakClient.__aenter__ = enter
+    b = ble_serial.BleSerialBridge(cfg_load=lambda: cfg, cfg_save=lambda c: None)
+    b._bluez_info = lambda mac: {'known': True, 'connected': False, 'le': True}
+    _drive(b, bleak, ticks=3)
+    assert seen == {'scan': True, 'connect': True}
+    assert not ble_serial.SCAN_LOCK.locked()
+    assert state['connects'] >= 1
+
+
+def test_a_scan_blocked_by_another_module_waits_instead_of_failing(run_dir):
+    """With the lock held elsewhere the bridge's scan waits its turn;
+    it never sees InProgress."""
+    import threading
+    cfg = {'radar': {'bluetooth_mac': '88:0A:98:19:08:16'}}
+    dev = _Dev('88:0A:98:19:08:16', 'VELOBEAM_003')
+    bleak, state = _fake_bleak({'88:0A:98:19:08:16': (dev, _Adv(
+        ['0000ffe0-0000-1000-8000-00805f9b34fb']))}, [FRAME.encode('latin-1')])
+    ble_serial.SCAN_LOCK.acquire()               # the other module's scan
+    t = threading.Timer(0.2, ble_serial.SCAN_LOCK.release)
+    t.start()
+    b = ble_serial.BleSerialBridge(cfg_load=lambda: cfg, cfg_save=lambda c: None)
+    _drive(b, bleak, ticks=3)
+    t.join()
+    assert state['connects'] >= 1 and b.scan_error == ''

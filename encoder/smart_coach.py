@@ -185,6 +185,8 @@ def status_line(h):
                 'box — sudo apt install -y python3-bleak (or sudo pip3 '
                 'install bleak --break-system-packages), then restart the '
                 'encoder')
+    if h.get('stood_down'):
+        return '⚫ Smart Coach: standing down — ' + str(h['stood_down'])
     if h.get('connected'):
         who = h.get('name') or h.get('device') or '?'
         heard = h.get('heard_s')
@@ -242,6 +244,7 @@ class SmartCoachService:
         self.link = link
         self.cfg_load = cfg_load or (lambda: {})
         self.cfg_save = cfg_save            # None → encoder.config
+        self.stood_down = ''                # why _want() said no (a Stalker BT adapter)
         self.running = True
         self.pending = deque(maxlen=200)
         self._last_live_post = 0.0
@@ -484,6 +487,7 @@ class SmartCoachService:
             # range, none of it the pinned address" and "has not looked
             # yet", all four of which used to print as "not found"
             'scan_error': self.scan_error or '',
+            'stood_down': getattr(self, 'stood_down', '') or '',
             'connect_error': self.connect_error or '',
             'connect_fails': self.connect_fails,
             'found_s': (round(time.monotonic() - self.found_at, 1)
@@ -509,7 +513,22 @@ class SmartCoachService:
         setting stays for a firmware that one day might."""
         rad = (cfg or {}).get('radar') or {}
         if (rad.get('smart_coach') or 'off') != 'auto':
+            self.stood_down = ''
             return None
+        # One gun per team. A Stalker on a Bluetooth serial adapter is
+        # read by encoder/ble_serial.py in this same process, and two
+        # LE scanners here are one too many: this module's scan held
+        # the adapter and the bridge's failed 'Operation already in
+        # progress' on every pass, for an hour, while the settings
+        # page showed 26 devices seen and none of them the gun that
+        # was never going to be there (19 Sep 2026).
+        if (rad.get('bluetooth_mac') or '').strip():
+            self.stood_down = ('a Stalker Bluetooth adapter is configured '
+                               f"({rad.get('bluetooth_mac').strip().upper()}) "
+                               '— one gun per team; clear that field to '
+                               'look for a Smart Coach instead')
+            return None
+        self.stood_down = ''
         return rad
 
     def _match(self, dev, rad):
@@ -536,7 +555,9 @@ class SmartCoachService:
             self.service = self.service or rad.get('smart_coach_service') \
                 or None
             try:
-                devs = await bleak.BleakScanner.discover(timeout=SCAN_S)
+                from .ble_serial import SCAN_LOCK   # one LE scan at a time
+                with SCAN_LOCK:
+                    devs = await bleak.BleakScanner.discover(timeout=SCAN_S)
             except Exception as e:
                 # no adapter / bluetoothd down / rfkill — and until now
                 # this read on the settings page as "gun not found",

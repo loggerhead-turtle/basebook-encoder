@@ -280,3 +280,57 @@ def test_heartbeat_and_health_carry_the_ble_gun():
     import encoder.cloud_link as cl
     src = open(cl.__file__.rstrip('c')).read()
     assert "'ble_radar'" in src and 'ble_radar_health' in src
+
+
+# ── one gun per team: a Stalker Bluetooth adapter stands the Smart Coach down ──
+# 19 Sep 2026: this module's scan and the Stalker BLE bridge's scan in the
+# same process — BlueZ allows one discovery per client — and the bridge
+# failed 'Operation already in progress' every pass for an hour while
+# this card listed 26 devices, none of them a gun that was never there.
+
+def test_a_stalker_bluetooth_adapter_stands_the_smart_coach_down():
+    svc = SmartCoachService(_FakeLink())
+    on = {'radar': {'smart_coach': 'auto'}}
+    assert svc._want(on) is not None and svc.stood_down == ''
+    both = {'radar': {'smart_coach': 'auto',
+                      'bluetooth_mac': '88:0a:98:19:08:16'}}
+    assert svc._want(both) is None
+    assert '88:0A:98:19:08:16' in svc.stood_down
+    assert 'one gun per team' in svc.stood_down
+    line = smart_coach.status_line(svc.health())
+    assert line.startswith('⚫ Smart Coach: standing down') and '88:0A:98' in line
+    # off is off, with no reason to give
+    svc._want({'radar': {'smart_coach': 'off', 'bluetooth_mac': 'x'}})
+    assert svc.stood_down == ''
+
+
+def test_the_smart_coach_scan_takes_the_process_wide_scan_lock():
+    import asyncio
+    from encoder import ble_serial
+    seen = {'locked': None}
+
+    class Scanner:
+        @staticmethod
+        async def discover(timeout=0):
+            seen['locked'] = ble_serial.SCAN_LOCK.locked()
+            return []
+
+    class Bleak:
+        BleakScanner = Scanner
+        BleakClient = None
+    svc = SmartCoachService(_FakeLink(),
+                            cfg_load=lambda: {'radar': {'smart_coach': 'auto'}})
+    sleeps = {'n': 0}
+
+    async def fake_sleep(s):
+        sleeps['n'] += 1
+        if sleeps['n'] >= 2:
+            svc.running = False
+    real = asyncio.sleep
+    asyncio.sleep = fake_sleep
+    try:
+        asyncio.run(svc._run(Bleak))
+    finally:
+        asyncio.sleep = real
+    assert seen['locked'] is True
+    assert not ble_serial.SCAN_LOCK.locked()          # released after

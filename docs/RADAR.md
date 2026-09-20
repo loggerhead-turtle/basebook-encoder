@@ -308,6 +308,14 @@ The one in the field advertises as `VELOBEAM_003`.
   first pitch over the BLE lead). A port that failed to open is retried
   only once it exists again, or once a minute if it exists but would
   not open; it is never a reason to reopen the rest.
+* **"this box cannot scan for Bluetooth — org.bluez.Error.InProgress".**
+  Another LE scan in the same process: the Pocket Radar Smart Coach
+  module, left on "try anyway", scanning every fifteen seconds. BlueZ
+  allows one discovery per client and every bleak scanner here is that
+  one client. Two guards now: one process-wide scan lock that both
+  modules (and a connect by address, which scans on its own) take in
+  turn — and the Smart Coach stands down whenever `radar.bluetooth_mac`
+  is set, because a team runs one gun. The card says so.
 * **The slide switch is a TX/RX crossover.** If the bridge is up
   (bytes received climbing on the settings page) and the gun is silent,
   flip it and pull the trigger again. First thing to try.
