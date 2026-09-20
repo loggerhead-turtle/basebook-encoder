@@ -812,3 +812,23 @@ def test_every_way_of_waiting_says_so(run_dir, caplog):
     finally:
         asyncio.wait_for = real
     assert 'scan hung' in b2.scan_note and 'restart bluetooth' in b2.scan_note
+
+
+def test_the_n150s_bluetoothctl_disconnect_wording_counts_as_success(monkeypatch):
+    """No 'Successful' on this build — just the property change and a
+    reason code, exit 0. That IS the disconnect (the connect that
+    followed it proved so)."""
+    class R:
+        stdout = ('Attempting to disconnect from 88:0A:98:19:08:16\n'
+                  '[CHG] Device 88:0A:98:19:08:16 Connected: no\n'
+                  'Disconnected with reason 2\n')
+        stderr, returncode = '', 0
+    monkeypatch.setattr(ble_serial.subprocess, 'run', lambda argv, **kw: R())
+    b = ble_serial.BleSerialBridge(cfg_load=lambda: {})
+    assert b._bluez_disconnect('88:0A:98:19:08:16') is True
+
+    class F:
+        stdout, stderr, returncode = 'Failed to disconnect: org.bluez.Error.NotConnected\n', '', 1
+    monkeypatch.setattr(ble_serial.subprocess, 'run', lambda argv, **kw: F())
+    b2 = ble_serial.BleSerialBridge(cfg_load=lambda: {})
+    assert b2._bluez_disconnect('88:0A:98:19:08:16') is False

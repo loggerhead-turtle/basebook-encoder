@@ -324,7 +324,12 @@ class BleSerialBridge:
         try:
             r = subprocess.run(['bluetoothctl', 'disconnect', mac],
                                capture_output=True, text=True, timeout=15)
-            ok = r.returncode == 0 and 'Successful' in (r.stdout or '')
+            low = (r.stdout or '').lower()
+            # bluetoothctl says 'Successful disconnected' on one build
+            # and only '[CHG] … Connected: no' / 'Disconnected with
+            # reason 2' on another (the N150's) — a zero exit with no
+            # 'failed' in it is the disconnect having happened
+            ok = r.returncode == 0 and 'fail' not in low
             if ok:
                 log.warning(f'BlueZ was holding {mac} connected from a '
                             'previous run — disconnected it so it '

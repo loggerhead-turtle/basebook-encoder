@@ -1267,3 +1267,57 @@ def test_a_genuinely_wrong_usb_pin_is_still_corrected(monkeypatch):
     assert svc.port == USB_GUN
     assert saved['radar']['port'] == USB_GUN
     assert saved['radar']['display_port'] == USB_BOARD
+
+
+# ── a pinned port that is unplugged must not make every rescan a change ──────
+# 19 Sep 2026: radar.port pinned to an FTDI cable left in the bag, the gun
+# on the BLE lead — 'radar listening on 1 adapter(s)' every 10 s all night,
+# each reopen cutting the frame in flight, and the one pitch fired landed
+# in a cut: 'did not parse: "564 564     6A"'.
+
+def test_an_unplugged_pin_is_not_a_change_on_every_rescan(monkeypatch):
+    from encoder import radar
+    pin = '/dev/serial/by-id/usb-FTDI_USB_Serial_Converter_FTETMJQS-if00-port0'
+    lead = radar.BLE_LINK
+    monkeypatch.setattr(radar.glob, 'glob', lambda pat: [])
+    present = {lead}
+    monkeypatch.setattr(radar.os.path, 'exists', lambda p: p in present)
+    svc = radar.RadarService(_FakeLink())
+    cfg = {'radar': {'port': pin}}
+    assert radar.find_ports(cfg) == [pin, lead]      # the pin is still WANTED
+    handles = {lead: object()}
+    failed = {pin: (1000.0, False)}            # failed while unplugged
+    # unplugged: not news, however long it stays that way
+    assert svc._adapters_changed(cfg, handles, failed, now=1005.0) is False
+    assert svc._adapters_changed(cfg, handles, failed, now=9999.0) is False
+    # plugged back in: a change at once
+    present.add(pin)
+    assert svc._adapters_changed(cfg, handles, failed, now=1005.0) is True
+
+
+def test_a_port_that_exists_but_would_not_open_is_retried_once_a_minute(monkeypatch):
+    from encoder import radar
+    lead = radar.BLE_LINK
+    board = '/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_A9YUGGIA-if00-port0'
+    monkeypatch.setattr(radar.glob, 'glob',
+                        lambda pat: [board] if 'by-id' in pat else [])
+    monkeypatch.setattr(radar.os.path, 'exists', lambda p: True)
+    svc = radar.RadarService(_FakeLink())
+    handles = {lead: object()}
+    failed = {board: (1000.0, True)}                  # there, but busy
+    assert svc._adapters_changed({}, handles, failed, now=1030.0) is False
+    assert svc._adapters_changed({}, handles, failed, now=1061.0) is True
+
+
+def test_a_new_adapter_or_a_lost_one_is_still_a_change(monkeypatch):
+    from encoder import radar
+    lead = radar.BLE_LINK
+    monkeypatch.setattr(radar.glob, 'glob', lambda pat: [])
+    present = {lead}
+    monkeypatch.setattr(radar.os.path, 'exists', lambda p: p in present)
+    svc = radar.RadarService(_FakeLink())
+    assert svc._adapters_changed({}, {lead: object()}, {}) is False
+    present.discard(lead)                             # the lead went away
+    assert svc._adapters_changed({}, {lead: object()}, {}) is True
+    present.add(lead)
+    assert svc._adapters_changed({}, {}, {}) is True  # never opened: open it

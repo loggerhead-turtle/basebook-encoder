@@ -299,6 +299,15 @@ The one in the field advertises as `VELOBEAM_003`.
   the encoder hands the adapter back, so the next run does not start
   in that state. By hand, the same thing is
   `bluetoothctl disconnect <MAC>`.
+* **"radar listening on 1 adapter(s)" every ten seconds, frames cut.**
+  The loop's rescan compared the ports it wanted with the ports it
+  held, and a pinned USB path whose cable is in the bag is wanted on
+  every scan and held on none — so every rescan was a "change", the
+  loop reopened its one real adapter every 10 s, and whatever frame
+  was mid-flight was lost ("did not parse: `564 564     6A`" — the
+  first pitch over the BLE lead). A port that failed to open is retried
+  only once it exists again, or once a minute if it exists but would
+  not open; it is never a reason to reopen the rest.
 * **The slide switch is a TX/RX crossover.** If the bridge is up
   (bytes received climbing on the settings page) and the gun is silent,
   flip it and pull the trigger again. First thing to try.

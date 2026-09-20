@@ -632,6 +632,35 @@ class RadarService:
             ports = [p for p in ports if p != BLE_LINK]
         return ports
 
+    def _adapters_changed(self, cfg, handles, failed, now=None):
+        """Should the loop close everything and reopen? Yes when an
+        adapter it holds is gone, or a NEW one it could open has
+        appeared. A port that failed to open is not new: a pinned
+        by-id path whose cable is unplugged is wanted on every scan and
+        open on none, and comparing the two lists made every rescan a
+        'change' — the loop reopened its one real adapter every 10 s
+        all night, cutting whatever frame was mid-flight ('did not
+        parse: "564 564     6A"' — the pitch, 19 Sep 2026). A failed
+        port is retried only once it exists, and if it exists but would
+        not open, not more than once a minute."""
+        now = time.monotonic() if now is None else now
+        want = set(self._ports(cfg))
+        have = set(handles)
+        if have - want:
+            return True                     # something we hold is gone
+        for p in want - have:
+            rec = failed.get(p)
+            if rec is None:
+                return True                 # new, never tried: open it
+            t, existed = rec
+            if not os.path.exists(p):
+                continue                    # still unplugged: not news
+            if not existed:
+                return True                 # it was unplugged; it is back
+            if now - t >= 60:
+                return True                 # there, would not open: retry
+        return False
+
     def persist_roles(self, gun, handles):
         """Write the proven gun (and, when unambiguous, the board) back
         to config, so identity is decided once per CABLE rather than
@@ -913,6 +942,7 @@ class RadarService:
             disp_fmt = ((cfg.get('radar') or {}).get('display_format')
                         or 'speed')
             handles, bufs = {}, {}
+            failed = {}   # port → (monotonic time the open failed, existed then?)
             claims = {'lines': 0, 'ok': 0}
             probes = {}                 # port → RD frames heard off-claim
             proof = {'rd': 0, 'ok': 0}  # evidence on the CLAIMED gun
@@ -922,6 +952,7 @@ class RadarService:
                         handles[p] = serial.Serial(p, gun_baud, timeout=0)
                         bufs[p] = b''
                     except Exception as e:
+                        failed[p] = (time.monotonic(), os.path.exists(p))
                         _warn_slow(('open', p),
                                    f'radar port {p} failed to open ({e})')
                 if not handles:
@@ -1134,7 +1165,7 @@ class RadarService:
                         self.push(event=ev)
                         time.sleep(0.05)
                     if time.monotonic() > rescan_at:
-                        if sorted(self._ports(cfg)) != sorted(handles):
+                        if self._adapters_changed(cfg, handles, failed):
                             log.info('serial adapters changed — reopening')
                             break
                         rescan_at = time.monotonic() + 10
