@@ -277,6 +277,16 @@ The one in the field advertises as `VELOBEAM_003`.
   again — at 20:10 that night to the operator's SSH login, and the
   radar loop "listened" to a shell. The loop also opens the link only
   when the running bridge says it is its own.
+* **The bridge is never silent.** Every way it can wait — scan failed,
+  scan hung (bounded now; `sudo systemctl restart bluetooth` if it says
+  so), MAC not in the scan, what BlueZ knows about the address — is one
+  journal line per change (`journalctl -u playcall-encoder | grep
+  bleserial`) and the same words under the byte count on the radar
+  card. On a miss it asks `bluetoothctl info`: an address BlueZ holds
+  connected or has seen as an LE device is connected directly; one it
+  knows only as classic, or not at all, is the binder's. And the radar
+  loop's warnings about an unplugged USB pin are said once, then at
+  most every ten minutes, instead of three lines every five seconds.
 * **The slide switch is a TX/RX crossover.** If the bridge is up
   (bytes received climbing on the settings page) and the gun is silent,
   flip it and pull the trigger again. First thing to try.

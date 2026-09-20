@@ -226,9 +226,11 @@ def test_a_mac_that_never_appears_in_a_ble_scan_is_left_to_the_binder(run_dir):
     bleak, state = _fake_bleak({}, [])
     b = ble_serial.BleSerialBridge(cfg_load=lambda: cfg,
                                    cfg_save=lambda c: saved.update(c))
+    b._bluez_info = lambda mac: {'known': True, 'connected': False, 'le': False}
     _drive(b, bleak, ticks=3)
     assert state['connects'] == 0
     assert b.master is None and saved == {}
+    assert 'has never seen' not in b.scan_note and 'not as LE' in b.scan_note
     assert not os.path.exists(os.path.join(run_dir, 'radar-ble'))
 
 
@@ -565,6 +567,7 @@ def test_an_unlearned_adapter_still_gets_no_tty_until_it_is_found(run_dir):
     cfg = {'radar': {'bluetooth_mac': 'AA:BB:CC:DD:EE:FF'}}
     bleak, state = _fake_bleak({}, [])
     b = ble_serial.BleSerialBridge(cfg_load=lambda: cfg, cfg_save=lambda c: None)
+    b._bluez_info = lambda mac: {'known': False, 'connected': False, 'le': False}
     _drive(b, bleak, ticks=3)
     assert b.master is None
     assert not os.path.lexists(os.path.join(run_dir, 'radar-ble'))
@@ -645,7 +648,7 @@ def test_the_bridge_removes_a_link_it_did_not_make(run_dir):
     cfg = {'radar': {'bluetooth_mac': 'AA:BB:CC:DD:EE:FF'}}
     bleak, state = _fake_bleak({}, [])
     b = ble_serial.BleSerialBridge(cfg_load=lambda: cfg, cfg_save=lambda c: None)
-    b._bluez_connected = lambda mac: False
+    b._bluez_info = lambda mac: {'known': False, 'connected': False, 'le': False}
     _drive(b, bleak, ticks=2)
     assert not os.path.lexists(link)             # gone before any scan
     # …but never its own
@@ -672,3 +675,100 @@ def test_the_loop_opens_the_link_only_on_the_bridges_word(run_dir, monkeypatch):
     os.unlink(link)
     os.symlink('/dev/pts/0', link)                    # swapped under it: no
     assert svc._ports({}) == []
+
+
+# ── what BlueZ knows decides a miss ──────────────────────────────────────────
+
+VELOBEAM_INFO = """Device 88:0A:98:19:08:16 (public)
+\tName: VELOBEAM_003
+\tAlias: VELOBEAM_003
+\tPaired: no
+\tBonded: no
+\tTrusted: no
+\tBlocked: no
+\tConnected: no
+\tLegacyPairing: no
+\tUUID: Unknown                   (0000ffe0-0000-1000-8000-00805f9b34fb)
+\tRSSI: -61
+\tAdvertisingFlags: 06
+"""
+
+
+def test_bluez_info_is_read_for_le_and_connection(monkeypatch):
+    class R:
+        def __init__(self, out): self.stdout, self.stderr, self.returncode = out, '', 0
+    outs = {'88:0A:98:19:08:16': VELOBEAM_INFO,
+            'AA:BB:CC:DD:EE:FF': 'Device AA:BB:CC:DD:EE:FF (public)\n\tName: BT578\n'
+                                 '\tPaired: yes\n\tConnected: no\n'
+                                 '\tUUID: Serial Port                (00001101-0000-1000-8000-00805f9b34fb)\n',
+            '00:00:00:00:00:01': 'Device 00:00:00:00:00:01 not available\n'}
+    monkeypatch.setattr(ble_serial.subprocess, 'run',
+                        lambda argv, **kw: R(outs.get(argv[2], '')))
+    assert ble_serial.BleSerialBridge._bluez_info('88:0A:98:19:08:16') \
+        == {'known': True, 'connected': False, 'le': True}
+    assert ble_serial.BleSerialBridge._bluez_info('AA:BB:CC:DD:EE:FF') \
+        == {'known': True, 'connected': False, 'le': False}
+    assert ble_serial.BleSerialBridge._bluez_info('00:00:00:00:00:01') \
+        == {'known': False, 'connected': False, 'le': False}
+    held = VELOBEAM_INFO.replace('Connected: no', 'Connected: yes')
+    outs['88:0A:98:19:08:16'] = held
+    assert ble_serial.BleSerialBridge._bluez_info('88:0A:98:19:08:16')['connected']
+
+
+def test_an_le_device_bluez_has_seen_is_connected_by_address_when_a_scan_misses_it(run_dir, monkeypatch):
+    """The scan can miss a slow advertiser; BlueZ having seen it as LE
+    is reason enough to connect by address. kind stays auto here."""
+    cfg = {'radar': {'bluetooth_mac': '88:0A:98:19:08:16'}}
+
+    class R:
+        stdout, stderr, returncode = VELOBEAM_INFO, '', 0
+    monkeypatch.setattr(ble_serial.subprocess, 'run', lambda argv, **kw: R())
+    bleak, state = _fake_bleak({}, [FRAME.encode('latin-1')])
+    b = ble_serial.BleSerialBridge(cfg_load=lambda: cfg, cfg_save=lambda c: None)
+    _drive(b, bleak, ticks=3)
+    assert state['connects'] >= 1
+    assert 'knows it as an LE device' in b.scan_note
+    assert b.health()['scan_note'] == b.scan_note
+
+
+def test_every_way_of_waiting_says_so(run_dir, caplog):
+    """A failed scan, a hung scan, a miss: each is one journal line and
+    the settings page's scan_note — never silence."""
+    import logging
+    caplog.set_level(logging.INFO, logger='bleserial')
+    cfg = {'radar': {'bluetooth_mac': 'AA:BB:CC:DD:EE:FF'}}
+
+    class Boom:
+        @staticmethod
+        async def discover(timeout=0, return_adv=False):
+            raise RuntimeError('org.bluez.Error.NotReady')
+
+    class Bleak:
+        BleakScanner = Boom
+        BleakClient = None
+    b = ble_serial.BleSerialBridge(cfg_load=lambda: cfg)
+    _drive(b, Bleak, ticks=3)
+    assert 'scan failed: RuntimeError: org.bluez.Error.NotReady' in caplog.text
+    assert 'NotReady' in b.health()['scan_error']
+    # the same failure three passes running is said once
+    assert caplog.text.count('org.bluez.Error.NotReady') == 1
+
+    class Hang:
+        @staticmethod
+        async def discover(timeout=0, return_adv=False):
+            await asyncio.Event().wait()            # never returns
+    Bleak.BleakScanner = Hang
+    real = asyncio.wait_for
+
+    async def fast_wait_for(coro, t):
+        try:
+            return await real(coro, 0.05)
+        finally:
+            pass
+    asyncio.wait_for = fast_wait_for
+    try:
+        b2 = ble_serial.BleSerialBridge(cfg_load=lambda: cfg)
+        _drive(b2, Bleak, ticks=2)
+    finally:
+        asyncio.wait_for = real
+    assert 'scan hung' in b2.scan_note and 'restart bluetooth' in b2.scan_note

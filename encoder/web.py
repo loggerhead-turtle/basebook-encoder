@@ -390,6 +390,10 @@ STATUS_PAGE = """<!doctype html><html><head>
     {% elif lead.get('connect_error') %}
       ⚫ BLE serial adapter {{ lead.get('mac') }}: found, but the link dropped —
       {{ lead.get('connect_error') }} (reconnecting)
+    {% elif lead.get('scan_note') %}
+      ⚫ BLE serial adapter {{ lead.get('mac') }}: {{ lead.get('scan_note') }}
+      {% if lead.get('scan_age_s') is not none %}({{ lead.get('scan_age_s')|int }}s ago){% endif %}
+      — the bridge keeps scanning; an address BlueZ knows as LE is connected directly
     {% else %}
       ⚫ BLE serial adapter {{ lead.get('mac') }}: not seen in a scan —
       is it powered (the gun's port feeds it)? A classic adapter is

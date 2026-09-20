@@ -39,6 +39,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import subprocess
 import threading
 import time
@@ -97,6 +98,10 @@ class BleSerialBridge:
         self.republished = 0                    # publish_link() writes
         self.rfcomm_released = False
         self._direct_logged = False
+        self._misses = 0
+        self.scan_note = ''
+        self.last_scan_t = None
+        self._last_note = None
 
     # ── the tty ──────────────────────────────────────────────────────────────
     def ensure_pty(self):
@@ -245,16 +250,67 @@ class BleSerialBridge:
         except Exception as e:
             log.warning(f'could not persist bluetooth_kind ({e})')
 
+    def _note(self, text):
+        """One line in the journal per CHANGE of what the bridge sees —
+        never per pass, never silence. The night of 19 Sep 2026 the
+        bridge had four ways to wait without a word (scan failed, scan
+        hung, MAC not seen, bluetoothctl timed out) and took one of
+        them for an hour while the log showed nothing but the radar
+        loop's USB warnings. The same text is also what the settings
+        page shows under the byte count."""
+        self.scan_note = text
+        self.last_scan_t = time.monotonic()
+        if text != self._last_note:
+            self._last_note = text
+            log.info(f'BLE serial: {text}')
+
+    async def _scan(self, bleak):
+        """One LE scan, bounded: bleak's discover() has been seen to
+        neither return nor raise, and a bridge parked in it for ever
+        looks exactly like one that found nothing. Returns the devices,
+        or None after saying why."""
+        try:
+            try:
+                return await asyncio.wait_for(
+                    bleak.BleakScanner.discover(timeout=SCAN_S,
+                                                return_adv=True),
+                    SCAN_S + 15)
+            except TypeError:
+                # older bleak: no return_adv — fall back to devices only
+                found = await asyncio.wait_for(
+                    bleak.BleakScanner.discover(timeout=SCAN_S), SCAN_S + 15)
+                return {d.address: (d, None) for d in found}
+        except asyncio.TimeoutError:
+            self.scan_error = (f'the Bluetooth scan hung for {SCAN_S + 15:.0f}s '
+                               '(bluetoothd stuck? — sudo systemctl restart '
+                               'bluetooth)')
+        except Exception as e:
+            self.scan_error = f'{e.__class__.__name__}: {e}' if str(e) \
+                else e.__class__.__name__
+        self._note(f'scan failed: {self.scan_error}')
+        return None
+
     @staticmethod
-    def _bluez_connected(mac):
-        """Does BlueZ hold this address connected right now? (bluetoothctl
-        info prints 'Connected: yes'.) Best effort; False on any doubt."""
+    def _bluez_info(mac):
+        """What BlueZ knows about this address, from `bluetoothctl info`:
+        whether it knows it at all, holds it connected right now, and
+        has seen it as an LE device (advertising flags, or a serial
+        service UUID — a classic adapter paired for rfcomm shows
+        neither). Best effort; all False on any doubt."""
+        out = ''
         try:
             r = subprocess.run(['bluetoothctl', 'info', mac],
                                capture_output=True, text=True, timeout=5)
-            return 'Connected: yes' in (r.stdout or '')
+            out = r.stdout or ''
         except Exception:
-            return False
+            pass
+        low = out.lower()
+        known = 'device ' in low and 'not available' not in low
+        le = known and ('advertisingflags' in low
+                        or looks_like_uart(re.findall(
+                            r'uuid:\s*.*?\(([0-9a-f-]{36})\)', low)))
+        return {'known': known, 'connected': 'connected: yes' in low,
+                'le': le}
 
     def clear_stale_link(self):
         """A link left by a previous run points at a pty that died with
@@ -342,28 +398,17 @@ class BleSerialBridge:
                 # the radio connects.
                 self.ensure_pty()
                 self.publish_link()
-            try:
-                devs = await bleak.BleakScanner.discover(
-                    timeout=SCAN_S, return_adv=True)
-            except TypeError:
-                # older bleak: no return_adv — fall back to devices only
-                try:
-                    found = await bleak.BleakScanner.discover(timeout=SCAN_S)
-                    devs = {d.address: (d, None) for d in found}
-                except Exception as e:
-                    self.scan_error = str(e)
-                    self.connected = False
-                    await asyncio.sleep(30)
-                    continue
-            except Exception as e:
-                self.scan_error = str(e)
+            devs = await self._scan(bleak)
+            if devs is None:                    # failed or hung: said below
                 self.connected = False
                 await asyncio.sleep(30)
                 continue
             self.scan_error = ''
             hit = None
+            seen = 0
             for addr, pair in (devs.items() if isinstance(devs, dict)
                                else ((d.address, (d, None)) for d in devs)):
+                seen += 1
                 if (addr or '').upper() == mac:
                     hit = pair
                     break
@@ -375,22 +420,30 @@ class BleSerialBridge:
                 # waited on that scan for an hour). BlueZ can connect to
                 # an address it knows without an advertisement, so a
                 # known-BLE adapter, or one BlueZ says is connected, is
-                # connected by address. Anything else absent from an LE
-                # scan is a classic adapter: the rfcomm binder's problem.
-                if kind == 'ble' or self.learned_kind \
-                        or self._bluez_connected(mac):
-                    if not self._direct_logged:
-                        self._direct_logged = True
-                        log.info(f'{mac} not advertising (held connected '
-                                 'by the adapter, or asleep) — connecting '
-                                 'by address')
+                # connected by address at once — and so is one BlueZ has
+                # seen as an LE device, since a scan can miss a slow
+                # advertiser. Only an address BlueZ has never seen as LE
+                # is left alone: that is a classic adapter, the binder's.
+                self._misses += 1
+                bz = self._bluez_info(mac)
+                self._note(f'scan saw {seen} device(s); {mac} not among '
+                           'them — BlueZ '
+                           + ('holds it connected' if bz['connected'] else
+                              'knows it as an LE device' if bz['le'] else
+                              'knows it (not as LE)' if bz['known'] else
+                              'has never seen it'))
+                if kind == 'ble' or self.learned_kind or bz['connected'] \
+                        or bz['le']:
+                    log.info(f'{mac} not advertising — connecting by '
+                             f'address (pass {self._misses})')
                     hit = (mac, None)
                 else:
                     self.connected = False
                     await asyncio.sleep(RESCAN_IDLE_S)
                     continue
             else:
-                self._direct_logged = False
+                self._misses = 0
+                self._note(f'scan saw {seen} device(s); {mac} among them')
             dev, adv = hit
             uuids = getattr(adv, 'service_uuids', None) if adv else None
             if kind == 'auto' and uuids is not None \
@@ -439,8 +492,8 @@ class BleSerialBridge:
                         await asyncio.sleep(1.0)
             except Exception as e:
                 self.connect_error = str(e) or e.__class__.__name__
-                log.warning(f'BLE serial lead dropped ({e}) — '
-                            'reconnecting')
+                log.warning(f'BLE serial lead dropped ({self.connect_error}) '
+                            '— reconnecting')
             self.connected = False
             await asyncio.sleep(RECONNECT_S)
 
@@ -470,6 +523,9 @@ class BleSerialBridge:
             'connected': bool(self.connected),
             'link': LINK if self.master is not None else None,
             'link_ok': self.link_ok(),
+            'scan_note': self.scan_note,
+            'scan_age_s': (round(time.monotonic() - self.last_scan_t, 1)
+                           if self.last_scan_t is not None else None),
             'chars': list(self.chars),
             'notifies': self.notifies,
             'bytes': self.bytes_in,

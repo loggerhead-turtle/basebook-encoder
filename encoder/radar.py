@@ -53,6 +53,20 @@ POST_PATH = '/api/encoder/radar'
 # Where the BLE serial bridge publishes its tty (encoder/ble_serial.py).
 # Named here rather than imported so this module keeps knowing nothing
 # about Bluetooth beyond "that path is a lead too".
+_warned_at = {}
+
+
+def _warn_slow(key, msg, every=600):
+    """A warning that would otherwise repeat every scan pass (5 s) is
+    said once, then at most every ten minutes: three of them per pass
+    about an unplugged cable buried the one line that mattered on
+    19 Sep 2026."""
+    now = time.monotonic()
+    if now - _warned_at.get(key, -every) >= every:
+        _warned_at[key] = now
+        log.warning(msg)
+
+
 BLE_LINK = os.path.join(os.environ.get('PLAYCALL_ENCODER_RUN',
                                        '/run/playcall-encoder'), 'radar-ble')
 LIVE_MIN_INTERVAL = 0.35      # throttle live pushes
@@ -316,9 +330,10 @@ def find_ports(cfg=None):
         ports = ports + [BLE_LINK]
     if want:
         if not os.path.exists(want):
-            log.warning('pinned radar port %s is not there — using whatever '
-                        'else is plugged in (plug it back in, or clear '
-                        'radar.port)', want)
+            _warn_slow(('pin', want),
+                       f'pinned radar port {want} is not there — using '
+                       'whatever else is plugged in (plug it back in, or '
+                       'clear radar.port)')
         return [want] + [p for p in ports if p != want]
     return ports
 
@@ -879,8 +894,9 @@ class RadarService:
             # Same rule for the board: a pinned port that has gone away
             # must not send every frame into a path that cannot open.
             if disp_pin and not os.path.exists(disp_pin):
-                log.warning('pinned display port %s is not there — falling '
-                            'back to the other adapter', disp_pin)
+                _warn_slow(('disp', disp_pin),
+                           f'pinned display port {disp_pin} is not there — '
+                           'falling back to the other adapter')
                 disp_pin = None
             # The GUN's rate (radar.baud) and the BOARD's rate
             # (radar.display_baud) are independent: a Stalker set to LO
@@ -906,7 +922,8 @@ class RadarService:
                         handles[p] = serial.Serial(p, gun_baud, timeout=0)
                         bufs[p] = b''
                     except Exception as e:
-                        log.warning(f'radar port {p} failed to open ({e})')
+                        _warn_slow(('open', p),
+                                   f'radar port {p} failed to open ({e})')
                 if not handles:
                     self.connected = False
                     time.sleep(5)
