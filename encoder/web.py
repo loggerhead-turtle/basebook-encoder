@@ -378,7 +378,10 @@ STATUS_PAGE = """<!doctype html><html><head>
       🟢 BLE serial adapter connected: {{ lead.get('name') or lead.get('mac') }}
       — {{ lead.get('bytes') }} bytes received
       {% if lead.get('heard_s') is not none %}, last {{ lead.get('heard_s')|int }}s ago{% endif %}
-      → {{ lead.get('link') }}
+      {% if lead.get('link_ok') %}→ {{ lead.get('link') }}{% else %}
+      — ⚠ but {{ lead.get('link') }} is missing, so the radar service cannot
+      open it; the bridge republishes it every second — if this stays, the
+      journal says what removes it{% endif %}
     {% elif lead.get('bleak') is false %}
       ⚫ BLE serial adapter: Bluetooth LE support is not installed —
       <code>sudo apt install -y python3-bleak</code>, then restart the encoder

@@ -39,6 +39,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import subprocess
 import threading
 import time
 import tty
@@ -92,6 +93,8 @@ class BleSerialBridge:
         self.scan_error = ''
         self.connect_error = ''
         self.learned_kind = False
+        self.republished = 0                    # publish_link() writes
+        self.rfcomm_released = False
 
     # ── the tty ──────────────────────────────────────────────────────────────
     def ensure_pty(self):
@@ -116,6 +119,30 @@ class BleSerialBridge:
         self.master = master
         self.slave_path = os.ttyname(slave)
         os.close(slave)     # radar.py opens the slave by path itself
+        self.publish_link()
+        return self.slave_path
+
+    def publish_link(self):
+        """Point LINK at the slave — and keep it pointed there. Called
+        once from ensure_pty and again every second while the radio is
+        up, because the link is a file in /run/playcall-encoder and
+        that directory is not ours alone: sibling units declare it as
+        their RuntimeDirectory, and a unit whose file lacks
+        RuntimeDirectoryPreserve wipes the directory every time it
+        stops (19 Sep 2026: the bridge said 'connected, 101 700 bytes
+        received → radar-ble' while radar.py's scan never listed the
+        link at all — it had been published once and deleted since).
+        Republishing is a lstat per second; a missing link is the whole
+        BLE lead gone, so it is cheap at the price. Returns True when
+        the link resolves to our slave."""
+        if self.slave_path is None:
+            return False
+        try:
+            if os.path.islink(LINK) and os.readlink(LINK) == self.slave_path \
+                    and os.path.exists(LINK):
+                return True
+        except OSError:
+            pass
         try:
             os.makedirs(RUN_DIR, exist_ok=True)
             tmp = LINK + '.tmp'
@@ -123,11 +150,26 @@ class BleSerialBridge:
                 os.unlink(tmp)
             os.symlink(self.slave_path, tmp)
             os.replace(tmp, LINK)              # atomic: never a dangling link
-            log.info(f'BLE serial lead is {LINK} -> {self.slave_path}')
+            self.republished += 1
+            log.info(f'BLE serial lead is {LINK} -> {self.slave_path}'
+                     + (' (republished — something removed it)'
+                        if self.republished > 1 else ''))
+            return True
         except OSError as e:
             log.warning(f'could not publish {LINK} ({e}) — radar.py will '
                         f'not see the BLE lead; slave is {self.slave_path}')
-        return self.slave_path
+            return False
+
+    def link_ok(self):
+        """Does LINK currently resolve to our slave? What the settings
+        page shows next to the byte count — 'connected' means the radio;
+        this means radar.py can find the tty."""
+        try:
+            return bool(self.slave_path) and os.path.islink(LINK) \
+                and os.readlink(LINK) == self.slave_path \
+                and os.path.exists(LINK)
+        except OSError:
+            return False
 
     def feed(self, data):
         """Bytes off the air → the tty. Never blocks the BLE loop: a tty
@@ -182,6 +224,37 @@ class BleSerialBridge:
                         'stands down from now on')
         except Exception as e:
             log.warning(f'could not persist bluetooth_kind ({e})')
+
+    def _release_rfcomm(self, mac):
+        """A binding the rfcomm binder made for this MAC before anyone
+        knew it was BLE is a trap: /dev/rfcomm0 exists, so radar.py
+        opens it, the open blocks while the kernel tries an RFCOMM
+        connect that a BLE-only adapter can never answer, the read then
+        fails EIO, and the whole radar loop spends its life reopening a
+        dead node (19 Sep 2026, every 8 s, all evening). The binder
+        stands down on the NEXT boot once bluetooth_kind=ble is written;
+        this clears the binding it already made on THIS one. Only a
+        binding that names our MAC is touched. Best effort, once."""
+        if self.rfcomm_released:
+            return
+        self.rfcomm_released = True
+        dev = '/dev/rfcomm0'
+        if not os.path.exists(dev):
+            return
+        try:
+            show = subprocess.run(['rfcomm', 'show', dev], capture_output=True,
+                                  text=True, timeout=5)
+            if mac.upper() not in (show.stdout or '').upper():
+                return
+            r = subprocess.run(['rfcomm', 'release', dev], capture_output=True,
+                               text=True, timeout=5)
+            if r.returncode == 0:
+                log.warning(f'released the stale rfcomm binding on {dev} — '
+                            f'{mac} is BLE, radar.py reads it from {LINK}')
+            else:
+                log.warning(f'could not release {dev} ({(r.stderr or "").strip()})')
+        except Exception as e:
+            log.debug(f'rfcomm release skipped: {e}')
 
     # ── the BLE loop ─────────────────────────────────────────────────────────
     async def _run(self, bleak):
@@ -259,9 +332,11 @@ class BleSerialBridge:
                     log.info(f'BLE serial lead up: {len(subs)} '
                              f'characteristic(s) → {LINK}')
                     self._persist_kind()
+                    self._release_rfcomm(mac)
                     while self.running and client.is_connected:
                         if self._want(self.cfg_load())[0] != mac:
                             break               # setting changed
+                        self.publish_link()     # see publish_link()
                         await asyncio.sleep(1.0)
             except Exception as e:
                 self.connect_error = str(e) or e.__class__.__name__
@@ -295,6 +370,7 @@ class BleSerialBridge:
             'name': self.device_name,
             'connected': bool(self.connected),
             'link': LINK if self.master is not None else None,
+            'link_ok': self.link_ok(),
             'chars': list(self.chars),
             'notifies': self.notifies,
             'bytes': self.bytes_in,

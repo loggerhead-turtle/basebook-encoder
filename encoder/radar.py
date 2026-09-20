@@ -296,10 +296,18 @@ def find_ports(cfg=None):
     serial adapter is found the same way a cabled one is: an rfcomm
     binding is an ordinary tty, it just lives nowhere near
     /dev/serial/by-id."""
-    want = ((cfg or {}).get('radar') or {}).get('port') or ''
+    rad = (cfg or {}).get('radar') or {}
+    want = rad.get('port') or ''
     byid = sorted(glob.glob('/dev/serial/by-id/*'))
     ports = byid if byid else sorted(glob.glob('/dev/ttyUSB*'))
-    ports = ports + sorted(glob.glob('/dev/rfcomm*'))
+    # …unless the adapter has been proven BLE: then any /dev/rfcomm*
+    # is a binding the rfcomm binder made before it knew, and opening
+    # it blocks on an RFCOMM connect the adapter can never answer, then
+    # reads EIO — the loop spent an evening reopening that node every
+    # 8 s while the real lead sat unread (19 Sep 2026). The bridge also
+    # releases the binding; leaving the node out is the sure half.
+    if (rad.get('bluetooth_kind') or 'auto').lower() != 'ble':
+        ports = ports + sorted(glob.glob('/dev/rfcomm*'))
     # …and the BLE serial lead, a pty the bridge publishes at a fixed
     # path (encoder/ble_serial.py). Same idea as rfcomm: a tty that
     # lives nowhere near /dev/serial/by-id, joined to the scan so the

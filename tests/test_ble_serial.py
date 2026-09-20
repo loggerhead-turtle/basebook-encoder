@@ -354,3 +354,120 @@ def test_the_tty_is_raw_from_birth(run_dir):
     # a control byte and a bare carriage return come through intact
     b.feed(b'\x03\r\x88')
     assert _read_slave(slave, 3) == b'\x03\r\x88'
+
+
+# ── the link must survive whatever else lives in /run/playcall-encoder ────────
+# 19 Sep 2026: the bridge reported connected with 101 700 bytes received
+# and radar.py's scan listed the stale pin and /dev/rfcomm0 — never the
+# link. It had been published once at connect and removed since (sibling
+# units own that directory as their RuntimeDirectory). The bridge now
+# republishes every second and the page says when the link is gone.
+
+def test_a_removed_link_is_republished(run_dir):
+    b = ble_serial.BleSerialBridge(cfg_load=lambda: {})
+    slave = b.ensure_pty()
+    link = os.path.join(run_dir, 'radar-ble')
+    assert b.link_ok() and b.health()['link_ok']
+    os.unlink(link)                       # what a RuntimeDirectory wipe does
+    assert not b.link_ok() and not b.health()['link_ok']
+    assert not os.path.exists(radar.BLE_LINK)
+    assert b.publish_link() is True
+    assert os.readlink(link) == slave and b.link_ok()
+    assert radar.find_ports({}) == [radar.BLE_LINK]
+    assert b.republished == 2
+    # …and the whole directory going is the same story
+    os.unlink(link)
+    os.rmdir(run_dir)
+    assert b.publish_link() is True and b.link_ok()
+
+
+def test_the_link_is_republished_while_the_radio_is_up(run_dir):
+    """The connected wait loop republishes every tick: a link removed
+    while the adapter is up is back before the next radar rescan."""
+    cfg = {'radar': {'bluetooth_mac': '88:0A:98:19:08:16'}}
+    dev = _Dev('88:0A:98:19:08:16', 'VELOBEAM_003')
+    bleak, state = _fake_bleak({'88:0A:98:19:08:16': (dev, _Adv(
+        ['0000ffe0-0000-1000-8000-00805f9b34fb']))}, [b'x\r'])
+
+    async def stay_up(self, ch, cb):        # the fake drops at once; don't
+        state['subscribed'].append(str(ch.uuid))
+        cb(None, b'x\r')
+    bleak.BleakClient.start_notify = stay_up
+    b = ble_serial.BleSerialBridge(cfg_load=lambda: cfg, cfg_save=lambda c: None)
+    link = os.path.join(run_dir, 'radar-ble')
+    real_publish = b.publish_link
+    hits = {'n': 0}
+
+    def wipe_then_publish():
+        hits['n'] += 1
+        if hits['n'] == 2:                   # 1 is ensure_pty's own publish
+            os.unlink(link)                  # from under the connected loop
+            assert not os.path.lexists(link)
+        return real_publish()
+    b.publish_link = wipe_then_publish
+    _drive(b, bleak, ticks=4)
+    assert state['connects'] == 1 and hits['n'] >= 3
+    assert os.path.islink(link) and os.readlink(link) == b.slave_path
+    assert b.republished == 2
+
+
+def test_a_stale_rfcomm_binding_for_our_mac_is_released(monkeypatch, tmp_path):
+    calls = []
+    dev = tmp_path / 'rfcomm0'
+    dev.write_text('')
+    monkeypatch.setattr(ble_serial.os.path, 'exists',
+                        lambda p: p == '/dev/rfcomm0' or os.path.lexists(p))
+
+    class R:
+        def __init__(self, out='', rc=0):
+            self.stdout, self.stderr, self.returncode = out, '', rc
+
+    def run(argv, **kw):
+        calls.append(argv)
+        if argv[:2] == ['rfcomm', 'show']:
+            return R('rfcomm0: 88:0A:98:19:08:16 channel 1 clean\n')
+        return R()
+    monkeypatch.setattr(ble_serial.subprocess, 'run', run)
+    b = ble_serial.BleSerialBridge(cfg_load=lambda: {})
+    b._release_rfcomm('88:0a:98:19:08:16')
+    assert ['rfcomm', 'release', '/dev/rfcomm0'] in calls
+    # once per run — not every reconnect
+    b._release_rfcomm('88:0a:98:19:08:16')
+    assert sum(1 for c in calls if c[1] == 'release') == 1
+
+
+def test_an_rfcomm_binding_for_another_device_is_left_alone(monkeypatch):
+    calls = []
+    monkeypatch.setattr(ble_serial.os.path, 'exists',
+                        lambda p: p == '/dev/rfcomm0' or os.path.lexists(p))
+
+    class R:
+        stdout = 'rfcomm0: 00:11:22:33:44:55 channel 1 clean\n'
+        stderr = ''
+        returncode = 0
+    monkeypatch.setattr(ble_serial.subprocess, 'run',
+                        lambda argv, **kw: calls.append(argv) or R())
+    b = ble_serial.BleSerialBridge(cfg_load=lambda: {})
+    b._release_rfcomm('88:0A:98:19:08:16')
+    assert calls == [['rfcomm', 'show', '/dev/rfcomm0']]
+
+
+def test_no_rfcomm_node_means_nothing_to_release(monkeypatch):
+    monkeypatch.setattr(ble_serial.subprocess, 'run',
+                        lambda *a, **k: pytest.fail('rfcomm must not run'))
+    monkeypatch.setattr(ble_serial.os.path, 'exists', lambda p: False)
+    ble_serial.BleSerialBridge(cfg_load=lambda: {})._release_rfcomm('88:0A:98:19:08:16')
+
+
+def test_the_scan_leaves_rfcomm_out_once_the_adapter_is_known_ble(run_dir, monkeypatch):
+    b = ble_serial.BleSerialBridge(cfg_load=lambda: {})
+    b.ensure_pty()
+    monkeypatch.setattr(radar.glob, 'glob',
+                        lambda pat: ['/dev/rfcomm0'] if 'rfcomm' in pat else [])
+    # auto / spp: the node is a candidate, as before
+    assert radar.find_ports({}) == ['/dev/rfcomm0', radar.BLE_LINK]
+    assert radar.find_ports({'radar': {'bluetooth_kind': 'spp'}}) \
+        == ['/dev/rfcomm0', radar.BLE_LINK]
+    # ble: the node is the binder's leftover — only the lead is listed
+    assert radar.find_ports({'radar': {'bluetooth_kind': 'ble'}}) \
+        == [radar.BLE_LINK]

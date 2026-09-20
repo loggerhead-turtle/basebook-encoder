@@ -241,6 +241,20 @@ The one in the field advertises as `VELOBEAM_003`.
   connection writes `bluetooth_kind: ble` so the rfcomm binder stands
   down on every boot after. A classic adapter never appears in a BLE
   scan and is left to the binder as before.
+* **Bytes climbing, radar still "no serial adapter open"?** Two things
+  bit on the first field night. A binding the rfcomm binder made for
+  the MAC before anyone knew it was BLE leaves `/dev/rfcomm0` behind,
+  and opening that blocks on a connect the adapter cannot answer, then
+  reads EIO — the radar loop reopened it every 8 s all evening. The
+  bridge now releases a binding that names its MAC, and the scan leaves
+  `/dev/rfcomm*` out once `bluetooth_kind` is `ble`. And the link
+  itself lives in `/run/playcall-encoder`, a directory sibling units
+  own as their RuntimeDirectory: a unit file without
+  `RuntimeDirectoryPreserve=yes` wipes it when that unit stops. The
+  bridge republishes the link every second while the radio is up, and
+  the settings page says "link is missing" rather than showing a path
+  that is not there. If it does say that, the journal names the culprit:
+  `journalctl -u playcall-encoder | grep republished`.
 * **The slide switch is a TX/RX crossover.** If the bridge is up
   (bytes received climbing on the settings page) and the gun is silent,
   flip it and pull the trigger again. First thing to try.
