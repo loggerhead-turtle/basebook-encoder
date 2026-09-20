@@ -596,29 +596,69 @@ def test_clearing_the_mac_takes_the_tty_down(run_dir):
 # connection outlived it at the daemon, the adapter stopped advertising,
 # and the bridge waited on a scan hit for an hour.
 
-def test_an_adapter_bluez_holds_connected_is_connected_by_address(run_dir, monkeypatch):
-    cfg = {'radar': {'bluetooth_mac': '88:0A:98:19:08:16'}}   # kind: auto
-    asked = []
+def test_an_adapter_bluez_holds_connected_is_let_go_then_found(run_dir, monkeypatch):
+    """LED solid blue, nobody reading: BlueZ holds the adapter from a
+    previous run, it does not advertise, and bleak cannot resolve its
+    address ('was not found'). The bridge tells BlueZ to drop it; the
+    adapter advertises again and the next scan finds it."""
+    cfg = {'radar': {'bluetooth_mac': '88:0A:98:19:08:16'}}
+    calls = []
+    held = {'yes': True}
 
     class R:
-        stdout = 'Device 88:0A:98:19:08:16 (public)\n\tConnected: yes\n'
-        stderr = ''
-        returncode = 0
-    monkeypatch.setattr(ble_serial.subprocess, 'run',
-                        lambda argv, **kw: asked.append(argv) or R())
-    bleak, state = _fake_bleak({}, [FRAME.encode('latin-1')])   # scan: nothing
-    seen = []
-    orig_init = bleak.BleakClient.__init__
+        def __init__(self, out): self.stdout, self.stderr, self.returncode = out, '', 0
 
-    def init(self, dev):
-        seen.append(dev)
-        orig_init(self, dev)
-    bleak.BleakClient.__init__ = init
+    def run(argv, **kw):
+        calls.append(argv[:2])
+        if argv[1] == 'info':
+            return R(VELOBEAM_INFO.replace('Connected: no', 'Connected: yes')
+                     if held['yes'] else VELOBEAM_INFO)
+        if argv[1] == 'disconnect':
+            held['yes'] = False
+            return R('Attempting to disconnect from 88:0A:98:19:08:16\nSuccessful disconnected\n')
+        return R('')
+    monkeypatch.setattr(ble_serial.subprocess, 'run', run)
+    dev = _Dev('88:0A:98:19:08:16', 'VELOBEAM_003')
+    devs = {}
+    bleak, state = _fake_bleak(devs, [FRAME.encode('latin-1')])
+    orig = bleak.BleakScanner.discover
+
+    async def discover(timeout=0, return_adv=False):
+        if not held['yes']:                     # advertising again
+            devs['88:0A:98:19:08:16'] = (dev, _Adv(
+                ['0000ffe0-0000-1000-8000-00805f9b34fb']))
+        return devs
+    bleak.BleakScanner.discover = discover
     b = ble_serial.BleSerialBridge(cfg_load=lambda: cfg, cfg_save=lambda c: None)
-    _drive(b, bleak, ticks=3)
-    assert asked and asked[0][:2] == ['bluetoothctl', 'info']
-    assert state['connects'] >= 1 and seen[0] == '88:0A:98:19:08:16'
+    _drive(b, bleak, ticks=4)
+    assert ['bluetoothctl', 'disconnect'] in calls
+    assert state['connects'] >= 1
     assert _read_slave(b.slave_path, len(FRAME)) == FRAME.encode('latin-1')
+    # disconnect is asked once a minute at most
+    b2 = ble_serial.BleSerialBridge(cfg_load=lambda: cfg)
+    t = {'now': 500.0}
+    monkeypatch.setattr(ble_serial.time, 'monotonic', lambda: t['now'])
+    calls.clear()
+    assert b2._bluez_disconnect('88:0A:98:19:08:16') is True
+    assert b2._bluez_disconnect('88:0A:98:19:08:16') is False
+    t['now'] += 61
+    assert b2._bluez_disconnect('88:0A:98:19:08:16') is True
+    assert calls.count(['bluetoothctl', 'disconnect']) == 2
+
+
+def test_release_on_shutdown_hands_the_adapter_back(monkeypatch):
+    calls = []
+
+    class R:
+        stdout, stderr, returncode = 'Successful disconnected\n', '', 0
+    monkeypatch.setattr(ble_serial.subprocess, 'run',
+                        lambda argv, **kw: calls.append(argv) or R())
+    b = ble_serial.BleSerialBridge(cfg_load=lambda: {})
+    b.release()                                   # not connected: nothing
+    assert calls == []
+    b.mac, b.connected = '88:0A:98:19:08:16', True
+    b.release()
+    assert calls == [['bluetoothctl', 'disconnect', '88:0A:98:19:08:16']]
 
 
 def test_a_classic_adapter_absent_from_the_scan_is_still_the_binders(run_dir, monkeypatch):

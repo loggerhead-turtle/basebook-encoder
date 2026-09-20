@@ -157,6 +157,12 @@ def main():
 
     def stop(*a):
         link.running = False
+        # hand a BLE gun adapter back to BlueZ, or the next run finds it
+        # held connected and unreachable (encoder/ble_serial.py)
+        try:
+            _bridge.release()
+        except Exception:
+            pass
         sys.exit(0)
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)

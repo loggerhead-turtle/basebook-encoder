@@ -99,6 +99,7 @@ class BleSerialBridge:
         self.rfcomm_released = False
         self._direct_logged = False
         self._misses = 0
+        self._disconnect_next_t = 0.0
         self.scan_note = ''
         self.last_scan_t = None
         self._last_note = None
@@ -312,6 +313,46 @@ class BleSerialBridge:
         return {'known': known, 'connected': 'connected: yes' in low,
                 'le': le}
 
+    def _bluez_disconnect(self, mac):
+        """Ask BlueZ to drop its connection to the adapter. Once a
+        minute at most: if it will not let go, saying so every pass
+        helps nobody. True when the command ran and succeeded."""
+        now = time.monotonic()
+        if now < self._disconnect_next_t:
+            return False
+        self._disconnect_next_t = now + 60
+        try:
+            r = subprocess.run(['bluetoothctl', 'disconnect', mac],
+                               capture_output=True, text=True, timeout=15)
+            ok = r.returncode == 0 and 'Successful' in (r.stdout or '')
+            if ok:
+                log.warning(f'BlueZ was holding {mac} connected from a '
+                            'previous run — disconnected it so it '
+                            'advertises again')
+            else:
+                log.warning(f'bluetoothctl disconnect {mac} did not: '
+                            f'{(r.stdout or r.stderr or "").strip()[-160:]}')
+            return ok
+        except Exception as e:
+            log.warning(f'bluetoothctl disconnect {mac} failed ({e})')
+            return False
+
+    def release(self):
+        """On shutdown, hand the adapter back. bleak disconnects on a
+        clean exit, but the encoder is stopped with SIGTERM while this
+        loop runs in a daemon thread, and a connection nobody closed is
+        BlueZ's to keep — which is exactly the held-connected state the
+        next run then has to break. Synchronous and quick: called from
+        the signal handler on the way out."""
+        if not (self.connected and self.mac):
+            return
+        try:
+            subprocess.run(['bluetoothctl', 'disconnect', self.mac],
+                           capture_output=True, text=True, timeout=5)
+            log.info(f'released {self.mac} on shutdown')
+        except Exception:
+            pass
+
     def clear_stale_link(self):
         """A link left by a previous run points at a pty that died with
         it — or worse, at a pty number the kernel has since handed to
@@ -432,8 +473,19 @@ class BleSerialBridge:
                               'knows it as an LE device' if bz['le'] else
                               'knows it (not as LE)' if bz['known'] else
                               'has never seen it'))
-                if kind == 'ble' or self.learned_kind or bz['connected'] \
-                        or bz['le']:
+                if bz['connected']:
+                    # Held by BlueZ from a previous run of this process:
+                    # the LED solid blue, nobody reading, and nothing
+                    # can connect to it — bleak resolves an address
+                    # through a scan, and a connected device does not
+                    # advertise ('Device with address … was not found',
+                    # every pass, 19 Sep 2026 20:35). Make BlueZ let
+                    # go; the adapter advertises again within a second
+                    # or two and the next scan finds it the normal way.
+                    if self._bluez_disconnect(mac):
+                        await asyncio.sleep(2)
+                        continue
+                if kind == 'ble' or self.learned_kind or bz['le']:
                     log.info(f'{mac} not advertising — connecting by '
                              f'address (pass {self._misses})')
                     hit = (mac, None)

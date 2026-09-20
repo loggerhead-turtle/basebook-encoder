@@ -287,6 +287,18 @@ The one in the field advertises as `VELOBEAM_003`.
   knows only as classic, or not at all, is the binder's. And the radar
   loop's warnings about an unplugged USB pin are said once, then at
   most every ten minutes, instead of three lines every five seconds.
+* **"BlueZ holds it connected" + "was not found", every pass.** The
+  encoder is stopped with SIGTERM (every update restarts it), the BLE
+  loop runs in a daemon thread and never says goodbye, and a connection
+  nobody closed is bluetoothd's to keep: LED solid blue, nobody
+  reading, and no client can reach it, because bleak resolves an
+  address through a scan and a connected device does not advertise.
+  The bridge now asks BlueZ to drop such a connection (once a minute
+  at most), the adapter advertises again within a couple of seconds,
+  and the next scan finds it the normal way. And on its own shutdown
+  the encoder hands the adapter back, so the next run does not start
+  in that state. By hand, the same thing is
+  `bluetoothctl disconnect <MAC>`.
 * **The slide switch is a TX/RX crossover.** If the bridge is up
   (bytes received climbing on the settings page) and the gun is silent,
   flip it and pull the trigger again. First thing to try.
