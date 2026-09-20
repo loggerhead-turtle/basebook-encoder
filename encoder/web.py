@@ -438,6 +438,38 @@ STATUS_PAGE = """<!doctype html><html><head>
     </label>
     <button class="btn" type="submit">Save radar settings</button>
   </form>
+  <form method="post" action="/radar/find" style="margin-top:.5rem"
+        onsubmit="this.querySelector('button').disabled=true;this.querySelector('button').textContent='Scanning… about 10 s';">
+    <button class="btn" type="submit">🔎 Find my adapter</button>
+    <span class="hint">gun on, adapter light blinking, within a few metres —
+      the box lists what it hears and one tap sets it up</span>
+  </form>
+  {% if found is not none %}
+  <div class="card" style="margin:.5rem 0" id="found">
+    {% if found.get('error') %}
+      <p class="hint">🔴 could not scan — {{ found.get('error') }}</p>
+    {% elif not found.get('found') %}
+      <p class="hint">⚫ nothing that looks like a serial adapter is in range.
+        Is the gun on and the adapter's light blinking (not solid — solid means
+        something else is already connected to it)? Try again a little closer.</p>
+    {% else %}
+      <p class="hint">Heard {{ found.get('found')|length }} — the likely adapters first:</p>
+      {% for c in found.get('found') %}
+      <form method="post" action="/radar/use" style="display:flex;gap:.5rem;align-items:center;margin:.25rem 0">
+        <input type="hidden" name="mac" value="{{ c.mac }}">
+        <input type="hidden" name="kind" value="{{ c.kind }}">
+        <input type="hidden" name="name" value="{{ c.name }}">
+        <button class="btn" type="submit">Use</button>
+        <span>{{ '⭐ ' if c.likely }}<b>{{ c.name or '(no name)' }}</b>
+          <span class="hint">{{ c.mac }}
+            · {{ {'ble': 'Bluetooth LE', 'spp': 'classic Bluetooth', 'auto': 'kind unknown — the box will find out'}[c.kind] }}
+            {% if c.serial %}· serial service ✓{% endif %}
+            {% if c.rssi is not none %}· {{ c.rssi }} dBm{% endif %}</span></span>
+      </form>
+      {% endfor %}
+    {% endif %}
+  </div>
+  {% endif %}
   <form method="post" action="/radar/forget" style="margin-top:.5rem"
         onsubmit="return confirm('Forget the learned cable roles? The box re-learns them from the next real velocity.')">
     <button class="btn" type="submit">Forget learned cables</button>
@@ -831,6 +863,7 @@ def create_app(cloud=None):
                    if callable(getattr(cloud, 'radar_health', None))
                    else None),
             radar_cfg=(cfg.get('radar') or {}),
+            found=_recent_scan(),
             comms=comms_status(),
             comms_tok=comms_token(cfg),
             cloud_base=(cfg.get('cloud') or {}).get('base_url', ''),
@@ -1038,6 +1071,61 @@ def create_app(cloud=None):
         log.info('radar settings saved from the settings page')
         return redirect(url_for('index', msg=(
             'Radar settings saved — radar restarting, back in ~10 s')))
+
+    # ── Find my adapter ─────────────────────────────────────────────────
+    # The last scan's result, shown on the settings page until it is ten
+    # minutes old or an adapter has been chosen. Process memory on
+    # purpose: a scan is a moment, not a setting.
+    app._adapter_scan = None
+
+    def _recent_scan():
+        sc = app._adapter_scan
+        if sc and time.monotonic() - sc['at'] < 600:
+            return sc
+        return None
+
+    @app.route('/radar/find', methods=['POST'])
+    def radar_find():
+        """Scan for the gun's Bluetooth serial adapter and list what was
+        heard, likely adapters first — so nobody has to type a MAC.
+        Blocks for the scan (~10 s); the button says so."""
+        from . import bt_scan
+        res = bt_scan.scan()
+        res['at'] = time.monotonic()
+        app._adapter_scan = res
+        if res.get('error'):
+            log.warning(f"adapter scan failed: {res['error']}")
+        return redirect(url_for('index') + '#found')
+
+    @app.route('/radar/use', methods=['POST'])
+    def radar_use():
+        """One tap on a scan result: write the adapter's address and
+        kind, and start reading it. A BLE adapter is the bridge's from
+        the next pass; a classic one needs the rfcomm binder run now."""
+        mac = (request.form.get('mac') or '').strip().upper()
+        kind = (request.form.get('kind') or 'auto').strip().lower()
+        name = (request.form.get('name') or '').strip()[:40]
+        if not _MAC_RE.match(mac):
+            return redirect(url_for('index', err='That is not a Bluetooth MAC'))
+        if kind not in ('auto', 'spp', 'ble'):
+            kind = 'auto'
+        cfg = config.load()
+        rd = dict(cfg.get('radar') or {})
+        old_mac = (rd.get('bluetooth_mac') or '').upper()
+        rd['bluetooth_mac'] = mac
+        rd['bluetooth_kind'] = kind
+        cfg['radar'] = rd
+        config.save(cfg)
+        app._adapter_scan = None
+        if kind != 'ble' or mac != old_mac:
+            system.systemctl('restart', 'playcall-encoder-radarbt')
+        _restart_self_soon()
+        log.info(f'adapter chosen from the settings page: {name or "?"} '
+                 f'[{mac}] kind={kind}')
+        return redirect(url_for('index', msg=(
+            f'Using {name or mac} for the gun — radar restarting, back in '
+            '~10 s. Pull the trigger once it is: the radar line above '
+            'should say the gun was heard.')))
 
     @app.route('/radar/forget', methods=['POST'])
     def radar_forget():

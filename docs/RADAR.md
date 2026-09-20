@@ -218,6 +218,38 @@ male and female serial heads and Type-C for power.
   the next trigger pull, the module's power saving is dozing — keep it
   on Type-C power at the gun end.
 
+### Setting up a new Bluetooth adapter — the two-minute version
+
+1. Plug the adapter into the gun's serial port, turn the gun on, and
+   wait for the adapter's light to **blink** (blinking = advertising,
+   nobody connected; solid = something is already connected to it —
+   a phone with a terminal app, say — and the box will not see it).
+2. On the box's settings page, radar card, press **🔎 Find my
+   adapter**. The box scans for about ten seconds and lists what it
+   heard by name, the likely adapters starred and on top, each with
+   what kind it is (Bluetooth LE for an IRXON/HM-10, classic for a
+   BT578).
+3. Tap **Use** next to yours. The address and the kind are written,
+   the radar restarts, and within ten seconds the radar line reads
+   "listening … (over Bluetooth)". Pull the trigger: "gun heard 0s
+   ago".
+
+That is all of it. Nobody types a MAC. The scan is `bluetoothctl`
+rather than the bridge's own scanner, so it sees classic adapters too
+and cannot collide with the bridge (BlueZ allows one discovery per
+client; a subprocess is its own client).
+
+Two things the button cannot do, because they are settings **on the
+adapter**, not on the box:
+
+* **The UART rate must match the gun's.** The box shows "bytes
+  received" climbing and "gun not heard" when it does not: perfect
+  delivery of garbage. The adapter's leaflet says what its default is
+  (commonly 9600) and how to change it; the gun and the adapter must
+  agree, and `radar.baud` here only matters for a cable.
+* **The slide switch** on an IRXON is a TX/RX crossover. Bytes flowing
+  and the gun never heard, with the rate right, means flip it.
+
 ### The IRXON RS-232 adapter — and any BLE serial brick
 
 The second brick this has been used with: an IRXON RS-232↔Bluetooth
