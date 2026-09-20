@@ -471,3 +471,116 @@ def test_the_scan_leaves_rfcomm_out_once_the_adapter_is_known_ble(run_dir, monke
     # ble: the node is the binder's leftover — only the lead is listed
     assert radar.find_ports({'radar': {'bluetooth_kind': 'ble'}}) \
         == [radar.BLE_LINK]
+
+
+# ── the learned kind must not be lost to the settings form ───────────────────
+# 19 Sep 2026: learned 'ble' at 19:26, the settings page (rendered before
+# that) was saved at 19:29 with its select still on Auto, and the box
+# spent the evening paging the adapter over classic Bluetooth again.
+
+def _stay_up_bleak(devs, payload=b'x\r'):
+    bleak, state = _fake_bleak(devs, [payload])
+
+    async def stay_up(self, ch, cb):
+        state['subscribed'].append(str(ch.uuid))
+        cb(None, payload)
+    bleak.BleakClient.start_notify = stay_up
+    return bleak, state
+
+
+def test_a_kind_saved_back_to_auto_is_rewritten_while_connected(run_dir, monkeypatch):
+    cfg = {'radar': {'bluetooth_mac': '88:0A:98:19:08:16'}}
+    writes = []
+
+    def save(c):
+        writes.append(c['radar'].get('bluetooth_kind'))
+        cfg.update(c)
+    dev = _Dev('88:0A:98:19:08:16', 'VELOBEAM_003')
+    bleak, state = _stay_up_bleak({'88:0A:98:19:08:16': (dev, _Adv(
+        ['0000ffe0-0000-1000-8000-00805f9b34fb']))})
+    b = ble_serial.BleSerialBridge(cfg_load=lambda: cfg, cfg_save=save)
+    # no backoff in the test: every call may write
+    monkeypatch.setattr(ble_serial.time, 'monotonic',
+                        lambda c=[0.0]: c.__setitem__(0, c[0] + 60) or c[0])
+    ticks = {'n': 0}
+    real_publish = b.publish_link
+
+    def form_saves_auto_then_publish():
+        ticks['n'] += 1
+        if ticks['n'] == 3:                 # the page's save lands
+            cfg['radar']['bluetooth_kind'] = 'auto'
+        return real_publish()
+    b.publish_link = form_saves_auto_then_publish
+    _drive(b, bleak, ticks=6)
+    assert state['connects'] == 1
+    assert writes == ['ble', 'ble']         # learned, then rewritten
+    assert cfg['radar']['bluetooth_kind'] == 'ble'
+
+
+def test_a_failed_write_is_not_retried_at_frame_rate(monkeypatch):
+    calls = []
+
+    def save(c):
+        calls.append(1)
+        raise OSError('read-only /etc')
+    b = ble_serial.BleSerialBridge(cfg_load=lambda: {'radar': {}}, cfg_save=save)
+    t = {'now': 100.0}
+    monkeypatch.setattr(ble_serial.time, 'monotonic', lambda: t['now'])
+    b._persist_kind()
+    b._persist_kind()
+    t['now'] += 10
+    b._persist_kind()
+    assert len(calls) == 1
+    t['now'] += 25
+    b._persist_kind()
+    assert len(calls) == 2
+
+
+# ── a known-BLE adapter gets its tty before the radio is found ───────────────
+# A restart leaves the previous process's link pointing at a pty that died
+# with it; radar.py skips a dangling link silently. With the kind known,
+# the tty is published at once and the loop holds it open and quiet.
+
+def test_a_known_ble_adapter_publishes_its_tty_before_any_connection(run_dir):
+    cfg = {'radar': {'bluetooth_mac': '88:0A:98:19:08:16',
+                     'bluetooth_kind': 'ble'}}
+    link = os.path.join(run_dir, 'radar-ble')
+    os.makedirs(run_dir, exist_ok=True)
+    os.symlink('/dev/pts/999', link)             # the dead process's link
+    assert not os.path.exists(link) and radar.find_ports({}) == []
+    bleak, state = _fake_bleak({}, [])           # radio not found (yet)
+    b = ble_serial.BleSerialBridge(cfg_load=lambda: cfg, cfg_save=lambda c: None)
+    _drive(b, bleak, ticks=3)
+    assert state['connects'] == 0
+    assert b.master is not None and os.readlink(link) == b.slave_path
+    assert os.path.exists(link) and b.link_ok()
+    assert radar.find_ports({}) == [radar.BLE_LINK]
+
+
+def test_an_unlearned_adapter_still_gets_no_tty_until_it_is_found(run_dir):
+    """kind=auto and never seen in a BLE scan: a classic adapter — the
+    binder's, no phantom tty (unchanged)."""
+    cfg = {'radar': {'bluetooth_mac': 'AA:BB:CC:DD:EE:FF'}}
+    bleak, state = _fake_bleak({}, [])
+    b = ble_serial.BleSerialBridge(cfg_load=lambda: cfg, cfg_save=lambda c: None)
+    _drive(b, bleak, ticks=3)
+    assert b.master is None
+    assert not os.path.lexists(os.path.join(run_dir, 'radar-ble'))
+
+
+def test_clearing_the_mac_takes_the_tty_down(run_dir):
+    cfg = {'radar': {'bluetooth_mac': '88:0A:98:19:08:16',
+                     'bluetooth_kind': 'ble'}}
+    link = os.path.join(run_dir, 'radar-ble')
+    bleak, state = _fake_bleak({}, [])
+    b = ble_serial.BleSerialBridge(cfg_load=lambda: cfg, cfg_save=lambda c: None)
+    _drive(b, bleak, ticks=2)
+    assert os.path.lexists(link)
+    cfg['radar']['bluetooth_mac'] = ''           # blank for cabled
+    b.running = True
+    _drive(b, bleak, ticks=2)
+    assert not os.path.lexists(link)
+    # …and someone else's link is never ours to remove
+    os.symlink('/dev/pts/998', link)
+    b.unpublish_link()
+    assert os.path.lexists(link)

@@ -93,6 +93,7 @@ class BleSerialBridge:
         self.scan_error = ''
         self.connect_error = ''
         self.learned_kind = False
+        self._persist_next_t = 0.0
         self.republished = 0                    # publish_link() writes
         self.rfcomm_released = False
 
@@ -201,10 +202,19 @@ class BleSerialBridge:
     def _persist_kind(self):
         """Write bluetooth_kind='ble' once this bridge has proven it —
         the rfcomm binder reads it and stands down instead of failing
-        on every boot. Best effort, once."""
-        if self.learned_kind:
+        on every boot, and radar.py leaves /dev/rfcomm* out of its scan.
+
+        Not once per run: the settings page's select is rendered from
+        config and saved back whole, so a page opened before the bridge
+        learned and saved after it put 'auto' straight back (19 Sep
+        2026: learned 19:26, saved over 19:29, and the box spent the
+        evening paging the adapter over classic Bluetooth again). The
+        connected loop calls this whenever config says anything but
+        'ble'; a write that fails is retried no sooner than 30 s."""
+        now = time.monotonic()
+        if now < self._persist_next_t:
             return
-        self.learned_kind = True
+        self._persist_next_t = now + 30
         try:
             if self.cfg_save is not None:
                 save = self.cfg_save
@@ -215,15 +225,36 @@ class BleSerialBridge:
                 save = _config.save
             rad = dict(cfg.get('radar') or {})
             if rad.get('bluetooth_kind') == 'ble':
+                self.learned_kind = True
                 return
+            was = rad.get('bluetooth_kind') or 'auto'
             rad['bluetooth_kind'] = 'ble'
             cfg['radar'] = rad
             save(cfg)
-            log.warning('learned that the gun adapter is BLE and wrote '
-                        'radar.bluetooth_kind=ble — the rfcomm binder '
-                        'stands down from now on')
+            if self.learned_kind:
+                log.warning("radar.bluetooth_kind had gone back to "
+                            f"'{was}' — a save "
+                            "on the settings page? — rewrote 'ble': the "
+                            "adapter is connected over BLE right now")
+            else:
+                log.warning('learned that the gun adapter is BLE and wrote '
+                            'radar.bluetooth_kind=ble — the rfcomm binder '
+                            'stands down from now on')
+            self.learned_kind = True
         except Exception as e:
             log.warning(f'could not persist bluetooth_kind ({e})')
+
+    def unpublish_link(self):
+        """Take LINK down when it is ours and the MAC is gone from
+        config — otherwise radar.py keeps a phantom adapter open."""
+        try:
+            if self.slave_path and os.path.islink(LINK) \
+                    and os.readlink(LINK) == self.slave_path:
+                os.unlink(LINK)
+                log.info(f'BLE serial lead {LINK} taken down — no adapter '
+                         'configured')
+        except OSError:
+            pass
 
     def _release_rfcomm(self, mac):
         """A binding the rfcomm binder made for this MAC before anyone
@@ -263,9 +294,23 @@ class BleSerialBridge:
             mac, kind = self._want(cfg)
             if not mac:
                 self.connected = False
+                self.unpublish_link()
                 await asyncio.sleep(10)
                 continue
             self.mac = mac
+            if kind == 'ble':
+                # Known BLE (learned on an earlier boot, or set): publish
+                # the tty NOW, before the radio is even found. A restart
+                # leaves the old process's link pointing at a pty that
+                # died with it, and radar.py's scan skips a dangling
+                # link without a word — the lead came back only when the
+                # radio reconnected, which the stale rfcomm binding was
+                # blocking (19 Sep 2026, 19:26 → 20:10). With the tty
+                # up from the start the loop holds it open and silent,
+                # like a gun between innings, and bytes land the moment
+                # the radio connects.
+                self.ensure_pty()
+                self.publish_link()
             try:
                 devs = await bleak.BleakScanner.discover(
                     timeout=SCAN_S, return_adv=True)
@@ -334,8 +379,11 @@ class BleSerialBridge:
                     self._persist_kind()
                     self._release_rfcomm(mac)
                     while self.running and client.is_connected:
-                        if self._want(self.cfg_load())[0] != mac:
+                        m, k = self._want(self.cfg_load())
+                        if m != mac:
                             break               # setting changed
+                        if k != 'ble':
+                            self._persist_kind()  # the form put 'auto' back
                         self.publish_link()     # see publish_link()
                         await asyncio.sleep(1.0)
             except Exception as e:

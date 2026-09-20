@@ -434,6 +434,9 @@ STATUS_PAGE = """<!doctype html><html><head>
         <option value="spp" {{ 'selected' if radar_cfg.get('bluetooth_kind') == 'spp' }}>Classic Bluetooth (SPP → /dev/rfcomm0)</option>
         <option value="ble" {{ 'selected' if radar_cfg.get('bluetooth_kind') == 'ble' }}>Bluetooth LE (HM-10 family → BLE serial lead)</option>
       </select>
+      <span class="hint">the box learns this itself on the first connection and
+      keeps it; a BLE adapter that is connected right now rewrites BLE over
+      whatever is saved here</span>
     </label>
     <label>LED board output
       <select name="display_format">

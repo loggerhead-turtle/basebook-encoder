@@ -255,6 +255,18 @@ The one in the field advertises as `VELOBEAM_003`.
   the settings page says "link is missing" rather than showing a path
   that is not there. If it does say that, the journal names the culprit:
   `journalctl -u playcall-encoder | grep republished`.
+* **Why it took an evening to find.** The classic-Bluetooth page the
+  kernel makes for every open of `/dev/rfcomm0` holds the radio for
+  ~5 s, and the loop was opening it every 8 s — so the LE scan ran in
+  the gaps and the bridge could not reconnect after a restart. That
+  restart is also why the link dangled: a pty dies with its process,
+  and the new one only published once it connected. Now a known-BLE
+  adapter gets its tty the moment the encoder starts, the loop holds
+  it open and quiet like a gun between innings, and bytes land when
+  the radio comes up. And the kind, once learned, is re-asserted while
+  the radio is connected: the settings form saves its select back
+  whole, and a page opened before the learn and saved after it had put
+  `auto` straight back.
 * **The slide switch is a TX/RX crossover.** If the bridge is up
   (bytes received climbing on the settings page) and the gun is silent,
   flip it and pull the trigger again. First thing to try.
