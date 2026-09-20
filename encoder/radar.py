@@ -604,6 +604,19 @@ class RadarService:
                                or '/serial/by-id/' in port
                                or port.startswith('/dev/rfcomm'))
 
+    def _ports(self, cfg):
+        """find_ports, minus a BLE link the bridge does not vouch for.
+        The link is a path in /run; what it points at is a pty NUMBER,
+        and a number left by a dead process is handed out again — on
+        19 Sep 2026 to the operator's SSH session, which this loop then
+        opened as the gun. Only a link the running bridge says is its
+        own is a serial lead."""
+        ports = find_ports(cfg)
+        bridge = getattr(self, 'bridge', None)
+        if BLE_LINK in ports and bridge is not None and not bridge.link_ok():
+            ports = [p for p in ports if p != BLE_LINK]
+        return ports
+
     def persist_roles(self, gun, handles):
         """Write the proven gun (and, when unambiguous, the board) back
         to config, so identity is decided once per CABLE rather than
@@ -852,7 +865,7 @@ class RadarService:
             if ((cfg.get('radar') or {}).get('enabled') or 'auto') == 'off':
                 time.sleep(10)
                 continue
-            ports = find_ports(cfg)
+            ports = self._ports(cfg)
             if not ports:
                 self.connected = False
                 if not missing_logged:
@@ -1104,7 +1117,7 @@ class RadarService:
                         self.push(event=ev)
                         time.sleep(0.05)
                     if time.monotonic() > rescan_at:
-                        if sorted(find_ports(cfg)) != sorted(handles):
+                        if sorted(self._ports(cfg)) != sorted(handles):
                             log.info('serial adapters changed — reopening')
                             break
                         rescan_at = time.monotonic() + 10

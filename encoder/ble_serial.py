@@ -96,6 +96,7 @@ class BleSerialBridge:
         self._persist_next_t = 0.0
         self.republished = 0                    # publish_link() writes
         self.rfcomm_released = False
+        self._direct_logged = False
 
     # ── the tty ──────────────────────────────────────────────────────────────
     def ensure_pty(self):
@@ -244,6 +245,35 @@ class BleSerialBridge:
         except Exception as e:
             log.warning(f'could not persist bluetooth_kind ({e})')
 
+    @staticmethod
+    def _bluez_connected(mac):
+        """Does BlueZ hold this address connected right now? (bluetoothctl
+        info prints 'Connected: yes'.) Best effort; False on any doubt."""
+        try:
+            r = subprocess.run(['bluetoothctl', 'info', mac],
+                               capture_output=True, text=True, timeout=5)
+            return 'Connected: yes' in (r.stdout or '')
+        except Exception:
+            return False
+
+    def clear_stale_link(self):
+        """A link left by a previous run points at a pty that died with
+        it — or worse, at a pty number the kernel has since handed to
+        someone else. 19 Sep 2026, 20:10:06: 'radar listening on
+        /run/playcall-encoder/radar-ble' — which was /dev/pts/1, which
+        had just become the operator's SSH terminal. Before this bridge
+        has a tty of its own, any link there is nobody's: remove it."""
+        if self.slave_path is not None:
+            return
+        try:
+            if os.path.islink(LINK):
+                was = os.readlink(LINK)
+                os.unlink(LINK)
+                log.info(f'removed a stale BLE serial lead {LINK} -> {was} '
+                         'left by a previous run')
+        except OSError:
+            pass
+
     def unpublish_link(self):
         """Take LINK down when it is ours and the MAC is gone from
         config — otherwise radar.py keeps a phantom adapter open."""
@@ -289,6 +319,7 @@ class BleSerialBridge:
 
     # ── the BLE loop ─────────────────────────────────────────────────────────
     async def _run(self, bleak):
+        self.clear_stale_link()
         while self.running:
             cfg = self.cfg_load()
             mac, kind = self._want(cfg)
@@ -337,10 +368,29 @@ class BleSerialBridge:
                     hit = pair
                     break
             if hit is None:
-                # not a BLE device (or off): the rfcomm binder's problem
-                self.connected = False
-                await asyncio.sleep(RESCAN_IDLE_S)
-                continue
+                # A BLE adapter that is not advertising is usually one
+                # BlueZ still holds connected from a previous run of this
+                # process — the LED solid blue, nobody reading it, and a
+                # scan that can never see it (19 Sep 2026: the bridge
+                # waited on that scan for an hour). BlueZ can connect to
+                # an address it knows without an advertisement, so a
+                # known-BLE adapter, or one BlueZ says is connected, is
+                # connected by address. Anything else absent from an LE
+                # scan is a classic adapter: the rfcomm binder's problem.
+                if kind == 'ble' or self.learned_kind \
+                        or self._bluez_connected(mac):
+                    if not self._direct_logged:
+                        self._direct_logged = True
+                        log.info(f'{mac} not advertising (held connected '
+                                 'by the adapter, or asleep) — connecting '
+                                 'by address')
+                    hit = (mac, None)
+                else:
+                    self.connected = False
+                    await asyncio.sleep(RESCAN_IDLE_S)
+                    continue
+            else:
+                self._direct_logged = False
             dev, adv = hit
             uuids = getattr(adv, 'service_uuids', None) if adv else None
             if kind == 'auto' and uuids is not None \
@@ -348,7 +398,8 @@ class BleSerialBridge:
                 log.info(f'{mac} is BLE but advertises no serial service '
                          f'({sorted(uuids)}) — subscribing to whatever '
                          'notifies')
-            self.device_name = getattr(dev, 'name', None) or None
+            self.device_name = (getattr(dev, 'name', None) or None
+                                if not isinstance(dev, str) else self.device_name)
             self.ensure_pty()
             log.info(f'BLE serial adapter found: {self.device_name or "?"} '
                      f'[{mac}] — connecting')

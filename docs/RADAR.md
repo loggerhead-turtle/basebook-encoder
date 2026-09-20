@@ -267,6 +267,16 @@ The one in the field advertises as `VELOBEAM_003`.
   the radio is connected: the settings form saves its select back
   whole, and a page opened before the learn and saved after it had put
   `auto` straight back.
+* **Solid blue LED, nothing read, no bridge lines in the journal.** The
+  previous encoder process's BLE connection outlived it at the BlueZ
+  daemon, so the adapter stopped advertising and the scan could never
+  see it. A known-BLE adapter, or one `bluetoothctl info` says is
+  connected, is now connected **by address** without waiting for an
+  advertisement. And a link left by a dead process is removed before
+  the bridge does anything else, because a pty number is handed out
+  again — at 20:10 that night to the operator's SSH login, and the
+  radar loop "listened" to a shell. The loop also opens the link only
+  when the running bridge says it is its own.
 * **The slide switch is a TX/RX crossover.** If the bridge is up
   (bytes received climbing on the settings page) and the gun is silent,
   flip it and pull the trigger again. First thing to try.

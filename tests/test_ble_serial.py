@@ -548,10 +548,12 @@ def test_a_known_ble_adapter_publishes_its_tty_before_any_connection(run_dir):
     os.makedirs(run_dir, exist_ok=True)
     os.symlink('/dev/pts/999', link)             # the dead process's link
     assert not os.path.exists(link) and radar.find_ports({}) == []
-    bleak, state = _fake_bleak({}, [])           # radio not found (yet)
+    bleak, state = _fake_bleak({}, [])           # not advertising
     b = ble_serial.BleSerialBridge(cfg_load=lambda: cfg, cfg_save=lambda c: None)
     _drive(b, bleak, ticks=3)
-    assert state['connects'] == 0
+    # known BLE: the tty is up, and the radio is connected BY ADDRESS
+    # rather than waited for in a scan it may never appear in
+    assert state['connects'] >= 1
     assert b.master is not None and os.readlink(link) == b.slave_path
     assert os.path.exists(link) and b.link_ok()
     assert radar.find_ports({}) == [radar.BLE_LINK]
@@ -584,3 +586,89 @@ def test_clearing_the_mac_takes_the_tty_down(run_dir):
     os.symlink('/dev/pts/998', link)
     b.unpublish_link()
     assert os.path.lexists(link)
+
+
+# ── an adapter BlueZ still holds is connected by address ─────────────────────
+# 19 Sep 2026: LED solid blue, no reader — the previous process's
+# connection outlived it at the daemon, the adapter stopped advertising,
+# and the bridge waited on a scan hit for an hour.
+
+def test_an_adapter_bluez_holds_connected_is_connected_by_address(run_dir, monkeypatch):
+    cfg = {'radar': {'bluetooth_mac': '88:0A:98:19:08:16'}}   # kind: auto
+    asked = []
+
+    class R:
+        stdout = 'Device 88:0A:98:19:08:16 (public)\n\tConnected: yes\n'
+        stderr = ''
+        returncode = 0
+    monkeypatch.setattr(ble_serial.subprocess, 'run',
+                        lambda argv, **kw: asked.append(argv) or R())
+    bleak, state = _fake_bleak({}, [FRAME.encode('latin-1')])   # scan: nothing
+    seen = []
+    orig_init = bleak.BleakClient.__init__
+
+    def init(self, dev):
+        seen.append(dev)
+        orig_init(self, dev)
+    bleak.BleakClient.__init__ = init
+    b = ble_serial.BleSerialBridge(cfg_load=lambda: cfg, cfg_save=lambda c: None)
+    _drive(b, bleak, ticks=3)
+    assert asked and asked[0][:2] == ['bluetoothctl', 'info']
+    assert state['connects'] >= 1 and seen[0] == '88:0A:98:19:08:16'
+    assert _read_slave(b.slave_path, len(FRAME)) == FRAME.encode('latin-1')
+
+
+def test_a_classic_adapter_absent_from_the_scan_is_still_the_binders(run_dir, monkeypatch):
+    cfg = {'radar': {'bluetooth_mac': 'AA:BB:CC:DD:EE:FF'}}
+
+    class R:
+        stdout = 'Device AA:BB:CC:DD:EE:FF (public)\n\tConnected: no\n'
+        stderr = ''
+        returncode = 0
+    monkeypatch.setattr(ble_serial.subprocess, 'run', lambda argv, **kw: R())
+    bleak, state = _fake_bleak({}, [])
+    b = ble_serial.BleSerialBridge(cfg_load=lambda: cfg, cfg_save=lambda c: None)
+    _drive(b, bleak, ticks=3)
+    assert state['connects'] == 0 and b.master is None
+
+
+# ── a link left by a dead process is nobody's ────────────────────────────────
+# 20:10:06 that night: the stale link resolved to /dev/pts/1, which the
+# kernel had just handed to the operator's SSH login, and the radar loop
+# 'listened' to a shell. Two guards: the bridge removes any link it did
+# not make, and the loop opens the link only when the bridge vouches.
+
+def test_the_bridge_removes_a_link_it_did_not_make(run_dir):
+    link = os.path.join(run_dir, 'radar-ble')
+    os.makedirs(run_dir, exist_ok=True)
+    os.symlink('/dev/pts/0', link)               # someone's terminal, alive
+    cfg = {'radar': {'bluetooth_mac': 'AA:BB:CC:DD:EE:FF'}}
+    bleak, state = _fake_bleak({}, [])
+    b = ble_serial.BleSerialBridge(cfg_load=lambda: cfg, cfg_save=lambda c: None)
+    b._bluez_connected = lambda mac: False
+    _drive(b, bleak, ticks=2)
+    assert not os.path.lexists(link)             # gone before any scan
+    # …but never its own
+    b.ensure_pty()
+    b.clear_stale_link()
+    assert os.readlink(link) == b.slave_path
+
+
+def test_the_loop_opens_the_link_only_on_the_bridges_word(run_dir, monkeypatch):
+    from tests.test_radar import _FakeLink
+    link = os.path.join(run_dir, 'radar-ble')
+    os.makedirs(run_dir, exist_ok=True)
+    os.symlink('/dev/pts/0', link)               # resolves, but not ours
+    monkeypatch.setattr(radar.glob, 'glob', lambda pat: [])
+    svc = radar.RadarService(_FakeLink())
+    assert radar.find_ports({}) == [radar.BLE_LINK]   # the raw scan lists it
+    assert svc._ports({}) == [radar.BLE_LINK]         # no bridge: as before
+    b = ble_serial.BleSerialBridge(cfg_load=lambda: {})
+    svc.bridge = b
+    assert svc._ports({}) == []                       # bridge has no tty: no
+    os.unlink(link)
+    b.ensure_pty()
+    assert svc._ports({}) == [radar.BLE_LINK]         # its own link: yes
+    os.unlink(link)
+    os.symlink('/dev/pts/0', link)                    # swapped under it: no
+    assert svc._ports({}) == []
