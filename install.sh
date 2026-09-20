@@ -84,13 +84,13 @@ apt-get install -y -qq ffmpeg curl git avahi-daemon hostapd dnsmasq \
 # bluez: a radar gun on a serial→Bluetooth adapter becomes /dev/rfcomm0
 # and is read exactly like a cabled one. Costs nothing on a box that
 # never uses it — see scripts/radar_bt_bind.sh and docs/RADAR.md.
-# python3-bleak: BLE client for the Pocket Radar Smart Coach (its ONLY
-# data output is BLE — the USB port is power/firmware). Debian packages
-# it; a distro that doesn't gets the pip fallback below, and a box with
-# neither simply logs "Smart Coach capture disabled" and runs on.
+# python3-bleak: the BLE client for a Stalker gun on a Bluetooth LE
+# serial adapter (IRXON and the like — encoder/ble_serial.py). Without it
+# the bridge logs once and stands aside; a cabled gun and a classic
+# (rfcomm) adapter are unaffected.
 apt-get install -y -qq python3-bleak >/dev/null 2>&1 \
   || pip3 install -q bleak --break-system-packages 2>/dev/null \
-  || echo "⚠ bleak not installed — Pocket Radar Smart Coach capture disabled (Stalker serial radar unaffected)"
+  || echo "⚠ bleak not installed — a BLE serial gun adapter cannot be read (cable and rfcomm unaffected)"
 # USB Bluetooth dongles (the long-range comms option) are nearly all
 # Realtek inside — TP-Link UB500 included — and a netinst Debian ships
 # no firmware for them: the dongle enumerates as an hci with NO address

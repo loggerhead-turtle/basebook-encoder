@@ -97,15 +97,6 @@ def main():
     _bridge.start_thread()
     _radar.bridge = _bridge
 
-    # Pocket Radar Smart Coach over Bluetooth LE: a separate service on
-    # purpose — the serial pipeline above stays untouched whether this
-    # one runs, idles (no bleak / no BT adapter), or dies. Same cloud
-    # endpoint, same display-only invariant. See encoder/smart_coach.py.
-    from . import smart_coach
-    _scoach = smart_coach.SmartCoachService(link, cfg_load=config.load)
-    _scoach.start_thread()
-    link.ble_radar_health = _scoach.health
-
     # Clip cutter: systemd normally runs it as its own unit, but a box
     # installed before that unit existed never got it — self-update
     # cannot write /etc/systemd/system as the service user, so the unit

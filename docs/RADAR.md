@@ -309,13 +309,11 @@ The one in the field advertises as `VELOBEAM_003`.
   only once it exists again, or once a minute if it exists but would
   not open; it is never a reason to reopen the rest.
 * **"this box cannot scan for Bluetooth — org.bluez.Error.InProgress".**
-  Another LE scan in the same process: the Pocket Radar Smart Coach
-  module, left on "try anyway", scanning every fifteen seconds. BlueZ
-  allows one discovery per client and every bleak scanner here is that
-  one client. Two guards now: one process-wide scan lock that both
-  modules (and a connect by address, which scans on its own) take in
-  turn — and the Smart Coach stands down whenever `radar.bluetooth_mac`
-  is set, because a team runs one gun. The card says so.
+  Another LE scan in the same process. BlueZ allows one discovery per
+  client and every bleak scanner here is that one client. Every LE
+  scan in the encoder (and a connect by address, which scans on its
+  own) takes one process-wide lock in turn. The module that first
+  caused it — a Pocket Radar reader — has been removed.
 * **The slide switch is a TX/RX crossover.** If the bridge is up
   (bytes received climbing on the settings page) and the gun is silent,
   flip it and pull the trigger again. First thing to try.
@@ -346,31 +344,20 @@ The one in the field advertises as `VELOBEAM_003`.
 
 ---
 
-## Pocket Radar Smart Coach — not supported over Bluetooth
+## Pocket Radar — not read by the box
 
-**The capture service is off by default and should stay off.** The gun
-will not give its readings to anything except Pocket Radar's own app.
-This was established against a real SR1100, from three directions, and
-the evidence is written up in `docs/POCKET_RADAR.md` in the site repo
-along with the cloud integration that replaces it.
+The box does not read a Pocket Radar, and the module that tried has
+been removed. The gun gives its readings to nothing but Pocket Radar's
+own app (established against a real SR1100 from three directions —
+`docs/POCKET_RADAR.md` in the site repo has the evidence), so a team
+with one uses that app, and the site takes the readings from Pocket
+Radar's cloud, not from this box. Older configs may still carry
+`radar.smart_coach*` keys; the settings page drops them on its next
+save and nothing reads them.
 
-The short version, so nobody spends another evening on it:
-
-* The box connects and BlueZ reports `failed to discover services,
-  device disconnected` — every time, against a gun visible on every
-  scan.
-* A browser gets further (it can see the one vendor service and
-  subscribe) and is handed **sixteen zero bytes** on every read, has
-  **every write refused**, and is dropped after **1.9 seconds** on the
-  dot.
-* `bluetoothctl pair` connects and never completes.
-
-That is a product boundary, not a protocol nobody has guessed yet.
-`radar.smart_coach: auto` still turns the capture on for a firmware that
-one day behaves differently; nothing else about this box changes.
-
-**The Stalker on a cable is the supported gun**, and it gives spin as
-well as velocity, which a Smart Coach never does.
+**The Stalker is the box's gun** — on a cable, a classic Bluetooth
+adapter, or a BLE serial adapter — and it gives spin as well as
+velocity when the gun is set to send it.
 
 ## When there is no velo
 

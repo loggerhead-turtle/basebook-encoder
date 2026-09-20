@@ -410,7 +410,7 @@ def test_heartbeat_payload_shape():
     assert hb['state'] == 'pushing'
     assert set(hb) == {'state', 'ingest', 'push', 'cpu', 'temp',
                        'version', 'log_tail', 'hostname', 'ip', 'clips',
-                       'pin', 'rtmp_urls', 'radar', 'ble_radar',
+                       'pin', 'rtmp_urls', 'radar',
                        'temp_max', 'storage', 'livepush', 'transcode',
                        'hardware'}
     assert isinstance(hb['hardware'], str)
@@ -2682,17 +2682,18 @@ def _radar_client(monkeypatch):
 
 
 def test_the_radar_card_is_one_form_with_every_field_in_it(monkeypatch):
-    """It was two: the template closed the form after the Smart Coach
-    rows, and the gun baud, the BT578 adapter's MAC and the LED board
-    format sat below it, outside any form. They looked editable and were
-    not — nothing they said was ever submitted."""
+    """It was two: the template closed the form after the (since
+    removed) Pocket Radar rows, and the gun baud, the BT578 adapter's
+    MAC and the LED board format sat below it, outside any form. They
+    looked editable and were not — nothing they said was ever
+    submitted."""
     web, client = _radar_client(monkeypatch)
     html = client.get('/').get_data(as_text=True)
     card = html[html.index('🔫 Radar'):html.index('Save radar settings')]
     assert card.count('<form') - card.count('</form>') == 1   # one open form
+    assert 'smart_coach' not in html                          # module removed
     for field in ('name="baud"', 'name="bluetooth_mac"',
-                  'name="display_format"', 'name="smart_coach_mac"',
-                  'name="smart_coach"'):
+                  'name="display_format"', 'name="bluetooth_kind"'):
         assert html.count(field) == 1, field                  # once, not twice
         assert field in card                                  # and inside it
 

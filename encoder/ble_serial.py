@@ -63,7 +63,7 @@ UART_SERVICES = (
 SCAN_S = 8.0
 # One LE scan per process at a time. BlueZ allows one discovery per
 # D-Bus client, and every bleak scanner in this process is that one
-# client: with the Smart Coach module scanning in its own thread, the
+# client: with a second module scanning in its own thread, the
 # bridge's scan failed 'org.bluez.Error.InProgress: Operation already
 # in progress' on every pass, for an hour (19 Sep 2026). A scan holds
 # this; a connect by ADDRESS holds it too, since bleak resolves an

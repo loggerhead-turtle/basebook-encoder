@@ -456,10 +456,6 @@ class CloudLink:
             # without a gun.
             'radar': (self.radar_health() if callable(
                 getattr(self, 'radar_health', None)) else None),
-            # Smart Coach (BLE) health, same idea — a separate key so
-            # the two guns never impersonate each other on the site
-            'ble_radar': (self.ble_radar_health() if callable(
-                getattr(self, 'ble_radar_health', None)) else None),
             # What the Multi-View leg is doing right now: the site's
             # stream sheet has a GO LIVE button for it, and a button with
             # no readout is a button you press twice. Written by

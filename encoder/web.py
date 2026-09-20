@@ -401,7 +401,6 @@ STATUS_PAGE = """<!doctype html><html><head>
     {% endif %}
   </p>
   {% endif %}
-  {% if ble_line %}<p class="hint">{{ ble_line }}</p>{% endif %}
 
   <form method="post" action="/radar">
     <label>Capture
@@ -409,17 +408,6 @@ STATUS_PAGE = """<!doctype html><html><head>
         <option value="auto" {{ 'selected' if radar_cfg.get('enabled', 'auto') != 'off' }}>Auto (default)</option>
         <option value="off" {{ 'selected' if radar_cfg.get('enabled') == 'off' }}>Off</option>
       </select>
-    </label>
-    <label>Pocket Radar Smart Coach (BLE) — <b>off</b>: the gun will not
-      talk to anything but its own app (see docs/POCKET_RADAR.md)
-      <select name="smart_coach">
-        <option value="off" {{ 'selected' if radar_cfg.get('smart_coach', 'off') != 'auto' }}>Off (default)</option>
-        <option value="auto" {{ 'selected' if radar_cfg.get('smart_coach') == 'auto' }}>Try anyway</option>
-      </select>
-    </label>
-    <label>Smart Coach MAC (optional pin)
-      <input name="smart_coach_mac" value="{{ radar_cfg.get('smart_coach_mac') or '' }}"
-             placeholder="only used when the capture above is on">
     </label>
     <label>Gun baud
       <select name="baud">
@@ -683,21 +671,6 @@ def live_push_view(cfg):
             'status': line}
 
 
-def _ble_line(cloud):
-    """The Smart Coach status as one sentence, or '' on a box whose
-    encoder has no BLE service at all."""
-    h = (cloud.ble_radar_health()
-         if callable(getattr(cloud, 'ble_radar_health', None)) else None)
-    if not h:
-        return ''
-    try:
-        from . import smart_coach
-        return smart_coach.status_line(h)
-    except Exception:
-        log.debug('smart coach status line failed', exc_info=True)
-        return ''
-
-
 def create_app(cloud=None):
     app = Flask(__name__)
     app.secret_key = _session_secret()
@@ -857,11 +830,7 @@ def create_app(cloud=None):
             radar=(cloud.radar_health()
                    if callable(getattr(cloud, 'radar_health', None))
                    else None),
-            ble_radar=(cloud.ble_radar_health()
-                       if callable(getattr(cloud, 'ble_radar_health', None))
-                       else None),
             radar_cfg=(cfg.get('radar') or {}),
-            ble_line=_ble_line(cloud),
             comms=comms_status(),
             comms_tok=comms_token(cfg),
             cloud_base=(cfg.get('cloud') or {}).get('base_url', ''),
@@ -1054,21 +1023,12 @@ def create_app(cloud=None):
             rd['display_format'] = request.form.get('display_format')
         if request.form.get('bluetooth_kind') in ('auto', 'spp', 'ble'):
             rd['bluetooth_kind'] = request.form.get('bluetooth_kind')
-        if request.form.get('smart_coach') in ('auto', 'off'):
-            rd['smart_coach'] = request.form.get('smart_coach')
-        sc_mac = (request.form.get('smart_coach_mac') or '').strip().upper()
-        if sc_mac and not _MAC_RE.match(sc_mac):
-            return redirect(url_for('index', err=(
-                'That is not a Bluetooth MAC — the Smart Coach pin looks '
-                'like AA:BB:CC:DD:EE:FF (bluetoothctl devices while the '
-                'gun is on)')))
-        if sc_mac != (rd.get('smart_coach_mac') or '').upper():
-            rd['smart_coach_mac'] = sc_mac
-            # a different gun means the learned wire format is someone
-            # else's — re-learn from its first pitch
-            rd.pop('smart_coach_char', None)
-            rd.pop('smart_coach_decode', None)
-            rd.pop('smart_coach_service', None)
+        # the Pocket Radar module is gone (its gun talks only to its own
+        # app — see docs/POCKET_RADAR.md in the site repo); its keys in
+        # an older config are dropped on the first save
+        for k in ('smart_coach', 'smart_coach_mac', 'smart_coach_char',
+                  'smart_coach_decode', 'smart_coach_service'):
+            rd.pop(k, None)
         cfg['radar'] = rd
         config.save(cfg)
         if mac != old_mac:
@@ -1086,12 +1046,7 @@ def create_app(cloud=None):
         the wrong adapter (new cable, clone IDs)."""
         cfg = config.load()
         rd = dict(cfg.get('radar') or {})
-        for k in ('port', 'display_port',
-                  # the Smart Coach's learned identity is the same kind
-                  # of fact — a replaced gun re-learns from its first
-                  # pitch just like a replaced cable
-                  'smart_coach_mac', 'smart_coach_char',
-                  'smart_coach_decode', 'smart_coach_service'):
+        for k in ('port', 'display_port'):
             rd.pop(k, None)
         cfg['radar'] = rd
         config.save(cfg)
