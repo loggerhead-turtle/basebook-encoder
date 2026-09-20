@@ -89,6 +89,14 @@ def main():
     # board / a collapsed parse rate without anyone SSHing in
     link.radar_health = _radar.health
 
+    # A BLE serial adapter on the gun (an HM-10-family brick, not classic
+    # SPP) becomes a tty the radar service reads like any cable. Idles
+    # with no MAC, a classic adapter, or no bleak. See encoder/ble_serial.py.
+    from . import ble_serial
+    _bridge = ble_serial.BleSerialBridge(cfg_load=config.load)
+    _bridge.start_thread()
+    _radar.bridge = _bridge
+
     # Pocket Radar Smart Coach over Bluetooth LE: a separate service on
     # purpose — the serial pipeline above stays untouched whether this
     # one runs, idles (no bleak / no BT adapter), or dies. Same cloud

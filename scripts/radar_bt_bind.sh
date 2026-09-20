@@ -21,24 +21,34 @@
 # the radar service already tolerates.
 set -uo pipefail
 
-CONFIG=/etc/playcall-encoder/config.json
+CONFIG="${PLAYCALL_ENCODER_DIR:-/etc/playcall-encoder}/config.json"
 DEV=/dev/rfcomm0
 CHANNEL="${RFCOMM_CHANNEL:-1}"
 
-mac() {
-  python3 - "$CONFIG" <<'PY' 2>/dev/null
+radar_cfg() {
+  python3 - "$CONFIG" "$1" <<'PY' 2>/dev/null
 import json, sys
 try:
     cfg = json.load(open(sys.argv[1]))
 except Exception:
     sys.exit(0)
-print(((cfg.get('radar') or {}).get('bluetooth_mac') or '').strip())
+print(str((cfg.get('radar') or {}).get(sys.argv[2]) or '').strip())
 PY
 }
 
-MAC="$(mac)"
+MAC="$(radar_cfg bluetooth_mac)"
 if [[ -z "$MAC" ]]; then
   echo "radar-bt: no radar.bluetooth_mac configured — nothing to bind"
+  exit 0
+fi
+
+# A BLE adapter (the HM-10 family and friends) has no SPP to bind: it is
+# read by encoder/ble_serial.py instead, which writes this setting the
+# first time it connects. Trying rfcomm against one fails on every boot
+# for ever, so stand down quietly.
+KIND="$(radar_cfg bluetooth_kind | tr 'A-Z' 'a-z')"
+if [[ "$KIND" == "ble" ]]; then
+  echo "radar-bt: $MAC is a BLE adapter (radar.bluetooth_kind=ble) — read by the BLE serial bridge, no rfcomm binding"
   exit 0
 fi
 

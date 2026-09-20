@@ -50,6 +50,11 @@ log = logging.getLogger('radar')
 
 BAUD = 19200
 POST_PATH = '/api/encoder/radar'
+# Where the BLE serial bridge publishes its tty (encoder/ble_serial.py).
+# Named here rather than imported so this module keeps knowing nothing
+# about Bluetooth beyond "that path is a lead too".
+BLE_LINK = os.path.join(os.environ.get('PLAYCALL_ENCODER_RUN',
+                                       '/run/playcall-encoder'), 'radar-ble')
 LIVE_MIN_INTERVAL = 0.35      # throttle live pushes
 ALIVE_INTERVAL = 10           # keepalive push while idle
 GAP_S = 1.0                   # quiet gap that closes a burst
@@ -295,6 +300,12 @@ def find_ports(cfg=None):
     byid = sorted(glob.glob('/dev/serial/by-id/*'))
     ports = byid if byid else sorted(glob.glob('/dev/ttyUSB*'))
     ports = ports + sorted(glob.glob('/dev/rfcomm*'))
+    # …and the BLE serial lead, a pty the bridge publishes at a fixed
+    # path (encoder/ble_serial.py). Same idea as rfcomm: a tty that
+    # lives nowhere near /dev/serial/by-id, joined to the scan so the
+    # gun on the far end of a BLE adapter is found like a cabled one.
+    if os.path.exists(BLE_LINK):
+        ports = ports + [BLE_LINK]
     if want:
         if not os.path.exists(want):
             log.warning('pinned radar port %s is not there — using whatever '
@@ -562,6 +573,16 @@ class RadarService:
             return False
 
     @staticmethod
+    def _is_bluetooth(port):
+        """An rfcomm binding — the gun on the far end of a serial-to-
+        Bluetooth adapter. It is a PEER of the USB pin, never a
+        correction of it: a box that runs the gun on a cable some games
+        and over Bluetooth on others keeps both, and the claim moves to
+        whichever is talking. Nothing about that is a wrong pin."""
+        return bool(port) and (port.startswith('/dev/rfcomm')
+                               or port == BLE_LINK)
+
+    @staticmethod
     def _stable_path(port):
         """A name worth remembering across reboots and replugs.
 
@@ -571,7 +592,8 @@ class RadarService:
         is the opposite — it names an enumeration ORDER, which changes
         with sockets and boot timing, so persisting one would pin the
         gun to whichever adapter got lucky. Never remember those."""
-        return bool(port) and ('/serial/by-id/' in port
+        return bool(port) and (port == BLE_LINK
+                               or '/serial/by-id/' in port
                                or port.startswith('/dev/rfcomm'))
 
     def persist_roles(self, gun, handles):
@@ -670,6 +692,14 @@ class RadarService:
             # the pinned gun port turned out not to be the gun — fix
             # radar.port/display_port in config
             'pin_overridden': bool(self.pin_overridden),
+            # which LEAD the gun is on right now — the settings page and
+            # Field check say "over Bluetooth" rather than a device path
+            'bluetooth': self._is_bluetooth(self.port),
+            # the BLE serial bridge, when one is running — its link to
+            # the adapter is a separate thing from the gun being heard
+            'ble_lead': (self.bridge.health()
+                         if getattr(self, 'bridge', None) is not None
+                         else None),
             # the number that would have named the glued-field bug in
             # one glance instead of a log dive
             'parse_pct': (round(100.0 * parsed / lines, 1)
@@ -911,19 +941,52 @@ class RadarService:
                                 # can be the board echoing the very
                                 # speeds we write to it, and an echo
                                 # must never steal the claim.
-                                if _FRAME.search(
-                                        raw.decode('ascii', 'replace')):
+                                text = raw.decode('ascii', 'replace')
+                                # Bare numbers count as evidence ONLY on
+                                # a Bluetooth port that is not the board
+                                # target: the echo that makes them
+                                # untrustworthy is the board repeating
+                                # what we wrote, and nothing is ever
+                                # written to rfcomm — so a plain-format
+                                # gun on Bluetooth can take the claim
+                                # from a silent cable too.
+                                bt_plain = (self._is_bluetooth(p)
+                                            and p != disp_pin
+                                            and _FMT_A.match(text))
+                                if _FRAME.search(text) or bt_plain:
                                     probes[p] = probes.get(p, 0) + 1
-                                    if probes[p] >= GUN_TAKEOVER_FRAMES:
-                                        log.warning(
-                                            f'gun frames are streaming on '
-                                            f'{p}, not the claimed '
-                                            f'{gun} — moving the gun '
-                                            'there (radar.port in config '
-                                            'points at the wrong '
-                                            'adapter; update or clear '
-                                            'it)')
-                                        self.pin_overridden = True
+                                    need = (GUN_LEARN_FMT_A if bt_plain
+                                            else GUN_TAKEOVER_FRAMES)
+                                    if probes[p] >= need:
+                                        pinned = ((cfg.get('radar') or {})
+                                                  .get('port') or None)
+                                        # A move between the pin and the
+                                        # Bluetooth port is a gun on a
+                                        # different LEAD, not a wrong
+                                        # pin: it rewrites nothing and
+                                        # waves no flag. Both stay as
+                                        # the box's two homes for the
+                                        # gun, and the claim follows
+                                        # whichever is talking.
+                                        peer = (self._is_bluetooth(p)
+                                                or self._is_bluetooth(gun)
+                                                or p == pinned)
+                                        if peer:
+                                            log.info(
+                                                f'gun is talking on {p} '
+                                                f'now (was {gun}) — '
+                                                'following it; the USB '
+                                                'pin is unchanged')
+                                        else:
+                                            log.warning(
+                                                f'gun frames are streaming '
+                                                f'on {p}, not the claimed '
+                                                f'{gun} — moving the gun '
+                                                'there (radar.port in '
+                                                'config points at the '
+                                                'wrong adapter; update '
+                                                'or clear it)')
+                                            self.pin_overridden = True
                                         gun = p
                                         self.port = p
                                         claims = {'lines': 0, 'ok': 0}
@@ -931,8 +994,11 @@ class RadarService:
                                         proof = {'rd': 0, 'ok': 0}
                                         # RD frames only come from a
                                         # Stalker: that IS the gun's
-                                        # cable, for ever — remember it
-                                        self.persist_roles(p, handles)
+                                        # cable, for ever — remember it.
+                                        # Not for Bluetooth: the pin is
+                                        # the cable's, and stays so.
+                                        if not peer:
+                                            self.persist_roles(p, handles)
                                 else:
                                     continue
                             if gun is None or p == gun:
@@ -963,12 +1029,19 @@ class RadarService:
                                             proof['rd'] += 1
                                         else:
                                             proof['ok'] += 1
+                                    # …never from Bluetooth: a USB pin
+                                    # that also exists is the cable's
+                                    # and stays the cable's. A lone
+                                    # rfcomm with no pin at all may
+                                    # still be remembered as before.
                                     if not self.roles_learned and (
                                             proof['rd'] >=
                                             GUN_TAKEOVER_FRAMES
                                             or (len(handles) == 1
                                                 and proof['ok'] >=
-                                                GUN_LEARN_FMT_A)):
+                                                GUN_LEARN_FMT_A)) \
+                                            and not (self._is_bluetooth(p)
+                                                     and self.cfg_pinned):
                                         self.persist_roles(p, handles)
                                     # A WRONG claim is self-correcting: a
                                     # display board chatters status back

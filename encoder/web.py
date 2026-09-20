@@ -357,7 +357,7 @@ STATUS_PAGE = """<!doctype html><html><head>
   <h2>🔫 Radar</h2>
   <p class="hint">
     {% if radar and radar.get('connected') %}
-      🟢 listening on {{ radar.get('port') or '?' }} @ {{ radar.get('baud') }}
+      🟢 listening on {{ radar.get('port') or '?' }}{{ ' (over Bluetooth)' if radar.get('bluetooth') }} @ {{ radar.get('baud') }}
       {% if radar.get('gun_heard_s') is not none %}
         — gun heard {{ radar.get('gun_heard_s')|int }}s ago
       {% else %} — gun not heard yet{% endif %}
@@ -371,6 +371,29 @@ STATUS_PAGE = """<!doctype html><html><head>
       radar capture runs in the encoder service
     {% endif %}
   </p>
+  {% set lead = (radar or {}).get('ble_lead') %}
+  {% if lead and lead.get('mac') %}
+  <p class="hint">
+    {% if lead.get('connected') %}
+      🟢 BLE serial adapter connected: {{ lead.get('name') or lead.get('mac') }}
+      — {{ lead.get('bytes') }} bytes received
+      {% if lead.get('heard_s') is not none %}, last {{ lead.get('heard_s')|int }}s ago{% endif %}
+      → {{ lead.get('link') }}
+    {% elif lead.get('bleak') is false %}
+      ⚫ BLE serial adapter: Bluetooth LE support is not installed —
+      <code>sudo apt install -y python3-bleak</code>, then restart the encoder
+    {% elif lead.get('scan_error') %}
+      🔴 BLE serial adapter: this box cannot scan for Bluetooth — {{ lead.get('scan_error') }}
+    {% elif lead.get('connect_error') %}
+      ⚫ BLE serial adapter {{ lead.get('mac') }}: found, but the link dropped —
+      {{ lead.get('connect_error') }} (reconnecting)
+    {% else %}
+      ⚫ BLE serial adapter {{ lead.get('mac') }}: not seen in a scan —
+      is it powered (the gun's port feeds it)? A classic adapter is
+      bound as /dev/rfcomm0 instead and does not show here.
+    {% endif %}
+  </p>
+  {% endif %}
   {% if ble_line %}<p class="hint">{{ ble_line }}</p>{% endif %}
 
   <form method="post" action="/radar">
@@ -398,9 +421,16 @@ STATUS_PAGE = """<!doctype html><html><head>
         {% endfor %}
       </select>
     </label>
-    <label>Bluetooth gun adapter (BT578…) MAC
+    <label>Bluetooth gun adapter MAC (BT578, IRXON…)
       <input name="bluetooth_mac" value="{{ radar_cfg.get('bluetooth_mac') or '' }}"
              placeholder="00:11:22:33:44:55 — blank for cabled">
+    </label>
+    <label>…which kind of adapter
+      <select name="bluetooth_kind">
+        <option value="auto" {{ 'selected' if (radar_cfg.get('bluetooth_kind') or 'auto') == 'auto' }}>Auto — the box finds out (default)</option>
+        <option value="spp" {{ 'selected' if radar_cfg.get('bluetooth_kind') == 'spp' }}>Classic Bluetooth (SPP → /dev/rfcomm0)</option>
+        <option value="ble" {{ 'selected' if radar_cfg.get('bluetooth_kind') == 'ble' }}>Bluetooth LE (HM-10 family → BLE serial lead)</option>
+      </select>
     </label>
     <label>LED board output
       <select name="display_format">
@@ -1012,6 +1042,8 @@ def create_app(cloud=None):
             rd['bluetooth_mac'] = mac
         if request.form.get('display_format') in ('speed', 'raw'):
             rd['display_format'] = request.form.get('display_format')
+        if request.form.get('bluetooth_kind') in ('auto', 'spp', 'ble'):
+            rd['bluetooth_kind'] = request.form.get('bluetooth_kind')
         if request.form.get('smart_coach') in ('auto', 'off'):
             rd['smart_coach'] = request.form.get('smart_coach')
         sc_mac = (request.form.get('smart_coach_mac') or '').strip().upper()

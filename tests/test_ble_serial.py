@@ -1,0 +1,356 @@
+"""The BLE serial bridge: an HM-10-family adapter on the gun, read over
+Bluetooth LE and presented to the radar service as a tty.
+
+Built against a real one — an IRXON brick advertising as VELOBEAM_003
+with service 0xFFE0 and AdvertisingFlags 06 (BLE only, no classic), on
+a Stalker Pro IIs. Nothing about it can become /dev/rfcomm0, and
+nothing about it pairs; it hands its bytes to whoever subscribes.
+"""
+import asyncio
+import os
+import subprocess
+import sys
+
+import pytest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from encoder import ble_serial, radar  # noqa: E402
+
+FRAME = '\x88RD   34A 586         5A 589         9A15650        \r'
+
+
+@pytest.fixture
+def run_dir(tmp_path, monkeypatch):
+    """The bridge publishes its tty under a fixed path; point that at
+    the sandbox for both the bridge and the radar module's view of it."""
+    d = str(tmp_path / 'run')
+    monkeypatch.setattr(ble_serial, 'RUN_DIR', d)
+    monkeypatch.setattr(ble_serial, 'LINK', os.path.join(d, 'radar-ble'))
+    monkeypatch.setattr(radar, 'BLE_LINK', os.path.join(d, 'radar-ble'))
+    return d
+
+
+def _read_slave(path, n, tries=50):
+    """Read up to n bytes off the slave side, non-blocking, patiently."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOCTTY | os.O_NONBLOCK)
+    try:
+        out = b''
+        for _ in range(tries):
+            try:
+                out += os.read(fd, n)
+            except BlockingIOError:
+                pass
+            if len(out) >= n:
+                break
+        return out
+    finally:
+        os.close(fd)
+
+
+# ── recognising the adapter ──────────────────────────────────────────────────
+
+def test_the_hm10_family_service_is_recognised_as_a_serial_bridge():
+    assert ble_serial.looks_like_uart(['0000ffe0-0000-1000-8000-00805f9b34fb'])
+    assert ble_serial.looks_like_uart(['0000FFE0-0000-1000-8000-00805F9B34FB'])
+    assert ble_serial.looks_like_uart(['6e400001-b5a3-f393-e0a9-e50e24dcca9e'])
+    # the Tencent UUID these bricks also carry is not the serial service
+    assert not ble_serial.looks_like_uart(['0000fee7-0000-1000-8000-00805f9b34fb'])
+    assert not ble_serial.looks_like_uart([]) and not ble_serial.looks_like_uart(None)
+
+
+# ── the tty ──────────────────────────────────────────────────────────────────
+
+def test_the_bridge_publishes_a_tty_the_radar_scan_picks_up(run_dir):
+    b = ble_serial.BleSerialBridge(cfg_load=lambda: {})
+    slave = b.ensure_pty()
+    assert os.path.exists(slave)
+    link = os.path.join(run_dir, 'radar-ble')
+    assert os.path.islink(link) and os.path.realpath(link) == slave
+    # radar.py's port scan sees it beside rfcomm, and knows it is a
+    # Bluetooth lead — the same peer-of-the-pin rule as rfcomm applies
+    assert link in radar.find_ports({})
+    assert radar.RadarService._is_bluetooth(link)
+    assert radar.RadarService._stable_path(link)
+    # one pty for the life of the process
+    assert b.ensure_pty() == slave
+
+
+def test_bytes_off_the_air_come_out_of_the_tty_in_order(run_dir):
+    """A fifty-character Stalker frame arrives as three notifications
+    of twenty-odd bytes. The tty carries them through untouched, and
+    the line buffer on the other side puts the frame back together —
+    exactly what happens to a cable that delivers a frame a byte at a
+    time."""
+    b = ble_serial.BleSerialBridge(cfg_load=lambda: {})
+    slave = b.ensure_pty()
+    raw = FRAME.encode('latin-1')
+    pieces = [raw[i:i + 20] for i in range(0, len(raw), 20)]
+    assert len(pieces) == 3
+    for piece in pieces:
+        b.feed(piece)
+    got = _read_slave(slave, len(raw))
+    assert got == raw
+    assert b.notifies == 3 and b.bytes_in == len(raw)
+    assert b.health()['heard_s'] is not None
+    # …and it parses as the gun frame it is, spin included
+    from tests.test_radar import _FakeLink
+    svc = radar.RadarService(_FakeLink())
+    svc.handle_line(got.decode('ascii', 'replace').rstrip('\r'))
+    assert svc.frames_parsed == 1
+
+
+def test_feeding_nothing_or_before_the_pty_exists_is_harmless(run_dir):
+    b = ble_serial.BleSerialBridge(cfg_load=lambda: {})
+    assert b.feed(b'') == 0 and b.feed(None) == 0
+    assert b.feed(b'x') == 0            # no pty yet: dropped, no error
+    assert b.notifies == 0
+
+
+# ── the BLE loop, against a fake bleak ───────────────────────────────────────
+
+class _Adv:
+    def __init__(self, uuids):
+        self.service_uuids = uuids
+
+
+class _Dev:
+    def __init__(self, address, name):
+        self.address, self.name = address, name
+
+
+class _Char:
+    def __init__(self, uuid, props):
+        self.uuid, self.properties = uuid, props
+
+
+class _Svc:
+    def __init__(self, uuid, chars):
+        self.uuid, self.characteristics = uuid, chars
+
+
+def _fake_bleak(devs, notify_payloads, fail_connect=None):
+    """A bleak that finds `devs` ({mac: (dev, adv)}), whose client
+    offers one FFE1 notify characteristic, and which fires
+    `notify_payloads` at the callback once subscribed."""
+    state = {'subscribed': [], 'connects': 0}
+
+    class Scanner:
+        @staticmethod
+        async def discover(timeout=0, return_adv=False):
+            return devs
+
+    class Client:
+        def __init__(self, dev):
+            self.dev = dev
+            self.is_connected = False
+            self.services = [_Svc('0000ffe0-0000-1000-8000-00805f9b34fb', [
+                _Char('0000ffe1-0000-1000-8000-00805f9b34fb',
+                      ['read', 'write-without-response', 'notify'])])]
+
+        async def __aenter__(self):
+            state['connects'] += 1
+            if fail_connect:
+                raise fail_connect
+            self.is_connected = True
+            return self
+
+        async def __aexit__(self, *a):
+            self.is_connected = False
+
+        async def start_notify(self, ch, cb):
+            state['subscribed'].append(str(ch.uuid))
+            for p in notify_payloads:
+                cb(None, p)
+            # then the adapter goes quiet and drops, as between innings
+            self.is_connected = False
+
+    class Bleak:
+        BleakScanner = Scanner
+        BleakClient = Client
+    return Bleak, state
+
+
+def _drive(bridge, bleak, ticks=6):
+    """Run the loop for a bounded number of sleeps."""
+    sleeps = {'n': 0}
+
+    async def fake_sleep(s):
+        sleeps['n'] += 1
+        if sleeps['n'] >= ticks:
+            bridge.running = False
+    real = asyncio.sleep
+    asyncio.sleep = fake_sleep
+    try:
+        asyncio.run(bridge._run(bleak))
+    finally:
+        asyncio.sleep = real
+
+
+def test_a_found_adapter_is_subscribed_fed_through_and_learned(run_dir):
+    """The whole path: scan finds the MAC with the serial service,
+    connect, subscribe to what notifies, bytes reach the tty, and the
+    kind is written to config so the rfcomm binder stands down."""
+    cfg = {'radar': {'bluetooth_mac': '88:0a:98:19:08:16'}}
+    saved = {}
+    dev = _Dev('88:0A:98:19:08:16', 'VELOBEAM_003')
+    bleak, state = _fake_bleak(
+        {'88:0A:98:19:08:16': (dev, _Adv(
+            ['0000fee7-0000-1000-8000-00805f9b34fb',
+             '0000ffe0-0000-1000-8000-00805f9b34fb']))},
+        [FRAME[:20].encode('latin-1'), FRAME[20:40].encode('latin-1'),
+         FRAME[40:].encode('latin-1')])
+    b = ble_serial.BleSerialBridge(cfg_load=lambda: cfg,
+                                   cfg_save=lambda c: saved.update(c))
+    _drive(b, bleak)
+    assert state['connects'] >= 1
+    # the fake adapter drops after each delivery and the bridge comes
+    # back every time, so the same characteristic is subscribed once
+    # per connection — reconnecting IS the behaviour
+    assert set(state['subscribed']) == {'0000ffe1-0000-1000-8000-00805f9b34fb'}
+    assert len(state['subscribed']) == state['connects']
+    assert b.device_name == 'VELOBEAM_003'
+    assert b.bytes_in >= len(FRAME)
+    assert _read_slave(b.slave_path, len(FRAME)) == FRAME.encode('latin-1')
+    # learned: the binder reads this and stops trying rfcomm
+    assert saved['radar']['bluetooth_kind'] == 'ble'
+    assert b.health()['chars'] == ['0000ffe1-0000-1000-8000-00805f9b34fb']
+
+
+def test_a_mac_that_never_appears_in_a_ble_scan_is_left_to_the_binder(run_dir):
+    """A classic adapter (a BT578) is invisible to a BLE scan. The bridge
+    must not claim it, not open a pty for it, and not write anything —
+    that one is rfcomm's."""
+    cfg = {'radar': {'bluetooth_mac': 'AA:BB:CC:DD:EE:FF'}}
+    saved = {}
+    bleak, state = _fake_bleak({}, [])
+    b = ble_serial.BleSerialBridge(cfg_load=lambda: cfg,
+                                   cfg_save=lambda c: saved.update(c))
+    _drive(b, bleak, ticks=3)
+    assert state['connects'] == 0
+    assert b.master is None and saved == {}
+    assert not os.path.exists(os.path.join(run_dir, 'radar-ble'))
+
+
+def test_kind_spp_switches_the_bridge_off_entirely(run_dir):
+    cfg = {'radar': {'bluetooth_mac': '88:0A:98:19:08:16',
+                     'bluetooth_kind': 'spp'}}
+    dev = _Dev('88:0A:98:19:08:16', 'VELOBEAM_003')
+    bleak, state = _fake_bleak({'88:0A:98:19:08:16': (dev, _Adv([]))}, [])
+    b = ble_serial.BleSerialBridge(cfg_load=lambda: cfg)
+    _drive(b, bleak, ticks=3)
+    assert state['connects'] == 0 and b.master is None
+
+
+def test_a_dropped_link_is_reported_and_retried(run_dir):
+    cfg = {'radar': {'bluetooth_mac': '88:0A:98:19:08:16'}}
+    dev = _Dev('88:0A:98:19:08:16', 'VELOBEAM_003')
+    bleak, state = _fake_bleak(
+        {'88:0A:98:19:08:16': (dev, _Adv(
+            ['0000ffe0-0000-1000-8000-00805f9b34fb']))},
+        [], fail_connect=OSError('Device disconnected'))
+    b = ble_serial.BleSerialBridge(cfg_load=lambda: cfg, cfg_save=lambda c: None)
+    _drive(b, bleak, ticks=5)
+    assert state['connects'] >= 2                  # it keeps trying
+    assert b.connected is False
+    assert 'Device disconnected' in b.health()['connect_error']
+
+
+def test_without_bleak_the_bridge_says_so_and_stands_aside(run_dir, monkeypatch):
+    import builtins
+    real_import = builtins.__import__
+
+    def no_bleak(name, *a, **k):
+        if name == 'bleak':
+            raise ImportError('no bleak')
+        return real_import(name, *a, **k)
+    monkeypatch.setattr(builtins, '__import__', no_bleak)
+    b = ble_serial.BleSerialBridge(cfg_load=lambda: {})
+    b.loop()
+    assert b.have_bleak is False and b.health()['bleak'] is False
+
+
+# ── the rfcomm binder stands down for BLE ────────────────────────────────────
+
+def test_the_binder_stands_down_for_a_ble_adapter(tmp_path):
+    script = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), 'scripts', 'radar_bt_bind.sh')
+    (tmp_path / 'config.json').write_text(
+        '{"radar": {"bluetooth_mac": "88:0A:98:19:08:16", '
+        '"bluetooth_kind": "ble"}}')
+    r = subprocess.run(['bash', script], capture_output=True, text=True,
+                       env={**os.environ, 'PLAYCALL_ENCODER_DIR': str(tmp_path)})
+    assert r.returncode == 0
+    assert 'BLE adapter' in r.stdout and 'no rfcomm' in r.stdout
+    # and with no MAC at all, the same quiet exit as before
+    (tmp_path / 'config.json').write_text('{"radar": {}}')
+    r = subprocess.run(['bash', script], capture_output=True, text=True,
+                       env={**os.environ, 'PLAYCALL_ENCODER_DIR': str(tmp_path)})
+    assert r.returncode == 0 and 'nothing to bind' in r.stdout
+
+
+# ── the radar service treats the lead as the Bluetooth peer it is ────────────
+
+def test_the_gun_on_the_ble_lead_is_followed_without_touching_the_usb_pin(
+        run_dir, monkeypatch):
+    """Same three-lead rule as rfcomm: the USB cable pinned, the board
+    pinned, and the BLE lead talking — the claim follows the gun and
+    the pin stays the cable's."""
+    import types
+    from tests.test_radar import _FakePort, _FakeLink, FIELD_LIVE, FIELD_SPIN
+    link = os.path.join(run_dir, 'radar-ble')
+    usb_gun = '/dev/serial/by-id/usb-FTDI_GUN-if00-port0'
+    usb_board = '/dev/serial/by-id/usb-FTDI_BOARD-if00-port0'
+    burst = (FIELD_LIVE + '\r' + FIELD_LIVE + '\r' + FIELD_LIVE + '\r'
+             + FIELD_SPIN + '\r').encode()
+    _FakePort.SCRIPT = {usb_gun: [], usb_board: [], link: [burst]}
+    _FakePort.OPEN = {}
+    monkeypatch.setitem(sys.modules, 'serial',
+                        types.SimpleNamespace(Serial=_FakePort))
+    monkeypatch.setattr(radar, 'find_ports',
+                        lambda c=None: [usb_gun, usb_board, link])
+    real_exists = radar.os.path.exists
+    monkeypatch.setattr(radar.os.path, 'exists',
+                        lambda q: q in (usb_gun, usb_board, link)
+                        or real_exists(q))
+    cfg = {'radar': {'port': usb_gun, 'display_port': usb_board,
+                     'bluetooth_mac': '88:0A:98:19:08:16'}}
+    saved = {}
+    svc = radar.RadarService(_FakeLink(), cfg_load=lambda: cfg,
+                             cfg_save=lambda c: saved.update(c))
+    sleeps = {'n': 0}
+
+    def _sleep(s):
+        sleeps['n'] += 1
+        if sleeps['n'] > 3:
+            svc.running = False
+    monkeypatch.setattr(radar.time, 'sleep', _sleep)
+    svc.loop()
+    assert svc.port == link
+    assert svc.health()['bluetooth'] is True
+    assert svc.pin_overridden is False and saved == {}
+    assert cfg['radar']['port'] == usb_gun
+    assert _FakePort.OPEN[usb_board].written        # the board still fed
+
+
+def test_the_tty_is_raw_from_birth(run_dir):
+    """Cooked mode turned \\r into \\n, echoed bytes at the master, held
+    them until a newline, and would read a 0x03 as Ctrl-C. A byte is
+    either what the gun sent or it is worthless."""
+    import termios
+    b = ble_serial.BleSerialBridge(cfg_load=lambda: {})
+    slave = b.ensure_pty()
+    fd = os.open(slave, os.O_RDONLY | os.O_NOCTTY | os.O_NONBLOCK)
+    try:
+        iflag, oflag, cflag, lflag, *_ = termios.tcgetattr(fd)
+    finally:
+        os.close(fd)
+    assert not (iflag & termios.ICRNL)        # \\r stays \\r
+    assert not (lflag & termios.ECHO)         # nothing bounced back
+    assert not (lflag & termios.ICANON)       # bytes flow as they come
+    assert not (lflag & termios.ISIG)         # 0x03 is data, not a signal
+    # and the master cannot park the radio loop
+    assert not os.get_blocking(b.master)
+    # a control byte and a bare carriage return come through intact
+    b.feed(b'\x03\r\x88')
+    assert _read_slave(slave, 3) == b'\x03\r\x88'

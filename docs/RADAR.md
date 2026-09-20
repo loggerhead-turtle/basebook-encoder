@@ -115,13 +115,32 @@ One-time pairing, then it is automatic for ever.
 bluetoothctl --agent
 ```
 
-then inside that prompt:
+then inside that prompt, scan for **classic** Bluetooth only — the
+adapter is classic (SPP), and a plain `scan on` buries it under every
+Bluetooth LE gadget in the house, hundreds of lines of signal-strength
+updates with the one you want somewhere in the middle:
 
 ```
+menu scan
+transport bredr
+back
 scan on
 ```
 
-Wait for your adapter to appear, note its MAC, then:
+Give it twenty seconds, then `scan off` and `devices`. The adapter is
+one of a handful of lines, named or not; `info <mac>` shows a `Class:`
+line for a classic device and a name once it has resolved.
+
+**A Stalker Pro IIs advertises its own Bluetooth** as `Stalker Pro IIs
+NNNN` — that is the gun's built-in radio, not your adapter, and it is
+BLE. Ignore it here; it is not the thing being paired.
+
+If the adapter is not in the list, it is not in pairing mode: power it
+off and on (unplug it from the gun for five seconds), and if it still
+does not appear, try the other position of its slide switch — on some
+bricks that switch is a master/slave role selector, and in master mode
+the adapter hunts for something to connect to rather than waiting to be
+paired. Note its MAC, then:
 
 ```
 pair AA:BB:CC:DD:EE:FF
@@ -150,8 +169,25 @@ You want `bound /dev/rfcomm0 -> AA:BB:CC:DD:EE:FF`. The binder runs at
 every boot, before the radar service scans, and exits quietly on boxes
 with no MAC configured.
 
-**4. Point the gun at it** (optional). `/dev/rfcomm0` is discovered
-automatically, but you can pin it like any other port:
+**4. That is all. Leave `radar.port` alone.** A box that runs the gun
+on its USB cable some games and over Bluetooth on others keeps the USB
+pin exactly as it is: `/dev/rfcomm0` is a **peer** of the pin, not a
+correction of it. The box opens the pinned cable, the pinned board and
+the Bluetooth lead all at once and follows the gun to whichever is
+talking — quietly, rewriting nothing, flagging nothing. Cable one
+night, Bluetooth the next, no config change in between. (It used to
+rewrite `radar.port` to `/dev/rfcomm0` the first time the gun spoke
+over Bluetooth and nag that the pin was wrong, then write it back the
+next cable game.) The LED board stays on its own pin throughout.
+
+A plain-format gun (bare numbers, no RD tags) is found over Bluetooth
+too, after thirty lines; on a spare USB port bare numbers are still
+ignored, because there they could be the board echoing what the box
+wrote. Nothing is ever written to rfcomm, so on Bluetooth that echo
+cannot happen.
+
+If you never use the cable, you can pin the Bluetooth lead like any
+other port, but there is no need:
 
 ```json
 "radar": { "port": "/dev/rfcomm0" }
@@ -181,6 +217,41 @@ male and female serial heads and Type-C for power.
 * Battery bricks sleep: if readings stop between innings and resume on
   the next trigger pull, the module's power saving is dozing — keep it
   on Type-C power at the gun end.
+
+### The IRXON RS-232 adapter — and any BLE serial brick
+
+The second brick this has been used with: an IRXON RS-232↔Bluetooth
+adapter with a male DB9 that plugs straight into the gun's jack, two
+status LEDs and a small two-position slide switch by the connector.
+The one in the field advertises as `VELOBEAM_003`.
+
+* **It is Bluetooth LE, not classic.** `bluetoothctl info` shows
+  `AdvertisingFlags: 06` (LE only) and service `0000ffe0`, the HM-10
+  family's transparent-UART service. So there is **no SPP to bind**:
+  `rfcomm` can never turn it into `/dev/rfcomm0`, and there is **no
+  pairing** — `pair` does nothing, and nothing needs it. It hands its
+  bytes to whoever subscribes.
+* **The box reads it with the BLE serial bridge** (`encoder/
+  ble_serial.py`), which subscribes over BLE and presents the bytes as
+  a tty at `/run/playcall-encoder/radar-ble`. The radar service opens
+  that beside the USB leads and treats it exactly like a cable —
+  claim, parse, spin, LED board, all unchanged. Set
+  `radar.bluetooth_mac` and nothing else: `radar.bluetooth_kind` is
+  `auto`, the bridge finds the MAC in a BLE scan, and on its first
+  connection writes `bluetooth_kind: ble` so the rfcomm binder stands
+  down on every boot after. A classic adapter never appears in a BLE
+  scan and is left to the binder as before.
+* **The slide switch is a TX/RX crossover.** If the bridge is up
+  (bytes received climbing on the settings page) and the gun is silent,
+  flip it and pull the trigger again. First thing to try.
+* **Its UART rate is a setting** and must equal the gun's. Same trap as
+  the BT578: connected, delivering perfect garbage. The leaflet gives
+  the default (commonly 9600) and how it is changed; the gun, the
+  adapter and `radar.baud` want the same number.
+* **Blue LED**: blinking = advertising, solid = a client is subscribed.
+  Solid after the encoder boots is the bridge holding it.
+* It draws power from the gun's port; dark LEDs with the gun on mean
+  that port is not feeding it.
 
 ### Bluetooth notes worth knowing
 

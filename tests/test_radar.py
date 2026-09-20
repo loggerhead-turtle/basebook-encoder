@@ -1131,3 +1131,139 @@ def test_measuring_the_rolldown_changes_no_verdict():
     eng = BurstEngine()
     ev = _run(eng, [_live(45.0, peak=45.0) for _ in range(6)])
     assert ev['kind'] == 'pitch' and ev['roll'] == 1.0
+
+
+# ── Bluetooth is a peer of the USB pin, not a correction of it ───────────────
+
+def _three_lead_loop(monkeypatch, script, cfg, passes=3):
+    """The field topology: the gun's USB cable pinned as radar.port, the
+    LED board pinned as display_port, and /dev/rfcomm0 bound to the
+    gun's Bluetooth adapter — all three present at once."""
+    import sys
+    import types
+    from encoder import radar as radar_mod
+    _FakePort.SCRIPT = script
+    _FakePort.OPEN = {}
+    monkeypatch.setitem(sys.modules, 'serial',
+                        types.SimpleNamespace(Serial=_FakePort))
+    monkeypatch.setattr(radar_mod, 'find_ports',
+                        lambda c=None: list(script))
+    # the pins are checked against the filesystem; these leads "exist"
+    real_exists = radar_mod.os.path.exists
+    monkeypatch.setattr(radar_mod.os.path, 'exists',
+                        lambda q: q in script or real_exists(q))
+    saved = {}
+    svc = RadarService(_FakeLink(), cfg_load=lambda: cfg,
+                       cfg_save=lambda c: saved.update(c))
+    sleeps = {'n': 0}
+
+    def _sleep(s):
+        sleeps['n'] += 1
+        if sleeps['n'] > passes:
+            svc.running = False
+    monkeypatch.setattr(radar_mod.time, 'sleep', _sleep)
+    svc.loop()
+    return svc, saved
+
+
+USB_GUN = '/dev/serial/by-id/usb-FTDI_USB_Serial_Converter_GUN-if00-port0'
+USB_BOARD = '/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_BOARD-if00-port0'
+BT = '/dev/rfcomm0'
+RD_BURST = (FIELD_LIVE + '\r' + FIELD_LIVE + '\r' + FIELD_LIVE + '\r'
+            + FIELD_SPIN + '\r').encode()
+
+
+def test_the_gun_on_bluetooth_is_followed_without_touching_the_usb_pin(
+        monkeypatch):
+    """A box that runs the gun on its cable some games and over Bluetooth
+    on others. Both USB adapters stay plugged in; the gun talks on
+    rfcomm0. The claim must follow the gun — and the USB pin must stay
+    exactly as the owner set it, with no 'wrong pin' flag, because
+    nothing about this is a wrong pin. It used to rewrite radar.port to
+    /dev/rfcomm0 and nag, then rewrite it back the next cable game."""
+    cfg = {'radar': {'port': USB_GUN, 'display_port': USB_BOARD,
+                     'bluetooth_mac': '88:0A:98:19:08:16'}}
+    svc, saved = _three_lead_loop(monkeypatch, {
+        USB_GUN: [],                      # cable plugged in, gun not on it
+        USB_BOARD: [],
+        BT: [RD_BURST],
+    }, cfg)
+    assert svc.port == BT                          # followed the gun
+    assert svc.health()['bluetooth'] is True
+    assert svc.pin_overridden is False             # not a wrong pin
+    assert saved == {}                             # config untouched
+    assert cfg['radar']['port'] == USB_GUN         # the pin is the cable's
+    # and the board on its own USB pin is still driven
+    board = _FakePort.OPEN[USB_BOARD]
+    assert board.written and all(b' 58.9' in w for w in board.written)
+
+
+def test_the_gun_back_on_its_cable_is_followed_home_just_as_quietly(
+        monkeypatch):
+    """Next game, the cable. The claim returns to the pin the moment the
+    cable talks — silently, nothing rewritten, no flag."""
+    cfg = {'radar': {'port': USB_GUN, 'display_port': USB_BOARD}}
+    import sys
+    import types
+    from encoder import radar as radar_mod
+    # Bluetooth talks first (so the claim is there), then the cable. A
+    # blank line is a chunk the fake port can hand over and the loop
+    # then ignores — an EMPTY chunk would never be popped at all.
+    _FakePort.SCRIPT = {USB_GUN: [b'\r', RD_BURST], USB_BOARD: [],
+                        BT: [RD_BURST, b'\r']}
+    _FakePort.OPEN = {}
+    monkeypatch.setitem(sys.modules, 'serial',
+                        types.SimpleNamespace(Serial=_FakePort))
+    monkeypatch.setattr(radar_mod, 'find_ports',
+                        lambda c=None: [USB_GUN, USB_BOARD, BT])
+    real_exists = radar_mod.os.path.exists
+    monkeypatch.setattr(radar_mod.os.path, 'exists',
+                        lambda q: q in (USB_GUN, USB_BOARD, BT)
+                        or real_exists(q))
+    saved = {}
+    svc = RadarService(_FakeLink(), cfg_load=lambda: cfg,
+                       cfg_save=lambda c: saved.update(c))
+    sleeps = {'n': 0}
+
+    def _sleep(s):
+        sleeps['n'] += 1
+        if sleeps['n'] > 4:
+            svc.running = False
+    monkeypatch.setattr(radar_mod.time, 'sleep', _sleep)
+    svc.loop()
+    assert svc.port == USB_GUN
+    assert svc.health()['bluetooth'] is False
+    assert svc.pin_overridden is False
+    assert saved == {}
+
+
+def test_a_plain_format_gun_on_bluetooth_can_take_a_silent_cable(
+        monkeypatch):
+    """Bare numbers are weak evidence on a USB port — a board can echo
+    what we wrote — so they never take a claim there. On rfcomm they
+    can: nothing is ever written to it, so an echo is impossible, and a
+    gun set to plain output still gets found over Bluetooth."""
+    # streamed a few at a time, as a gun does — one forty-line drain is
+    # what the loop rightly treats as a stale backlog and trims to five
+    plain = [('\r'.join(['78.2'] * 10) + '\r').encode()] * 4
+    cfg = {'radar': {'port': USB_GUN, 'display_port': USB_BOARD}}
+    svc, saved = _three_lead_loop(monkeypatch, {
+        USB_GUN: [], USB_BOARD: [], BT: plain}, cfg, passes=6)
+    assert svc.port == BT
+    assert saved == {}
+    # the same stream on a spare USB port is still ignored (echo rule)
+    spare = '/dev/serial/by-id/usb-FTDI_SPARE-if00-port0'
+    svc2, _ = _three_lead_loop(monkeypatch, {
+        USB_GUN: [], USB_BOARD: [], spare: plain}, cfg, passes=6)
+    assert svc2.port == USB_GUN
+
+
+def test_a_genuinely_wrong_usb_pin_is_still_corrected(monkeypatch):
+    """The Bluetooth exemption must not have blunted the real fix: two
+    cables on swapped adapters is still learned and written."""
+    cfg = {'radar': {'port': USB_BOARD, 'display_port': USB_GUN}}
+    svc, saved = _three_lead_loop(monkeypatch, {
+        USB_BOARD: [], USB_GUN: [RD_BURST]}, cfg)
+    assert svc.port == USB_GUN
+    assert saved['radar']['port'] == USB_GUN
+    assert saved['radar']['display_port'] == USB_BOARD
