@@ -719,3 +719,53 @@ def test_no_audio_bitstream_filter_on_the_https_road():
     # and the flag that forces the question is still the one in use
     cmd = live_push.build_ffmpeg_cmd(cfg, 'hevc', 'aac')
     assert '+empty_moov' in cmd[cmd.index('-movflags') + 1]
+
+
+def test_a_silent_start_is_asked_again_and_sound_restarts_the_push(monkeypatch):
+    """20 Sep 2026: the box probed three seconds of a quiet field before
+    the first pitch, judged the track silent, and shipped the whole game
+    without sound. A push running video-only for THAT reason asks the
+    camera again every AUDIO_RECHECK_S; sound is a reason to end the
+    push so the next one carries the track. A track kept at the start
+    is never re-judged, and a track that is still silent is left alone."""
+    cfg = {'local_ingest_key': 'k'}
+    listing = json.dumps({'streams': [{'codec_type': 'video', 'codec_name': 'h264'},
+                                      {'codec_type': 'audio', 'codec_name': 'aac'}]})
+
+    def runner(cmd, timeout=None):
+        if '-read_intervals' in cmd:
+            runner.asked += 1
+            return type('R', (), {'returncode': 0, 'stdout': runner.audio})()
+        return type('R', (), {'returncode': 0, 'stdout': listing})()
+    runner.asked = 0
+    runner.audio = '6\n' * 100                            # silence at first pitch
+    p = live_push.LivePusher(cfg_load=lambda: cfg, runner=runner)
+    assert p._probe(cfg) == ('h264', '') and p.audio_verdict == 'silent'
+    p._cfg = cfg
+    p._audio_next_t = 0                                   # a minute has passed
+    p._audio_recheck()                                    # still silent: carry on
+    assert runner.asked == 2
+    p._audio_next_t = 0
+    runner.audio = '340\n338\n341\n'                      # the crowd arrives
+    with pytest.raises(RuntimeError, match='sound arrived'):
+        p._audio_recheck()
+    # …and the next probe keeps the track
+    assert p._probe(cfg) == ('h264', 'aac') and p.audio_verdict == 'ok'
+    # a kept track is never re-judged, whatever the camera does later
+    runner.audio = '6\n' * 100
+    p._audio_next_t = 0
+    asked = runner.asked
+    p._audio_recheck()
+    assert runner.asked == asked
+    # the gate: no second question inside AUDIO_RECHECK_S
+    p.audio_verdict = 'silent'
+    p._audio_next_t = time.monotonic() + 30
+    p._audio_recheck()
+    assert runner.asked == asked
+    # a probe that cannot ask (ffprobe failed) is 'unknown' and keeps audio
+    def broken(cmd, timeout=None):
+        if '-read_intervals' in cmd:
+            return type('R', (), {'returncode': 1, 'stdout': ''})()
+        return type('R', (), {'returncode': 0, 'stdout': listing})()
+    q = live_push.LivePusher(cfg_load=lambda: cfg, runner=broken)
+    assert q._probe(cfg) == ('h264', 'aac') and q.audio_verdict == 'unknown'

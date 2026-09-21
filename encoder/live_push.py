@@ -88,6 +88,12 @@ SRT_COOLDOWN_S = 600
 # three hundred and up. Anywhere in between is safe, and the gap is wide
 # enough that no real recording lands near it.
 SILENT_FRAME_BYTES = 24
+# A track judged silent at the start of a push is asked again this often
+# while the push runs video-only. 20 Sep 2026: the box probed three
+# seconds of a quiet field before the first pitch, shipped the whole game
+# without sound, and the Watch page said 'audio -' all evening. Sound
+# arriving is a reason to restart the push WITH the track, once.
+AUDIO_RECHECK_S = 60
 
 
 _ANGLE_OK = 'abcdefghijklmnopqrstuvwxyz0123456789-_'
@@ -132,7 +138,7 @@ def read_target(path=None):
     return t
 
 
-def probe_codecs(cfg, runner=None):
+def probe_codecs(cfg, runner=None, verdict=None):
     """(video, audio) codecs of whatever is publishing right now, or two
     empty strings when nobody is — which is how this leg knows to wait.
 
@@ -161,6 +167,10 @@ def probe_codecs(cfg, runner=None):
             vcodec = st.get('codec_name') or ''
         elif st.get('codec_type') == 'audio' and not acodec:
             acodec = st.get('codec_name') or ''
+    # what became of the audio, for the caller that may ask again:
+    # absent | unknown | empty | silent | ok
+    if isinstance(verdict, dict):
+        verdict['audio'] = 'ok' if acodec else 'absent'
     if acodec:
         # DECLARED is not the same as USABLE, and the difference is fatal
         # downstream. mimoLive announces a 48 kHz stereo AAC track and
@@ -175,18 +185,34 @@ def probe_codecs(cfg, runner=None):
         # as five different faults, none of them this one.
         sizes = _audio_frame_sizes(cfg, runner)
         if sizes is None:
-            pass                 # could not ask → keep it, see below
+            if isinstance(verdict, dict):
+                verdict['audio'] = 'unknown'
         elif not sizes:
             log.info('audio track is declared but carries no samples — '
                      'dropping it rather than shipping a track that can '
                      'never fill')
             acodec = ''
+            if isinstance(verdict, dict):
+                verdict['audio'] = 'empty'
         elif _median(sizes) < SILENT_FRAME_BYTES:
             log.info('audio track carries only silence frames (median '
                      f'{_median(sizes)} bytes) — dropping it rather than '
-                     'shipping a track that can never fill')
+                     'shipping a track that can never fill; asking again '
+                     f'every {AUDIO_RECHECK_S} s')
             acodec = ''
+            if isinstance(verdict, dict):
+                verdict['audio'] = 'silent'
     return vcodec, acodec
+
+
+def audio_has_sound(cfg, runner=None):
+    """True when the camera's audio track now carries real frames, False
+    when it is still silence or empty, None when the question could not
+    be asked."""
+    sizes = _audio_frame_sizes(cfg, runner or system.run)
+    if sizes is None:
+        return None
+    return bool(sizes) and _median(sizes) >= SILENT_FRAME_BYTES
 
 
 def _median(sizes):
@@ -356,6 +382,9 @@ class LivePusher:
         self.cfg_load = cfg_load
         self.runner = runner or system.run
         self.status = status or StatusWriter()
+        self.audio_verdict = 'absent'
+        self._cfg = {}
+        self._audio_next_t = 0.0
         self.http = http or self._http
         self.running = True
         self.proc = None
@@ -452,6 +481,8 @@ class LivePusher:
         if not vcodec:
             self.status.write(False, reason='no camera publishing')
             return 0
+        self._cfg = cfg
+        self._audio_next_t = time.monotonic() + AUDIO_RECHECK_S
 
         mode = self.transport(cfg)
         if mode != 'https':
@@ -503,6 +534,7 @@ class LivePusher:
                 raise RuntimeError(f'ffmpeg exited ({rc})')
             if _changed(target, read_target()):
                 raise RuntimeError('assignment changed')
+            self._audio_recheck()
             total = int(self.progress.get('total_size') or 0)
             if total > sent:
                 now = time.monotonic()
@@ -511,7 +543,7 @@ class LivePusher:
                 while window and window[0][0] < now - 10:
                     window.popleft()
             self.status.write(True, transport='srt', kbps=_kbps(window),
-                              bytes=sent, backlog_ms=0,
+                              bytes=sent, backlog_ms=0, audio=self.audio_verdict,
                               angle=target['angle'], game=target['game'],
                               session=self.session, dropped=0,
                               srt_port=ticket.get('port'),
@@ -580,7 +612,27 @@ class LivePusher:
         self.status.write(False)
 
     def _probe(self, cfg):
-        return probe_codecs(cfg, self.runner)
+        verdict = {}
+        out = probe_codecs(cfg, self.runner, verdict)
+        self.audio_verdict = verdict.get('audio', 'absent')
+        return out
+
+    def _audio_recheck(self):
+        """While a push runs video-only because the track was silent at
+        the start, ask the camera again every AUDIO_RECHECK_S; sound is a
+        reason to end this push so the next one carries the track. A
+        track kept at the start is never re-judged — a quiet inning is
+        not a reason to drop sound."""
+        if getattr(self, 'audio_verdict', '') != 'silent':
+            return
+        now = time.monotonic()
+        if now < getattr(self, '_audio_next_t', 0):
+            return
+        self._audio_next_t = now + AUDIO_RECHECK_S
+        if audio_has_sound(self._cfg, self.runner):
+            log.info('sound has arrived on the camera\'s audio track — '
+                     'restarting the push with it')
+            raise RuntimeError('sound arrived — restarting with audio')
 
     def _drain_stderr(self):
         for line in self.proc.stderr:
@@ -612,6 +664,7 @@ class LivePusher:
         sent = 0
         window = deque()             # (monotonic, bytes) for the kbps figure
         while self.running:
+            self._audio_recheck()
             item = outbox.get()
             if item is None:
                 if outbox.closed and self.proc.poll() is not None:
