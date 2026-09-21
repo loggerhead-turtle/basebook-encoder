@@ -74,6 +74,12 @@ SCAN_S = 8.0
 SCAN_LOCK = threading.Lock()
 RESCAN_IDLE_S = 15
 RECONNECT_S = 3
+# A radar that is not there is not news every pass. 20 Sep 2026: a box
+# with no Pocket Radar in range wrote four lines every twenty seconds —
+# the whole of the 20-line log tail the site shows was the search, and
+# a stream fault would have scrolled off it in a minute. Each state is
+# said once when it changes; the search is summed up every SUMMARY_PASSES.
+SUMMARY_PASSES = 30
 
 
 def looks_like_uart(uuids):
@@ -110,6 +116,7 @@ class BleSerialBridge:
         self.rfcomm_released = False
         self._direct_logged = False
         self._misses = 0
+        self._chatter = {}                  # key → last text said out loud
         self._disconnect_next_t = 0.0
         self.scan_note = ''
         self.last_scan_t = None
@@ -262,19 +269,38 @@ class BleSerialBridge:
         except Exception as e:
             log.warning(f'could not persist bluetooth_kind ({e})')
 
-    def _note(self, text):
+    def _note(self, text, key=None):
         """One line in the journal per CHANGE of what the bridge sees —
         never per pass, never silence. The night of 19 Sep 2026 the
         bridge had four ways to wait without a word (scan failed, scan
         hung, MAC not seen, bluetoothctl timed out) and took one of
         them for an hour while the log showed nothing but the radar
         loop's USB warnings. The same text is also what the settings
-        page shows under the byte count."""
+        page shows under the byte count. `key` is what counts as a
+        change when the text carries a number that moves every pass (how
+        many devices a scan saw): the page gets the fresh text, the
+        journal only a new verdict."""
         self.scan_note = text
         self.last_scan_t = time.monotonic()
-        if text != self._last_note:
-            self._last_note = text
+        if (key or text) != self._last_note:
+            self._last_note = key or text
             log.info(f'BLE serial: {text}')
+
+    def _say(self, key, text, warn=False):
+        """A per-pass line of the reconnect loop: at INFO (WARNING) the
+        first time and whenever its text changes, at DEBUG while it
+        repeats — and every SUMMARY_PASSES passes one line that sums the
+        search up, so a box hunting a radar all evening says so once in
+        a while rather than four times a minute."""
+        if self._chatter.get(key) != text:
+            self._chatter[key] = text
+            (log.warning if warn else log.info)(text)
+        else:
+            log.debug(text)
+        if key == 'drop' and self._misses \
+                and self._misses % SUMMARY_PASSES == 0:
+            log.info(f'BLE serial: still looking for the radar — '
+                     f'{self._misses} passes so far; last: {text}')
 
     async def _scan(self, bleak):
         """One LE scan, bounded: bleak's discover() has been seen to
@@ -485,12 +511,13 @@ class BleSerialBridge:
                 # is left alone: that is a classic adapter, the binder's.
                 self._misses += 1
                 bz = self._bluez_info(mac)
+                verdict = ('holds it connected' if bz['connected'] else
+                           'knows it as an LE device' if bz['le'] else
+                           'knows it (not as LE)' if bz['known'] else
+                           'has never seen it')
                 self._note(f'scan saw {seen} device(s); {mac} not among '
-                           'them — BlueZ '
-                           + ('holds it connected' if bz['connected'] else
-                              'knows it as an LE device' if bz['le'] else
-                              'knows it (not as LE)' if bz['known'] else
-                              'has never seen it'))
+                           f'them — BlueZ {verdict}',
+                           key=f'miss:{mac}:{verdict}')
                 if bz['connected']:
                     # Held by BlueZ from a previous run of this process:
                     # the LED solid blue, nobody reading, and nothing
@@ -504,8 +531,8 @@ class BleSerialBridge:
                         await asyncio.sleep(2)
                         continue
                 if kind == 'ble' or self.learned_kind or bz['le']:
-                    log.info(f'{mac} not advertising — connecting by '
-                             f'address (pass {self._misses})')
+                    self._say('byaddr', f'{mac} not advertising — connecting '
+                                        'by address')
                     hit = (mac, None)
                 else:
                     self.connected = False
@@ -524,8 +551,8 @@ class BleSerialBridge:
             self.device_name = (getattr(dev, 'name', None) or None
                                 if not isinstance(dev, str) else self.device_name)
             self.ensure_pty()
-            log.info(f'BLE serial adapter found: {self.device_name or "?"} '
-                     f'[{mac}] — connecting')
+            self._say('found', f'BLE serial adapter found: '
+                               f'{self.device_name or "?"} [{mac}] — connecting')
             try:
                 client_cm = bleak.BleakClient(dev)
                 if isinstance(dev, str):
@@ -575,8 +602,8 @@ class BleSerialBridge:
                         pass
             except Exception as e:
                 self.connect_error = str(e) or e.__class__.__name__
-                log.warning(f'BLE serial lead dropped ({self.connect_error}) '
-                            '— reconnecting')
+                self._say('drop', f'BLE serial lead dropped ({self.connect_error}) '
+                                  '— reconnecting', warn=True)
             self.connected = False
             await asyncio.sleep(RECONNECT_S)
 

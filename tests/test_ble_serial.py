@@ -874,3 +874,58 @@ def test_a_scan_blocked_by_another_module_waits_instead_of_failing(run_dir):
     _drive(b, bleak, ticks=3)
     t.join()
     assert state['connects'] >= 1 and b.scan_error == ''
+
+
+# ── a radar that is not there is not news every pass ─────────────────────────
+# 20 Sep 2026: a box with no Pocket Radar in range wrote four lines every
+# twenty seconds, and the site's 20-line log tail was nothing but the
+# search. Each state is said once; the search is summed up now and then.
+
+def test_a_missing_radar_is_said_once_not_every_pass(run_dir, caplog):
+    import logging
+    caplog.set_level(logging.INFO, logger='bleserial')
+    cfg = {'radar': {'bluetooth_mac': '88:0A:98:19:08:16',
+                     'bluetooth_kind': 'ble'}}
+    # a scan that sees a different crowd every pass, never the radar,
+    # and a connect-by-address that fails the way BlueZ says it
+    crowd = {'n': 0}
+
+    class Scanner:
+        @staticmethod
+        async def discover(timeout=0, return_adv=False):
+            crowd['n'] += 1
+            return {f'AA:00:00:00:00:{i:02X}': (_Dev(f'AA:00:00:00:00:{i:02X}', 'x'), None)
+                    for i in range(40 + crowd['n'] % 7)}
+    bleak, state = _fake_bleak({}, [], fail_connect=RuntimeError(
+        'Device with address 88:0A:98:19:08:16 was not found.'))
+    bleak.BleakScanner = Scanner
+    b = ble_serial.BleSerialBridge(cfg_load=lambda: cfg, cfg_save=lambda c: None)
+    b._bluez_info = lambda mac: {'known': True, 'connected': False, 'le': True}
+    _drive(b, bleak, ticks=2 * ble_serial.SUMMARY_PASSES + 4)
+    passes = state['connects']
+    assert passes >= ble_serial.SUMMARY_PASSES * 2, passes
+    text = caplog.text
+    said = [r for r in caplog.records if r.levelno >= logging.INFO
+            and 'still looking' not in r.getMessage()]
+    # the four per-pass lines: once each, whatever the device count did
+    def n(frag):
+        return sum(1 for r in said if frag in r.getMessage())
+    assert n('not among them — BlueZ knows it as an LE device') == 1
+    assert n('not advertising — connecting by address') == 1
+    assert n('BLE serial adapter found') == 1
+    assert n('BLE serial lead dropped') == 1
+    assert [r.levelname for r in said if 'lead dropped' in r.getMessage()] == ['WARNING']
+    # …and the search summed up once per SUMMARY_PASSES passes
+    n_sum = text.count('still looking for the radar')
+    assert 1 <= n_sum <= passes // ble_serial.SUMMARY_PASSES, (n_sum, passes)
+    assert f'{ble_serial.SUMMARY_PASSES} passes so far' in text
+    # the settings page still gets the fresh count every pass
+    assert b.scan_note.startswith('scan saw ') and 'not among them' in b.scan_note
+    # a CHANGE is still said: a new failure text is a new line
+    b2 = ble_serial.BleSerialBridge(cfg_load=lambda: cfg, cfg_save=lambda c: None)
+    b2._bluez_info = lambda mac: {'known': True, 'connected': False, 'le': True}
+    caplog.clear()
+    bleak2, _ = _fake_bleak({}, [], fail_connect=RuntimeError('le-connection-abort-by-local'))
+    bleak2.BleakScanner = Scanner
+    _drive(b2, bleak2, ticks=3)
+    assert 'le-connection-abort-by-local' in caplog.text
