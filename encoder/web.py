@@ -301,6 +301,24 @@ STATUS_PAGE = """<!doctype html><html><head>
       <option value="https" {{ 'selected' if live_push.transport == 'https' }}>
         HTTPS only — survives a link that drops out entirely</option>
     </select>
+    <label>Picture the site gets</label>
+    <select name="bitrate_kbps">
+      {% for k, name in live_push.rates %}
+      <option value="{{ k }}" {{ 'selected' if live_push.bitrate_kbps == k }}>{{ name }}</option>
+      {% endfor %}
+    </select>
+    {% if hw_hevc %}
+    <select name="codec">
+      <option value="hevc" {{ 'selected' if live_push.codec == 'hevc' }}>HEVC
+        (~35% more picture per bit — modern phones decode it)</option>
+      <option value="h264" {{ 'selected' if live_push.codec != 'hevc' }}>H.264
+        (plays everywhere, older laptops included)</option>
+    </select>
+    {% endif %}
+    <p class="hint">The camera keeps its full quality into this box — clips
+      are cut from the box's own recording. The site's copy is re-encoded
+      on the chip to a rate every phone can play whenever the camera sends
+      more than this. A box with no hardware encoder always copies.</p>
     <label><input type="checkbox" name="enabled" value="1"
       {{ 'checked' if live_push.enabled }}> Send to the site's stream server</label>
     <button class="btn" type="submit">Save Multi-View</button>
@@ -697,7 +715,14 @@ def live_push_view(cfg):
     else:
         line = st.get('reason') or ''
     mode = (lp.get('transport') or 'auto').lower()
+    if st.get('connected') and st.get('video'):
+        line += f" · {st['video']}"
     return {'enabled': lp.get('enabled', True) is not False,
+            'bitrate_kbps': live_push.live_bitrate(cfg),
+            'codec': str(lp.get('codec') or 'hevc').lower(),
+            'rates': [(0, 'Source — copy the camera\'s stream as-is'),
+                      (2000, '2.0 Mb/s'), (3000, '3.0 Mb/s (default)'),
+                      (4000, '4.0 Mb/s'), (6000, '6.0 Mb/s')],
             'angle': live_push.safe_angle(lp.get('angle') or 'main'),
             'transport': mode if mode in ('auto', 'srt', 'https') else 'auto',
             'status': line}
@@ -965,10 +990,18 @@ def create_app(cloud=None):
         from .live_push import safe_angle
         cfg = config.load()
         mode = (request.form.get('transport') or 'auto').lower()
+        raw = request.form.get('bitrate_kbps')
+        try:
+            rate = 3000 if raw is None else int(raw or 0)   # absent → default
+        except ValueError:
+            rate = 3000
+        codec = (request.form.get('codec') or 'hevc').lower()
         cfg['live_push'] = {
             'enabled': bool(request.form.get('enabled')),
             'angle': safe_angle(request.form.get('angle')),
             'transport': mode if mode in ('auto', 'srt', 'https') else 'auto',
+            'bitrate_kbps': rate if rate in (0, 2000, 3000, 4000, 6000) else 3000,
+            'codec': codec if codec in ('hevc', 'h264') else 'hevc',
         }
         config.save(cfg)
         system.systemctl('restart', 'playcall-encoder-live')

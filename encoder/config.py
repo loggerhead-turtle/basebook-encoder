@@ -69,7 +69,13 @@ DEFAULTS = {
     # keeps dying (UDP blocked). 'srt' insists; 'https' never asks. SRT
     # holds its bitrate on a link that loses packets; HTTPS survives a
     # link that goes away. See encoder/live_push.py.
-    'live_push': {'enabled': True, 'angle': 'main', 'transport': 'auto'},
+    # 'bitrate_kbps': the BaseStream copy is transcoded to this on a box
+    # with a hardware encoder whenever the camera sends more; 0 = copy
+    # the camera's stream as-is. Unset = live_push.LIVE_DEFAULT_KBPS.
+    # 'codec': what the transcode writes — 'hevc' (default; falls back to
+    # H.264 on a box that cannot encode it) or 'h264'.
+    'live_push': {'enabled': True, 'angle': 'main', 'transport': 'auto',
+                  'bitrate_kbps': 3000, 'codec': 'hevc'},
     'version_check': {'url': '', 'enabled': True},
 }
 

@@ -94,6 +94,19 @@ SILENT_FRAME_BYTES = 24
 # without sound, and the Watch page said 'audio -' all evening. Sound
 # arriving is a reason to restart the push WITH the track, once.
 AUDIO_RECHECK_S = 60
+# The BaseStream copy is TRANSCODED on a box that can (QuickSync), to
+# this rate, whenever the camera sends more. 20 Sep 2026: a Mevo at
+# 7.3 Mb/s was copied straight through and every phone on the Watch
+# page fell behind it (a viewer pulled 4.8 Mb/s from the server, saw
+# two buffer stalls and dropped frames). The Mevo keeps its quality
+# INTO the box — clips are cut from the box's own recording — and the
+# viewers get a rate a phone can play. 0 in the settings means copy.
+LIVE_DEFAULT_KBPS = 3000
+LIVE_COPY_SLACK = 1.15            # a source within this of the target is copied
+MEDIAMTX_API = 'http://127.0.0.1:9997'
+TRANSCODE_FAST_DEATH_S = 10
+TRANSCODE_STRIKES = 3
+TRANSCODE_COOLDOWN_S = 600
 
 
 _ANGLE_OK = 'abcdefghijklmnopqrstuvwxyz0123456789-_'
@@ -245,7 +258,93 @@ def _audio_frame_sizes(cfg, runner):
     return sizes
 
 
-def build_ffmpeg_cmd(cfg, vcodec='', acodec=''):
+def live_bitrate(cfg):
+    """The kbps the BaseStream copy is transcoded to, 0 for copy. Unset
+    means LIVE_DEFAULT_KBPS; an explicit 0 is the operator's 'source'."""
+    raw = (cfg.get('live_push') or {}).get('bitrate_kbps')
+    if raw is None:
+        return LIVE_DEFAULT_KBPS
+    try:
+        kbps = int(raw)
+    except (TypeError, ValueError):
+        return LIVE_DEFAULT_KBPS
+    return 0 if kbps <= 0 else max(1000, min(12000, kbps))
+
+
+def live_codec(cfg, caps=None):
+    """'hevc' when asked (the default — the phones this is for decode
+    it, and it is ~35% more picture per bit) AND this box has proved it
+    can hardware-encode it; else 'h264', which everything plays."""
+    want = str((cfg.get('live_push') or {}).get('codec') or 'hevc').lower()
+    if want != 'hevc':
+        return 'h264'
+    caps = system.hw_encoders() if caps is None else caps
+    return 'hevc' if (caps or {}).get('hevc') else 'h264'
+
+
+def decide_video(cfg, hw=None, source_kbps=None, caps=None):
+    """{'kbps': int, 'codec': 'hevc'|'h264'} when the BaseStream copy
+    should be transcoded, else None (copy). Transcodes only on a box
+    with a hardware encoder, only when asked (live_bitrate > 0), and
+    only when the camera sends MORE than the target (or its rate is
+    unknown) — a phone-grade 2 Mb/s source is never re-encoded up to 3."""
+    kbps = live_bitrate(cfg)
+    if not kbps:
+        return None
+    hw = system.hw_encoder() if hw is None else hw
+    if hw != 'vaapi':
+        return None
+    if source_kbps and source_kbps <= kbps * LIVE_COPY_SLACK:
+        return None
+    return {'kbps': kbps, 'codec': live_codec(cfg, caps)}
+
+
+def video_args(video, hw_decode=True):
+    """(input prefix, output video args) for a transcode, or ([], copy).
+    The same QuickSync pipeline the YouTube leg runs: decode and encode
+    both on the chip, CBR-ish, 2 s GOP. HEVC is tagged hvc1 — the
+    fourcc Safari and hls.js want, and what the phones themselves send."""
+    if not video:
+        return [], ['-c:v', 'copy']
+    k = int(video['kbps'])
+    hevc = video.get('codec') == 'hevc'
+    enc = ['-c:v', 'hevc_vaapi' if hevc else 'h264_vaapi',
+           '-b:v', f'{k}k', '-maxrate', f'{k}k',
+           '-bufsize', f'{k * 2}k', '-g', '60'] + (['-tag:v', 'hvc1'] if hevc else [])
+    if hw_decode:
+        return (['-hwaccel', 'vaapi', '-hwaccel_output_format', 'vaapi',
+                 '-vaapi_device', '/dev/dri/renderD128'],
+                ['-vf', 'scale_vaapi=format=nv12'] + enc)
+    return (['-vaapi_device', '/dev/dri/renderD128'],
+            ['-vf', 'format=nv12,hwupload'] + enc)
+
+
+def ingest_kbps(cfg, http, wait_s=2.0, sleep=time.sleep):
+    """What the camera is sending INTO this box right now, in kbps, or
+    None when MediaMTX cannot say — two samples of bytesReceived, wait_s
+    apart, the same arithmetic the heartbeat uses."""
+    want = f"live/{cfg.get('local_ingest_key', '')}"
+
+    def sample():
+        data = http(f'{MEDIAMTX_API}/v3/paths/list')
+        for item in (data or {}).get('items') or []:
+            if item.get('name') == want and isinstance(item.get('bytesReceived'), int):
+                return item['bytesReceived']
+        return None
+    try:
+        a = sample()
+        if a is None:
+            return None
+        sleep(wait_s)
+        b = sample()
+    except Exception:
+        return None
+    if b is None or b < a or wait_s <= 0:
+        return None
+    return int((b - a) * 8 / wait_s / 1000)
+
+
+def build_ffmpeg_cmd(cfg, vcodec='', acodec='', video=None, hw_decode=True):
     """Read the published feed, write fragmented MP4 on stdout.
 
     +empty_moov puts a self-contained init segment (ftyp+moov) first and
@@ -279,16 +378,19 @@ def build_ffmpeg_cmd(cfg, vcodec='', acodec=''):
     if not acodec:
         audio = ['-an']
     else:
-        audio = ['-map', '0:a:0?']
-    return ['ffmpeg', '-hide_banner', '-loglevel', 'warning',
+        audio = ['-map', '0:a:0?', '-c:a', 'copy']
+    pre, vid = video_args(video, hw_decode)
+    if video:
+        fix = []                 # a fresh encode declares its own level
+    return ['ffmpeg', '-hide_banner', '-loglevel', 'warning'] + pre + [
             '-rtsp_transport', 'tcp', '-i', rtsp_in(cfg),
-            '-map', '0:v:0'] + audio + ['-c', 'copy'] + fix + [
+            '-map', '0:v:0'] + audio + vid + fix + [
             '-f', 'mp4', '-movflags',
             '+frag_keyframe+empty_moov+default_base_moof',
             'pipe:1']
 
 
-def build_srt_cmd(cfg, vcodec, url, acodec=''):
+def build_srt_cmd(cfg, vcodec, url, acodec='', video=None, hw_decode=True):
     """Read the published feed, write MPEG-TS straight into an SRT socket.
 
     MPEG-TS rather than fragmented MP4 because SRT carries a stream of
@@ -322,11 +424,13 @@ def build_srt_cmd(cfg, vcodec, url, acodec=''):
     else:
         audio = ['-map', '0:a:0?', '-c:a', 'aac', '-b:a', '128k',
                  '-ar', '48000']
+    pre, vid = video_args(video, hw_decode)
+    if video:
+        fix = []                 # a fresh encode declares its own level
     return ['ffmpeg', '-hide_banner', '-loglevel', 'warning',
-            '-progress', 'pipe:1', '-nostats',
+            '-progress', 'pipe:1', '-nostats'] + pre + [
             '-rtsp_transport', 'tcp', '-i', rtsp_in(cfg),
-            '-map', '0:v:0',
-            '-c:v', 'copy'] + fix + audio + [
+            '-map', '0:v:0'] + vid + fix + audio + [
             '-muxdelay', '0', '-muxpreload', '0',
             '-f', 'mpegts', url]
 
@@ -385,6 +489,9 @@ class LivePusher:
         self.audio_verdict = 'absent'
         self._cfg = {}
         self._audio_next_t = 0.0
+        self.video = None                 # the transcode this push runs, or None
+        self._transcode_strikes = 0
+        self._transcode_off_until = 0.0
         self.http = http or self._http
         self.running = True
         self.proc = None
@@ -483,6 +590,7 @@ class LivePusher:
             return 0
         self._cfg = cfg
         self._audio_next_t = time.monotonic() + AUDIO_RECHECK_S
+        self.video = self._decide_video(cfg)
 
         mode = self.transport(cfg)
         if mode != 'https':
@@ -503,14 +611,14 @@ class LivePusher:
         self.session = ticket['session']
         self.progress = {}
         self.proc = subprocess.Popen(
-            build_srt_cmd(cfg, vcodec, ticket['url'], acodec),
+            build_srt_cmd(cfg, vcodec, ticket['url'], acodec, video=self.video),
             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         threading.Thread(target=self._drain_stderr, daemon=True).start()
         threading.Thread(target=self._read_progress, daemon=True).start()
         log.info(f"live push start via SRT (angle={target['angle']}, "
                  f"game={target['game']}, port={ticket.get('port')}, "
                  f"latency={ticket.get('latency_ms')}ms, "
-                 f"in={vcodec}/{acodec or 'none'})")
+                 f"in={vcodec}/{acodec or 'none'}, {self.video_label()})")
         try:
             self._watch_srt(target, ticket)
         except Exception as e:
@@ -544,6 +652,7 @@ class LivePusher:
                     window.popleft()
             self.status.write(True, transport='srt', kbps=_kbps(window),
                               bytes=sent, backlog_ms=0, audio=self.audio_verdict,
+                              video=self.video_label(),
                               angle=target['angle'], game=target['game'],
                               session=self.session, dropped=0,
                               srt_port=ticket.get('port'),
@@ -580,7 +689,8 @@ class LivePusher:
     # ── HTTPS: we do the queueing ───────────────────────────────────────
     def push_https(self, cfg, target, vcodec, acodec=''):
         started = time.monotonic()
-        self.proc = subprocess.Popen(build_ffmpeg_cmd(cfg, vcodec, acodec),
+        self.proc = subprocess.Popen(build_ffmpeg_cmd(cfg, vcodec, acodec,
+                                                      video=self.video),
                                      stdout=subprocess.PIPE,
                                      stderr=subprocess.PIPE)
         threading.Thread(target=self._drain_stderr, daemon=True).start()
@@ -589,7 +699,7 @@ class LivePusher:
                                   args=(outbox,), daemon=True)
         reader.start()
         log.info(f"live push start (angle={target['angle']}, "
-                 f"game={target['game']}, in={vcodec}, copy)")
+                 f"game={target['game']}, in={vcodec}, {self.video_label()})")
         try:
             self._post_loop(target, outbox, vcodec)
         except Exception as e:
@@ -610,6 +720,46 @@ class LivePusher:
             self.stop_session(target, self.session)
             self.session = None
         self.status.write(False)
+
+    def video_label(self):
+        return (f"{self.video['codec']} {self.video['kbps']}k" if self.video else 'copy')
+
+    def _decide_video(self, cfg):
+        """Transcode or copy for THIS push. A hardware encoder that died
+        fast TRANSCODE_STRIKES times in a row is left alone for
+        TRANSCODE_COOLDOWN_S — a copy that plays beats a transcode that
+        does not start."""
+        if time.monotonic() < self._transcode_off_until:
+            return None
+        # a Pi, or a box told 'source', never asks MediaMTX for a rate
+        if not live_bitrate(cfg) or system.hw_encoder() != 'vaapi':
+            return None
+        try:
+            source = ingest_kbps(cfg, self.http)
+        except Exception:
+            source = None
+        video = decide_video(cfg, hw='vaapi', source_kbps=source)
+        if video:
+            log.info(f'BaseStream copy: transcoding to {video["codec"]} '
+                     f'{video["kbps"]}k (camera sends {source or "?"} kbps)')
+        return video
+
+    def note_transcode_run(self, alive):
+        """Called with how long a push lived: a transcode that died at
+        once, three times running, is the driver refusing the stream —
+        copy for a while and say so."""
+        if not self.video:
+            return
+        if alive >= TRANSCODE_FAST_DEATH_S:
+            self._transcode_strikes = 0
+            return
+        self._transcode_strikes += 1
+        if self._transcode_strikes >= TRANSCODE_STRIKES:
+            self._transcode_strikes = 0
+            self._transcode_off_until = time.monotonic() + TRANSCODE_COOLDOWN_S
+            log.warning('the BaseStream transcode died %d times in a row — '
+                        'copying the camera\'s stream for the next %d minutes',
+                        TRANSCODE_STRIKES, TRANSCODE_COOLDOWN_S // 60)
 
     def _probe(self, cfg):
         verdict = {}
@@ -692,6 +842,7 @@ class LivePusher:
                 window.popleft()
             self.status.write(True, transport='https', kbps=_kbps(window),
                               bytes=sent, backlog_ms=int(backlog * 1000),
+                              video=self.video_label(), audio=self.audio_verdict,
                               angle=target['angle'], game=target['game'],
                               session=self.session,
                               dropped=(r or {}).get('dropped') or 0)
@@ -705,6 +856,7 @@ class LivePusher:
             except Exception:
                 log.exception('live push attempt failed')
                 alive = 0
+            self.note_transcode_run(alive)
             if not self.running:
                 break
             if alive == 0:

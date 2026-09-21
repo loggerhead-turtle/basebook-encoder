@@ -149,6 +149,8 @@ class CloudLink:
                 'angle': st.get('angle') or '',
                 'game': st.get('game') or '',
                 'kbps': int(st.get('kbps') or 0),
+                # what leaves for the site: 'copy', or 'h264 3000k'
+                'video': str(st.get('video') or ''),
                 'backlog_ms': int(st.get('backlog_ms') or 0),
                 'reason': st.get('reason') or '',
                 'updated': st.get('updated')}

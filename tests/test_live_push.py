@@ -93,7 +93,7 @@ def test_an_absurd_h264_level_is_corrected_without_re_encoding():
     declaration, not a single frame."""
     h264 = live_push.build_ffmpeg_cmd({'local_ingest_key': 'k'}, 'h264')
     assert h264[h264.index('-bsf:v') + 1] == 'h264_metadata=level=auto'
-    assert h264[h264.index('-c') + 1] == 'copy'      # still no encoding
+    assert h264[h264.index('-c:v') + 1] == 'copy'    # still no encoding
     # the filter is H.264's; an HEVC camera must not be handed it
     hevc = live_push.build_ffmpeg_cmd({'local_ingest_key': 'k'}, 'hevc')
     assert '-bsf:v' not in hevc
@@ -103,7 +103,7 @@ def test_an_absurd_h264_level_is_corrected_without_re_encoding():
 
 def test_ffmpeg_is_copy_mode_fragmented_mp4_off_rtsp():
     cmd = live_push.build_ffmpeg_cmd({'local_ingest_key': 'abc123'})
-    assert '-c' in cmd and cmd[cmd.index('-c') + 1] == 'copy'
+    assert '-c:v' in cmd and cmd[cmd.index('-c:v') + 1] == 'copy'
     assert 'rtsp://127.0.0.1:8554/live/abc123' in cmd
     assert '-rtsp_transport' in cmd                 # RTMP drops HEVC/Opus
     flags = cmd[cmd.index('-movflags') + 1]
@@ -275,7 +275,18 @@ def test_settings_card_renders_and_saves(monkeypatch):
     assert r.status_code == 302
     saved = config.load()['live_push']
     assert saved == {'enabled': True, 'angle': 'third-base',
-                     'transport': 'srt'}
+                     'transport': 'srt', 'bitrate_kbps': 3000,
+                     'codec': 'hevc'}                              # absent → defaults
+    c.post('/livepush', data={'angle': 'main', 'enabled': '1',
+                              'transport': 'auto', 'codec': 'h264'})
+    assert config.load()['live_push']['codec'] == 'h264'
+    assert 'name="bitrate_kbps"' in page and 'Picture the site gets' in page
+    r = c.post('/livepush', data={'angle': 'main', 'enabled': '1',
+                                  'transport': 'auto', 'bitrate_kbps': '0'})
+    assert config.load()['live_push']['bitrate_kbps'] == 0            # the operator's 'source'
+    c.post('/livepush', data={'angle': 'main', 'enabled': '1',
+                              'transport': 'auto', 'bitrate_kbps': '999'})
+    assert config.load()['live_push']['bitrate_kbps'] == 3000         # not a rung → default
 
     # An unknown value must not become the stored setting: 'auto' is the
     # one that always has a working answer.
@@ -769,3 +780,117 @@ def test_a_silent_start_is_asked_again_and_sound_restarts_the_push(monkeypatch):
         return type('R', (), {'returncode': 0, 'stdout': listing})()
     q = live_push.LivePusher(cfg_load=lambda: cfg, runner=broken)
     assert q._probe(cfg) == ('h264', 'aac') and q.audio_verdict == 'unknown'
+
+
+# ── the BaseStream copy is transcoded on a box that can ──────────────────────
+# 20 Sep 2026: a Mevo at 7.3 Mb/s was copied straight through to the site
+# and every phone on the Watch page fell behind it. The camera keeps its
+# quality INTO the box (clips come from the box's recording); the site's
+# copy is re-encoded on the chip to a rate a phone can play.
+
+def test_the_basestream_copy_is_transcoded_only_when_it_helps(monkeypatch):
+    cfg = {'local_ingest_key': 'k'}                       # unset → the default
+    assert live_push.live_bitrate(cfg) == live_push.LIVE_DEFAULT_KBPS == 3000
+    both = {'h264': True, 'hevc': True}
+    assert live_push.decide_video(cfg, hw='vaapi', source_kbps=7300, caps=both) \
+        == {'kbps': 3000, 'codec': 'hevc'}
+    # HEVC is the default (the phones decode it, ~35% more picture per
+    # bit) — on a box that PROVED it can encode it; else H.264
+    assert live_push.decide_video(cfg, hw='vaapi', source_kbps=7300,
+                                  caps={'h264': True, 'hevc': False})['codec'] == 'h264'
+    assert live_push.decide_video({'local_ingest_key': 'k', 'live_push': {'codec': 'h264'}},
+                                  hw='vaapi', source_kbps=7300, caps=both)['codec'] == 'h264'
+    assert live_push.live_codec({'live_push': {'codec': 'HEVC'}}, caps=both) == 'hevc'
+    # the camera's rate is unknown: transcode (the point is a known size)
+    assert live_push.decide_video(cfg, hw='vaapi', source_kbps=None, caps=both)['kbps'] == 3000
+    # a phone-grade source is never re-encoded UP
+    assert live_push.decide_video(cfg, hw='vaapi', source_kbps=2000) is None
+    assert live_push.decide_video(cfg, hw='vaapi', source_kbps=3400) is None   # within slack
+    # a Pi has no encoder: copy, whatever is asked
+    assert live_push.decide_video(cfg, hw='', source_kbps=7300) is None
+    # the operator's 'source' is an explicit 0
+    assert live_push.decide_video({'local_ingest_key': 'k',
+                                   'live_push': {'bitrate_kbps': 0}},
+                                  hw='vaapi', source_kbps=7300) is None
+    assert live_push.live_bitrate({'live_push': {'bitrate_kbps': '4000'}}) == 4000
+    assert live_push.live_bitrate({'live_push': {'bitrate_kbps': 'junk'}}) == 3000
+    assert live_push.live_bitrate({'live_push': {'bitrate_kbps': 50}}) == 1000
+
+
+def test_the_transcode_rides_the_chip_on_both_roads():
+    cfg = {'local_ingest_key': 'k'}
+    video = {'kbps': 3000, 'codec': 'hevc'}
+    cmd = live_push.build_ffmpeg_cmd(cfg, 'hevc', 'aac', video=video)
+    i = cmd.index('-i')
+    assert cmd.index('-hwaccel') < i and 'vaapi' in cmd[:i]     # decode on the chip
+    assert cmd[cmd.index('-c:v') + 1] == 'hevc_vaapi'
+    assert cmd[cmd.index('-tag:v') + 1] == 'hvc1'                 # what Safari and hls.js want
+    # H.264 out: the other encoder, no tag
+    h = live_push.build_ffmpeg_cmd(cfg, 'hevc', 'aac', video={'kbps': 3000, 'codec': 'h264'})
+    assert h[h.index('-c:v') + 1] == 'h264_vaapi' and '-tag:v' not in h
+    assert cmd[cmd.index('-b:v') + 1] == '3000k' and cmd[cmd.index('-maxrate') + 1] == '3000k'
+    assert cmd[cmd.index('-bufsize') + 1] == '6000k' and cmd[cmd.index('-g') + 1] == '60'
+    assert 'scale_vaapi=format=nv12' in cmd
+    assert cmd[cmd.index('-c:a') + 1] == 'copy'                   # audio untouched
+    assert '-c' not in cmd[cmd.index('-map'):]                    # no blanket copy
+    assert 'h264_metadata=level=auto' not in cmd                  # a fresh encode sets its level
+    assert cmd[-1] == 'pipe:1' and '-movflags' in cmd
+    # the CPU-decode road, kept for a stream the chip refuses
+    cmd = live_push.build_ffmpeg_cmd(cfg, 'hevc', 'aac', video=video, hw_decode=False)
+    assert '-hwaccel' not in cmd and 'format=nv12,hwupload' in cmd
+    # SRT: same encode, TS out
+    cmd = live_push.build_srt_cmd(cfg, 'h264', 'srt://s:1?x', 'aac', video=video)
+    assert cmd[cmd.index('-c:v') + 1] == 'hevc_vaapi' and cmd[-2] == 'mpegts'
+    assert 'h264_metadata=level=auto' not in cmd
+    # …and without a decision both roads copy, level fix and all
+    cmd = live_push.build_ffmpeg_cmd(cfg, 'h264', 'aac')
+    assert cmd[cmd.index('-c:v') + 1] == 'copy' and 'h264_metadata=level=auto' in cmd
+    assert '-hwaccel' not in cmd
+    cmd = live_push.build_srt_cmd(cfg, 'h264', 'srt://s:1?x', 'aac')
+    assert cmd[cmd.index('-c:v') + 1] == 'copy'
+
+
+def test_the_camera_rate_is_read_off_mediamtx_in_two_samples():
+    cfg = {'local_ingest_key': 'k'}
+    seen = {'n': 0}
+
+    def http(url, payload=None, headers=None, timeout=None):
+        seen['n'] += 1
+        rx = 1_000_000 if seen['n'] == 1 else 2_000_000       # 1 MB in 2 s = 4000 kbps
+        return {'items': [{'name': 'live/other', 'bytesReceived': 5},
+                          {'name': 'live/k', 'bytesReceived': rx}]}
+    assert live_push.ingest_kbps(cfg, http, wait_s=2.0, sleep=lambda s: None) == 4000
+    # nobody publishing → unknown, not zero
+    assert live_push.ingest_kbps(cfg, lambda *a, **k: {'items': []},
+                                 wait_s=2.0, sleep=lambda s: None) is None
+    # the API down → unknown
+    def boom(*a, **k):
+        raise OSError('refused')
+    assert live_push.ingest_kbps(cfg, boom, wait_s=2.0, sleep=lambda s: None) is None
+
+
+def test_a_transcode_that_dies_fast_three_times_yields_to_copy(monkeypatch):
+    cfg = {'local_ingest_key': 'k'}
+    monkeypatch.setattr(live_push.system, 'hw_encoder', lambda: 'vaapi')
+    monkeypatch.setattr(live_push.system, 'hw_encoders', lambda: {'h264': True, 'hevc': True})
+    p = live_push.LivePusher(cfg_load=lambda: cfg, http=lambda *a, **k: {'items': []},
+                             status=live_push.StatusWriter())
+    assert p._decide_video(cfg) == {'kbps': 3000, 'codec': 'hevc'}
+    p.video = p._decide_video(cfg)
+    assert p.video_label() == 'hevc 3000k'
+    for _ in range(live_push.TRANSCODE_STRIKES - 1):
+        p.note_transcode_run(2)
+    assert p._decide_video(cfg) is not None                # two strikes: still trying
+    p.note_transcode_run(2)                                # the third
+    assert p._decide_video(cfg) is None                    # copy, for the cooldown
+    assert p._transcode_off_until > time.monotonic()
+    # a push that lived clears the strikes
+    p._transcode_off_until = 0
+    p.video = p._decide_video(cfg)
+    p.note_transcode_run(2); p.note_transcode_run(600); p.note_transcode_run(2)
+    assert p._decide_video(cfg) is not None
+    # copy runs never strike
+    p.video = None
+    for _ in range(5):
+        p.note_transcode_run(1)
+    assert p._decide_video(cfg) is not None
