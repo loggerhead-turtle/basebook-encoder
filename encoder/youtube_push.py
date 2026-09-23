@@ -41,6 +41,15 @@ log = logging.getLogger('youtube_push')
 
 RECONNECT_BASE = 3        # seconds; doubles per consecutive fast failure
 RECONNECT_MAX = 30
+# How often the camera's audio is asked about while a push runs. On
+# 21 Sep 2026 (Maeser) the camera's AAC track was named, copied, and
+# for half-hour stretches carried NO packets: YouTube reported "audio
+# bitrate (0)" and held the broadcast at liveStarting for three hours
+# with the picture arriving the whole time — it will not start a stream
+# without audio. A copied track cannot fill a gap the camera leaves, so
+# the box now watches for one and generates silence in its place until
+# the camera's sound comes back.
+AUDIO_RECHECK_S = 60
 
 
 
@@ -406,6 +415,26 @@ class YouTubePusher:
                      'publishing yet, or the probe timed out) — reading '
                      'over RTSP, which carries every track whatever the '
                      'camera turns out to be')
+        # A named track is only worth copying if it carries something.
+        # 'silent' here means the box makes the audio itself; 'camera'
+        # that the camera's own track rides across; 'unknown' that the
+        # question could not be asked (a probe failure is never a reason
+        # to talk over a real track).
+        self.audio_verdict = 'unknown'
+        self.audio_restart = False
+        cam_acodec = acodec
+        if acodec:
+            sound = self._audio_sound(cfg)
+            if sound is False:
+                log.info(f'audio track ({acodec}) is declared but carries '
+                         'nothing YouTube can use — no packets, or only '
+                         'silence frames. Sending silence in its place so '
+                         'the broadcast starts; asking the camera again '
+                         f'every {AUDIO_RECHECK_S} s')
+                acodec = ''
+                self.audio_verdict = 'silent'
+            else:
+                self.audio_verdict = 'camera'
         self.status.audio = {
             'in': acodec or '',
             'sample_rate': (adetail or {}).get('sample_rate') or 0,
@@ -420,6 +449,10 @@ class YouTubePusher:
                     else ('silence' if vcodec else '')),
             'mapped': bool(acodec or vcodec),
         }
+        if cam_acodec and not acodec:
+            # the camera HAS a track; it is the box's choice to replace it
+            self.status.audio['in'] = cam_acodec
+            self.status.audio['why'] = 'camera track carries no sound'
         log.info('audio: ' + (f"{acodec} {self.status.audio['sample_rate']} Hz "
                               f"{self.status.audio['channels']}ch → "
                               f"{self.status.audio['out']}" if acodec
@@ -472,11 +505,15 @@ class YouTubePusher:
         drain.start()
 
         self.fell_back = False
+        self._audio_next_t = time.monotonic() + AUDIO_RECHECK_S
         for line in self.proc.stdout:
             kbps = parse_progress_line(line, state)
             if kbps is not None:
                 self.status.write(True, kbps, speed=progress_speed(state))
             if not self.running:
+                self.proc.terminate()
+                break
+            if self._audio_watch(cfg):
                 self.proc.terminate()
                 break
             if hw_decode and transcoding and not self.fell_back:
@@ -520,6 +557,53 @@ class YouTubePusher:
                 log.warning(f'push failed after {alive:.1f}s: {line}')
         return alive
 
+    def _audio_sound(self, cfg):
+        """True / False / None (could not ask): does the camera's audio
+        track carry real frames right now? Shared with the BaseStream
+        push, which has judged its track this way since 1.2.91."""
+        from .live_push import audio_has_sound
+        return audio_has_sound(cfg, self.runner)
+
+    def _audio_packets(self, cfg):
+        """The sizes of a few seconds of the camera's audio packets, or
+        None when the question could not be asked."""
+        from .live_push import _audio_frame_sizes
+        return _audio_frame_sizes(cfg, self.runner)
+
+    def _audio_watch(self, cfg):
+        """Once a minute, the question YouTube is asking: is audio flowing?
+
+        Generating silence for a camera whose track went quiet: the
+        camera's sound coming back ends this push so the next one carries
+        it. Copying the camera's track: that track carrying NO packets at
+        all ends this push so the next one generates silence — the gap
+        YouTube will not start through (21 Sep 2026). A track that merely
+        went quiet is left alone: a quiet inning is not a reason to
+        replace a mic. Returns True when the push should end now."""
+        now = time.monotonic()
+        if now < getattr(self, '_audio_next_t', 0):
+            return False
+        self._audio_next_t = now + AUDIO_RECHECK_S
+        verdict = getattr(self, 'audio_verdict', 'unknown')
+        if verdict == 'silent':
+            if self._audio_sound(cfg):
+                log.info('sound has arrived on the camera\'s audio track — '
+                         'restarting the push with it')
+                self.audio_restart = True
+                return True
+        elif verdict == 'camera':
+            sizes = self._audio_packets(cfg)
+            if sizes is not None and not sizes:
+                log.warning('the camera\'s audio track has stopped carrying '
+                            'packets — YouTube reports this as "audio '
+                            'bitrate (0)" and will not start a broadcast '
+                            'through it. Restarting the push with silence '
+                            'in its place; the camera\'s sound is asked for '
+                            f'again every {AUDIO_RECHECK_S} s')
+                self.audio_restart = True
+                return True
+        return False
+
     def run_forever(self):
         backoff = RECONNECT_BASE
         while self.running:
@@ -528,8 +612,10 @@ class YouTubePusher:
                 break
             # A push that survived a while resets the backoff; consecutive
             # instant failures (no publisher yet / bad key) back off so we
-            # don't hammer YouTube.
-            backoff = RECONNECT_BASE if alive > 30 or self.fell_back else \
+            # don't hammer YouTube. A push the box ended on purpose (a
+            # decode fallback, an audio change) is not a failure at all.
+            backoff = RECONNECT_BASE if alive > 30 or self.fell_back \
+                or getattr(self, 'audio_restart', False) else \
                 min(RECONNECT_MAX, backoff * 2)
             self.status.reconnect_times.append(time.time())
             log.info(f'push ended — reconnecting in {backoff}s')

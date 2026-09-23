@@ -2950,3 +2950,157 @@ def test_push_status_carries_the_audio_report():
          'reconnect_times': []}))
     link = cloud_link.CloudLink(http=lambda *a, **k: {})
     assert link.push_status()['audio']['mapped'] is True
+
+
+# ── 1.2.93: a named audio track that carries nothing (Maeser, 21 Sep) ──────
+import inspect
+import logging
+
+def _gap_pusher(tmp_path, sound, packets, spawned):
+    """A pusher whose camera names H.264 + AAC, with the two audio
+    questions answered by the test, and ffmpeg replaced by a process
+    that emits progress until terminated."""
+    import threading
+    import time as _time
+    from encoder import youtube_push as yp
+
+    class _Proc:
+        def __init__(self):
+            self.dead = threading.Event()
+            self.stderr = iter(())
+
+        @property
+        def stdout(self):
+            def gen():
+                n = 0
+                while not self.dead.is_set() and n < 400:
+                    n += 1
+                    for l in ('total_size=1000\n', 'out_time_us=1000000\n',
+                              'speed=1.0x\n', 'progress=continue\n'):
+                        yield l
+                    _time.sleep(0.005)
+            return gen()
+
+        def wait(self):
+            return 0
+
+        def terminate(self):
+            self.dead.set()
+
+    p = yp.YouTubePusher(
+        cfg_load=lambda: {'local_ingest_key': 'k',
+                          'youtube': {'key': 'yt', 'url': 'rtmp://a/b'}},
+        runner=lambda c, **kw: type('R', (), {'returncode': 0, 'stdout':
+            '{"streams":[{"codec_type":"video","codec_name":"h264"},'
+            '{"codec_type":"audio","codec_name":"aac","sample_rate":"48000",'
+            '"channels":2}]}'})(),
+        status=yp.StatusWriter(tmp_path / 'push.json'),
+        http=lambda url, **kw: {'items': [{'name': 'live/k', 'ready': True}]})
+    p.push_url = lambda: 'rtmps://y/k'
+    p._audio_sound = lambda cfg: sound()
+    p._audio_packets = lambda cfg: packets()
+    return p, _Proc
+
+
+def _run_gap(monkeypatch, tmp_path, sound, packets):
+    import subprocess as _sp
+    from encoder import youtube_push as yp
+    spawned = []
+    p, Proc = _gap_pusher(tmp_path, sound, packets, spawned)
+    monkeypatch.setattr(yp, 'AUDIO_RECHECK_S', 0)
+    monkeypatch.setattr(_sp, 'Popen', lambda cmd, **kw: spawned.append(cmd) or Proc())
+    alive = p.run_once()
+    return p, spawned, alive
+
+
+def test_a_named_track_with_no_sound_is_replaced_by_silence_at_the_start(
+        monkeypatch, tmp_path):
+    """The BaseStream push has judged its track this way since 1.2.91;
+    the YouTube push copied whatever was named. A track with no packets
+    is exactly what YouTube will not start a broadcast through."""
+    p, spawned, _ = _run_gap(monkeypatch, tmp_path,
+                             sound=lambda: False, packets=lambda: [])
+    cmd = spawned[0]
+    assert 'anullsrc=channel_layout=stereo:sample_rate=48000' in cmd
+    assert p.audio_verdict == 'silent'
+    st = json.loads((tmp_path / 'push.json').read_text())
+    assert st['audio']['out'] == 'silence' and st['audio']['in'] == 'aac'
+    assert st['audio']['why'] == 'camera track carries no sound'
+
+
+def test_a_probe_that_cannot_answer_never_replaces_a_real_track(
+        monkeypatch, tmp_path):
+    p, spawned, _ = _run_gap(monkeypatch, tmp_path,
+                             sound=lambda: None, packets=lambda: None)
+    assert 'anullsrc=channel_layout=stereo:sample_rate=48000' not in spawned[0]
+    assert p.audio_verdict == 'camera'
+    assert '-c:a' in spawned[0] and spawned[0][spawned[0].index('-c:a') + 1] == 'copy'
+
+
+def test_a_copied_track_that_stops_carrying_packets_ends_the_push_for_silence(
+        monkeypatch, tmp_path, caplog):
+    """21 Sep 2026: half-hour stretches of 'audio bitrate (0)' with the
+    camera's AAC copied across, and a broadcast held at liveStarting for
+    three hours. The box now notices the gap and generates the audio
+    YouTube is waiting for."""
+    answers = iter([[], []])
+    with caplog.at_level(logging.WARNING, logger='youtube_push'):
+        p, spawned, alive = _run_gap(monkeypatch, tmp_path,
+                                     sound=lambda: True,
+                                     packets=lambda: next(answers, []))
+    assert p.audio_restart is True and alive < 5
+    assert 'anullsrc' not in ' '.join(spawned[0])     # this one copied the track
+    assert any('stopped carrying packets' in r.message for r in caplog.records)
+    # the next attempt asks again and, still nothing, sends silence
+    p._audio_sound = lambda cfg: False
+    import subprocess as _sp
+    from encoder import youtube_push as yp
+    _, Proc = _gap_pusher(tmp_path, lambda: False, lambda: [], spawned)
+    monkeypatch.setattr(_sp, 'Popen', lambda cmd, **kw: spawned.append(cmd) or Proc())
+    monkeypatch.setattr(yp, 'AUDIO_RECHECK_S', 3600)
+    p.running = True
+    import threading
+    threading.Timer(0.2, lambda: setattr(p, 'running', False)).start()
+    p.run_once()
+    assert 'anullsrc=channel_layout=stereo:sample_rate=48000' in spawned[1]
+
+
+def test_a_quiet_or_unreadable_track_is_left_alone_mid_push(
+        monkeypatch, tmp_path):
+    """A quiet inning is not a reason to replace a mic: small frames are
+    packets, and they keep YouTube fed. A probe that cannot answer is
+    not evidence of anything."""
+    from encoder import youtube_push as yp
+    import subprocess as _sp
+    for packets in (lambda: [9, 9, 9], lambda: None):
+        spawned = []
+        p, Proc = _gap_pusher(tmp_path, lambda: True, packets, spawned)
+        monkeypatch.setattr(yp, 'AUDIO_RECHECK_S', 0)
+        monkeypatch.setattr(_sp, 'Popen', lambda cmd, **kw: spawned.append(cmd) or Proc())
+        import threading
+        threading.Timer(0.15, lambda: setattr(p, 'running', False)).start()
+        p.run_once()
+        assert p.audio_restart is False
+
+
+def test_generated_silence_gives_way_when_the_sound_returns(
+        monkeypatch, tmp_path):
+    answers = iter([False, True])
+    p, spawned, alive = _run_gap(monkeypatch, tmp_path,
+                                 sound=lambda: next(answers, True),
+                                 packets=lambda: [])
+    assert 'anullsrc=channel_layout=stereo:sample_rate=48000' in spawned[0]
+    assert p.audio_restart is True and alive < 5
+
+
+def test_an_audio_restart_reconnects_at_once_not_with_backoff():
+    from encoder import youtube_push as yp
+    src = inspect.getsource(yp.YouTubePusher.run_forever)
+    assert "getattr(self, 'audio_restart', False)" in src
+    assert 'RECONNECT_BASE if alive > 30 or self.fell_back' in src
+
+
+def test_the_box_says_it_watches_the_audio_every_minute():
+    from encoder import youtube_push as yp
+    assert yp.AUDIO_RECHECK_S == 60
+    assert (Path(__file__).resolve().parent.parent / 'VERSION').read_text().strip() == '1.2.93'
