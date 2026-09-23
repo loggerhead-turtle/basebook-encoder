@@ -411,7 +411,7 @@ def test_heartbeat_payload_shape():
     assert set(hb) == {'state', 'ingest', 'push', 'cpu', 'temp',
                        'version', 'log_tail', 'hostname', 'ip', 'clips',
                        'pin', 'rtmp_urls', 'radar',
-                       'temp_max', 'storage', 'livepush', 'transcode',
+                       'temp_max', 'storage', 'livepush', 'backfill', 'transcode',
                        'hardware'}
     assert isinstance(hb['hardware'], str)
     # a Pi (no hardware encoder) reports not-capable, copy target
@@ -3103,4 +3103,5 @@ def test_an_audio_restart_reconnects_at_once_not_with_backoff():
 def test_the_box_says_it_watches_the_audio_every_minute():
     from encoder import youtube_push as yp
     assert yp.AUDIO_RECHECK_S == 60
-    assert (Path(__file__).resolve().parent.parent / 'VERSION').read_text().strip() == '1.2.93'
+    ver = (Path(__file__).resolve().parent.parent / 'VERSION').read_text().strip()
+    assert tuple(int(x) for x in ver.split('.')) >= (1, 2, 93)

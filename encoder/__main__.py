@@ -129,6 +129,15 @@ def main():
                 # the stream — but it must be VISIBLE
                 log.exception('in-process clipper failed to start')
 
+    # The recording-to-BaseStream upload waits for a request from the
+    # site (encoder/backfill.py). Idle, it is one file stat every few
+    # seconds; a broken worker must never take the stream down.
+    try:
+        from . import backfill as _backfill
+        _backfill.Backfill().start()
+    except Exception:
+        log.exception('backfill worker failed to start')
+
     threading.Thread(target=web.serve, kwargs={'cloud': link},
                      daemon=True).start()
 

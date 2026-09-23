@@ -130,6 +130,7 @@ class CloudLink:
         # otherwise churn that method's change signature every 5 seconds.
         # After the shutdown check: a box on its way down needs no ticket.
         self.write_live_target(a.get('live'))
+        self.write_backfill_target(a.get('backfill'))
         return self.handle_assignment(a)
 
     def livepush_status(self):
@@ -421,6 +422,47 @@ class CloudLink:
             return self._storage
         return self.watch_storage()
 
+    def write_backfill_target(self, req):
+        """Hand a 'send the recording' request to the backfill worker
+        (encoder/backfill.py) through a tmpfs file, the way the live
+        ticket travels. Served on every poll while the site holds the
+        request; blanked when it stops — the worker finishes the piece
+        it is on and stops asking."""
+        path = config.state_dir() / 'backfill_target.json'
+        req = req if isinstance(req, dict) and req.get('id') else {}
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                if json.loads(path.read_text()) == req:
+                    return                # unchanged: spare the tmpfs a write
+            except (OSError, ValueError):
+                pass
+            tmp = path.with_suffix('.tmp')
+            tmp.write_text(json.dumps(req))
+            os.replace(tmp, path)
+        except OSError:
+            pass
+
+    def backfill_status(self):
+        """What the backfill worker last reported, or None when it has
+        never run. The site retires its request on 'done' or 'failed'."""
+        try:
+            from . import backfill
+            st = backfill.status()
+        except Exception:
+            return None
+        if not st or not st.get('id'):
+            return None
+        return {'id': str(st.get('id') or ''), 'state': st.get('state') or '',
+                'game': st.get('game') or '', 'angle': st.get('angle') or '',
+                'sent_s': int(st.get('sent_s') or 0),
+                'total_s': int(st.get('total_s') or 0),
+                'pieces': int(st.get('pieces') or 0),
+                'done_pieces': int(st.get('done_pieces') or 0),
+                'note': str(st.get('note') or '')[:200],
+                'error': str(st.get('error') or '')[:200],
+                'updated': st.get('updated')}
+
     def heartbeat_payload(self):
         cfg = self.cfg_load()
         ingest = self.ingest_status()
@@ -463,6 +505,9 @@ class CloudLink:
             # no readout is a button you press twice. Written by
             # live_push to tmpfs every second it is connected.
             'livepush': self.livepush_status(),
+            # The after-the-game upload of this box's own recording, when
+            # one was asked for from the site (encoder/backfill.py).
+            'backfill': self.backfill_status(),
             'version': __version__,
             # So the site can link straight to this box's settings page
             # instead of assuming playcall-encoder.local resolves.

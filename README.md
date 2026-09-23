@@ -280,6 +280,24 @@ whatever key it has. Clear the key (or set the game's YouTube angle on the
 stream desk, which pushes from the *server* instead) when you want one and
 not both.
 
+### 📼 Sending the whole game after the fact
+
+The watch page plays only the live copy the box pushed during the game.
+Clips are cut from the box's own recording, so a game can have every
+clip and still no playable angle when the live copy was lost. The
+recording on the box is the game: on the site's **Stream Status** page,
+**📼 Send full recording to BaseStream** asks the box to send it.
+
+- It runs only when pressed — the box usually has YouTube to serve.
+- The box asks the stream server what it already holds for the angle and
+  sends only the missing stretches, in ten-minute upload runs stamped
+  with when they were shot. Nothing is re-encoded.
+- While a camera is publishing the upload crawls (250 KB/s) so the live
+  game keeps the uplink; otherwise it runs at up to ~32 Mb/s.
+- Progress shows beside the button; `journalctl -u playcall-encoder | grep
+  backfill` has the detail. The recording must still be on the box
+  (the rolling window set by *record hours*).
+
 ## FAQ
 
 **Do I need the PlayCall cloud?** No. Standalone, the encoder is a
