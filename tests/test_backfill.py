@@ -94,7 +94,8 @@ def _worker(tmp_path, server, cfg=None):
                           http=server.post, http_get=server.get,
                           sleep=slept.append,
                           status_file=tmp_path / 'status.json',
-                          target_file=tmp_path / 'target.json')
+                          target_file=tmp_path / 'target.json',
+                          live_status=lambda: {}, hw=None)
     return w, slept
 
 
@@ -241,4 +242,179 @@ def test_the_worker_starts_with_the_box_and_the_version_says_so():
     main = Path(backfill.__file__).with_name('__main__.py').read_text()
     assert '_backfill.Backfill().start()' in main
     ver = Path(backfill.__file__).parent.parent / 'VERSION'
-    assert ver.read_text().strip() == '1.2.94'
+    assert tuple(int(x) for x in ver.read_text().strip().split('.')) >= (1, 2, 95)
+
+
+# ── replace: a clean copy of footage the server already holds ───────────────
+
+class _HTTPError(Exception):
+    def __init__(self, code):
+        super().__init__(f'HTTP {code}')
+        self.code = code
+
+
+def _replace_target(tmp_path, frm=1000.0, to=2200.0):
+    t = _target(tmp_path, frm, to)
+    t['mode'] = 'replace'
+    t['id'] = 'bfaa01'
+    (tmp_path / 'target.json').write_text(json.dumps(t))
+    return t
+
+
+def test_replace_sends_the_whole_window_re_encoded_then_commits(tmp_path, monkeypatch):
+    """The server holds all of it — a fill would send nothing. A replace
+    sends everything, re-encoded on the chip, tagged with the batch, and
+    commits at the end so the clean copy takes over in one step."""
+    srv = _Server({'runs': 1, 'start': 900.0, 'end': 4000.0, 'gaps': []},
+                  segments=[(900.0, 3200.0)])
+    monkeypatch.setattr(backfill, 'REPLACE_KBPS', 1)   # the fake pieces are tiny
+    _replace_target(tmp_path)
+    encoded = []
+    real = srv.post
+
+    def post(url, payload=None, headers=None, timeout=60):
+        out = real(url, payload, headers, timeout)       # recorded either way
+        if url.endswith('/replace'):
+            return {'ok': True, 'seconds': 1200, 'spans': [[1000.0, 2200.0]]}
+        return out
+    srv.post = post
+    w, _ = _worker(tmp_path, srv)
+    w.hw = 'hevc'
+    w.transcode = lambda data, kbps, codec: encoded.append((kbps, codec)) \
+        or b'\x01' * 50_000
+    assert w.tick() is True
+    starts = [p for u, p, _ in srv.posts if u.endswith('/start')]
+    assert [p['capture_start'] for p in starts] == [1000.0, 1600.0]
+    assert all(p['replace'] == 'bfaa01' and p['upload'] is True for p in starts)
+    assert encoded == [(1, 'hevc'), (1, 'hevc')]
+    # the re-encoded bytes are what went up, not the original
+    feeds = [p for u, p, _ in srv.posts if u.endswith('/feed')]
+    assert feeds == [50_000, 50_000]
+    assert not [u for u, _, _ in srv.posts if u.endswith('/coverage')]
+    commits = [p for u, p, _ in srv.posts if u.endswith('/replace')]
+    assert commits == [{'token': 'tok', 'batch': 'bfaa01'}]
+    st = json.loads((tmp_path / 'status.json').read_text())
+    assert st['state'] == 'done' and st['mode'] == 'replace'
+    assert 'replaced 20 min' in st['note']
+
+
+def test_a_recording_already_light_is_sent_as_it_is(tmp_path):
+    """200 KB for ten minutes is far under 5 Mb/s: nothing to gain."""
+    srv = _Server({'runs': 0}, segments=[(1000.0, 1200.0)])
+    _replace_target(tmp_path)
+    w, _ = _worker(tmp_path, srv)
+    w.hw = 'hevc'
+    w.transcode = lambda *a: (_ for _ in ()).throw(AssertionError('no re-encode'))
+    w.tick()
+    assert json.loads((tmp_path / 'status.json').read_text())['state'] == 'done'
+
+
+def test_a_box_without_a_hardware_encoder_sends_full_quality(tmp_path, monkeypatch):
+    monkeypatch.setattr(backfill, 'REPLACE_KBPS', 1)
+    srv = _Server({'runs': 0}, segments=[(1000.0, 1200.0)])
+    _replace_target(tmp_path)
+    w, _ = _worker(tmp_path, srv)
+    w.hw = None
+    w.transcode = lambda *a: (_ for _ in ()).throw(AssertionError('no chip'))
+    w._hw = lambda: None
+    w.tick()
+    assert json.loads((tmp_path / 'status.json').read_text())['state'] == 'done'
+
+
+def test_a_failed_re_encode_sends_the_original_and_says_so(tmp_path, monkeypatch):
+    monkeypatch.setattr(backfill, 'REPLACE_KBPS', 1)
+    srv = _Server({'runs': 0}, segments=[(1000.0, 600.0)])
+    _replace_target(tmp_path, 1000.0, 1600.0)
+    w, _ = _worker(tmp_path, srv)
+    w.hw = 'hevc'
+    w.transcode = lambda *a: (_ for _ in ()).throw(RuntimeError('vaapi died'))
+    w.tick()
+    st = json.loads((tmp_path / 'status.json').read_text())
+    assert st['state'] == 'done' and 'sent full quality' in st['error']
+    assert [p for u, p, _ in srv.posts if u.endswith('/feed')]
+
+
+def test_it_waits_while_this_box_is_live_on_that_game(tmp_path):
+    srv = _Server({'runs': 0}, segments=[(1000.0, 1200.0)])
+    _replace_target(tmp_path)
+    w, _ = _worker(tmp_path, srv)
+    w.live_status = lambda: {'connected': True, 'game': 'g1'}
+    w.tick()
+    st = json.loads((tmp_path / 'status.json').read_text())
+    assert st['state'] == 'waiting' and 'still live' in st['note']
+    assert not srv.posts and not srv.fetched
+    # a live push on ANOTHER game is not this angle
+    w.live_status = lambda: {'connected': True, 'game': 'g2'}
+    w._wait_until = 0
+    w.tick()
+    assert json.loads((tmp_path / 'status.json').read_text())['state'] == 'done'
+
+
+def test_a_busy_angle_is_a_wait_not_a_failure(tmp_path):
+    """The server says 409 — a phone or a reconnect is live there."""
+    srv = _Server({'runs': 0}, segments=[(1000.0, 1200.0)])
+    real = srv.post
+
+    def post(url, payload=None, headers=None, timeout=60):
+        if url.endswith('/start'):
+            raise _HTTPError(409)
+        return real(url, payload, headers, timeout)
+    srv.post = post
+    _replace_target(tmp_path)
+    w, _ = _worker(tmp_path, srv)
+    w.tick()
+    st = json.loads((tmp_path / 'status.json').read_text())
+    assert st['state'] == 'waiting' and 'after it stops' in st['note']
+    # and it does not hammer: the next tick inside the wait does nothing
+    n = len(srv.posts)
+    assert w.tick() is False and len(srv.posts) == n
+
+
+def test_a_commit_refused_as_busy_is_retried_without_resending(tmp_path):
+    srv = _Server({'runs': 0}, segments=[(1000.0, 1200.0)])
+    real = srv.post
+    calls = {'n': 0}
+
+    def post(url, payload=None, headers=None, timeout=60):
+        if url.endswith('/replace'):
+            calls['n'] += 1
+            if calls['n'] == 1:
+                raise _HTTPError(409)
+            return {'ok': True, 'seconds': 1200}
+        return real(url, payload, headers, timeout)
+    srv.post = post
+    _replace_target(tmp_path)
+    w, _ = _worker(tmp_path, srv)
+    w.tick()
+    st = json.loads((tmp_path / 'status.json').read_text())
+    assert st['state'] == 'waiting'
+    starts = len([u for u, _, _ in srv.posts if u.endswith('/start')])
+    w._wait_until = 0
+    # the waiting state kept 'committing' out of the file; the worker
+    # remembers the sends by resuming at the commit
+    json_st = json.loads((tmp_path / 'status.json').read_text())
+    json_st['state'] = 'committing'
+    (tmp_path / 'status.json').write_text(json.dumps(json_st))
+    w.tick()
+    assert len([u for u, _, _ in srv.posts if u.endswith('/start')]) == starts
+    assert json.loads((tmp_path / 'status.json').read_text())['state'] == 'done'
+
+
+def test_the_transcode_runs_on_the_chip_with_a_cpu_fallback(tmp_path, monkeypatch):
+    monkeypatch.setattr(backfill, 'TMP_DIR', tmp_path)
+    seen = []
+
+    def runner(argv):
+        seen.append(argv)
+        if len(seen) == 1:
+            raise RuntimeError('hw decode refused')
+        Path(argv[-1]).write_bytes(b'\x02' * 4096)
+    out = backfill.transcode_piece(b'\x00' * 4096, 5000, 'hevc', runner=runner)
+    assert out == b'\x02' * 4096
+    assert '-hwaccel' in seen[0] and '-hwaccel' not in seen[1]
+    for argv in seen:
+        assert argv[argv.index('-c:v') + 1] == 'hevc_vaapi'
+        assert argv[argv.index('-b:v') + 1] == '5000k'
+        assert '+frag_keyframe+empty_moov+default_base_moof' in argv
+        assert argv[argv.index('-c:a') + 1] == 'aac'
+    assert list(tmp_path.iterdir()) == []            # temp files cleaned up

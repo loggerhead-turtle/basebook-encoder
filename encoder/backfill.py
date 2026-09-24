@@ -29,6 +29,21 @@ otherwise.
 Progress rides the heartbeat (cloud_link.backfill_status) so the page
 that asked can watch it, and the request is retired by the site when
 the box reports done or failed for its id.
+
+TWO MODES. 'fill' (the default) sends only what the server lacks.
+'replace' sends the WHOLE window as a clean copy — for a live copy that
+dropped packets or ran at a low bitrate (21-22 Sep 2026) — re-encoded on
+the box's hardware encoder to REPLACE_KBPS so it still plays on a phone
+at the ballpark, while the clips (cut from the untouched recording by
+clipper.py) stay at full quality. The pieces go up as a replacement
+BATCH the stream server keeps out of the playlist until this box commits
+it; then the time they cover is theirs and the old footage is left out
+(kept on the server, not deleted).
+
+NEVER UNDER A LIVE CAMERA. The stream server refuses an upload on an
+angle that has a live camera (409), because starting a session on an
+angle ends the one already there. The box waits instead: while its own
+live push is on that game, and whenever the server says busy.
 """
 
 from __future__ import annotations
@@ -36,6 +51,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import subprocess
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -43,7 +60,7 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import config
+from . import config, system
 
 log = logging.getLogger('backfill')
 
@@ -57,6 +74,15 @@ UPLOAD_BPS_IDLE = 4_000_000    # otherwise ~32 Mb/s — an hour of 3 Mb/s in a f
 STRIKES = 3                    # pieces failed in a row before giving up
 HTTP_TIMEOUT = 60
 TICK_S = 5.0
+WAIT_S = 60.0                  # a busy angle is asked about again after this
+REPLACE_KBPS = 5000            # the game footage: clean, and a phone still plays it
+COPY_SLACK = 1.15              # a recording already this light is copied
+TMP_DIR = Path(os.environ.get('BACKFILL_TMP',
+                              '/var/lib/playcall-encoder/backfill-tmp'))
+
+
+class Busy(Exception):
+    """The angle has a live camera: wait, do not count it as a failure."""
 
 
 def target_path():
@@ -198,6 +224,46 @@ def _http_post(url, payload=None, headers=None, timeout=HTTP_TIMEOUT):
     return json.loads(out) if out.strip() else {}
 
 
+def _live_push_status():
+    try:
+        from . import live_push
+        return live_push.status()
+    except Exception:
+        return {}
+
+
+def transcode_piece(data, kbps, codec, runner=None):
+    """Fragmented MP4 in, fragmented MP4 out: video re-encoded on the
+    QuickSync chip (live_push.video_args — the same pipeline the live
+    copy uses), audio to AAC so every piece has the same track layout.
+    Temp files on the recordings disk, never tmpfs: ten minutes of a
+    Mevo is most of a gigabyte. Hardware decode first; the CPU decode if
+    the chip refuses the stream."""
+    from .live_push import video_args
+    run = runner or (lambda argv: subprocess.run(argv, check=True,
+                                                 capture_output=True,
+                                                 timeout=1800))
+    TMP_DIR.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=str(TMP_DIR)) as tmp:
+        src, dst = Path(tmp) / 'in.mp4', Path(tmp) / 'out.mp4'
+        src.write_bytes(data)
+        last = None
+        for hw_decode in (True, False):
+            pre, vid = video_args({'kbps': int(kbps), 'codec': codec}, hw_decode)
+            argv = (['ffmpeg', '-hide_banner', '-loglevel', 'error', '-y'] + pre
+                    + ['-i', str(src), '-map', '0:v:0', '-map', '0:a:0?'] + vid
+                    + ['-c:a', 'aac', '-b:a', '128k', '-ar', '48000',
+                       '-f', 'mp4', '-movflags',
+                       '+frag_keyframe+empty_moov+default_base_moof', str(dst)])
+            try:
+                run(argv)
+                if dst.exists() and dst.stat().st_size > 1024:
+                    return dst.read_bytes()
+            except Exception as e:
+                last = e
+        raise RuntimeError(f'ffmpeg could not re-encode the piece: {last}')
+
+
 def camera_live(http_get=None):
     """Is a camera publishing into MediaMTX right now? Then the uplink
     belongs to the live push and this upload crawls."""
@@ -212,15 +278,20 @@ def camera_live(http_get=None):
 # ── the worker ──────────────────────────────────────────────────────────
 class Backfill:
     def __init__(self, cfg_load=config.load, http=None, http_get=None,
-                 sleep=time.sleep, status_file=None, target_file=None):
+                 sleep=time.sleep, status_file=None, target_file=None,
+                 transcode=None, live_status=None, hw=None):
         self.cfg_load = cfg_load
         self.http = http or _http_post
         self.http_get = http_get
         self.sleep = sleep
         self.status_file = Path(status_file) if status_file else None
         self.target_file = Path(target_file) if target_file else None
+        self.transcode = transcode or transcode_piece
+        self.live_status = live_status or _live_push_status
+        self.hw = hw                       # None → ask the hardware
         self.running = True
         self.busy = False
+        self._wait_until = 0.0
 
     # ── status ──────────────────────────────────────────────────────
     def _status(self):
@@ -242,9 +313,17 @@ class Backfill:
         st = self._status()
         if st.get('id') == t['id'] and st.get('state') in ('done', 'failed'):
             return False
+        if time.monotonic() < self._wait_until:
+            return False
         self.busy = True
         try:
-            self.run(t)
+            if st.get('id') == t['id'] and st.get('state') == 'committing':
+                self.commit(t)             # everything sent; only the commit is owed
+            else:
+                self.run(t)
+        except Busy as e:
+            self._wait_until = time.monotonic() + WAIT_S
+            self._write(id=t['id'], state='waiting', note=str(e)[:200])
         except Exception as e:
             log.exception('backfill %s failed', t.get('id'))
             self._write(id=t['id'], state='failed', error=str(e)[:200])
@@ -252,20 +331,34 @@ class Backfill:
             self.busy = False
         return True
 
+    def _own_push_live(self, t):
+        """Is THIS box's live push still on that game? Then the angle is
+        busy by definition, and asking the server would only confirm it."""
+        st = self.live_status() or {}
+        return bool(st.get('connected')) and (
+            not st.get('game') or str(st.get('game')) == str(t.get('game')))
+
     def run(self, t):
         cfg = self.cfg_load()
+        mode = 'replace' if t.get('mode') == 'replace' else 'fill'
+        if self._own_push_live(t):
+            raise Busy('this box is still live on that game — the recording '
+                       'goes up after the live push stops')
         frm, to = float(t.get('from') or 0), float(t.get('to') or 0)
         self._write(id=t['id'], game=t.get('game'), angle=t.get('angle'),
-                    state='planning', sent_s=0, total_s=0, pieces=0,
-                    done_pieces=0, error='')
-        cov = self.http(t['ingest'] + '/coverage', {'token': t['token']})
+                    mode=mode, state='planning', sent_s=0, total_s=0, pieces=0,
+                    done_pieces=0, error='', note='')
         segs = record_segments(cfg, self.http_get)
-        plan = pieces(holes(cov, frm, to), segs)
+        if mode == 'replace':
+            plan = pieces([(frm, to)], segs)
+        else:
+            cov = self.http(t['ingest'] + '/coverage', {'token': t['token']})
+            plan = pieces(holes(cov, frm, to), segs)
         total = sum(b - a for a, b in plan)
         have = sum(d for _, d in segs)
         if not plan:
             note = ('the server already holds everything this box recorded '
-                    'for that stretch' if have else
+                    'for that stretch' if have and mode == 'fill' else
                     'this box has no recording for that stretch')
             log.info('backfill %s: nothing to send — %s', t['id'], note)
             self._write(state='done', total_s=0, note=note)
@@ -275,10 +368,13 @@ class Backfill:
                  t.get('game'), t.get('angle'))
         self._write(state='sending', total_s=round(total), pieces=len(plan))
         sent, strikes, ok = 0.0, 0, 0
+        batch = t['id'] if mode == 'replace' else ''
         for i, (a, b) in enumerate(plan):
             try:
-                self.send_piece(cfg, t, a, b)
+                self.send_piece(cfg, t, a, b, batch=batch)
                 strikes = 0
+            except Busy:
+                raise                     # a camera came on: wait, resend later
             except Exception as e:
                 strikes += 1
                 log.warning('backfill piece %d/%d (%s +%.0fs) failed: %s',
@@ -291,19 +387,63 @@ class Backfill:
             sent += b - a
             ok += 1
             self._write(sent_s=round(sent), done_pieces=ok)
-        self._write(state='done', sent_s=round(sent),
-                    note=(f'{ok} piece(s) sent' if ok == len(plan) else
-                          f'{ok} of {len(plan)} piece(s) sent — '
-                          f'{len(plan) - ok} could not be'))
+        note = (f'{ok} piece(s) sent' if ok == len(plan) else
+                f'{ok} of {len(plan)} piece(s) sent — '
+                f'{len(plan) - ok} could not be')
+        if batch and ok:
+            # Everything that could go has gone: now it takes over. Only
+            # the time the new pieces actually cover changes — a piece
+            # that failed leaves the old footage in its place.
+            self._write(state='committing', sent_s=round(sent), note=note)
+            self.commit(t)
+            return
+        self._write(state='done', sent_s=round(sent), note=note)
         log.info('backfill %s done: %.0f s sent', t['id'], sent)
 
-    def send_piece(self, cfg, t, a, b):
+    def commit(self, t):
+        try:
+            r = self.http(t['ingest'] + '/replace',
+                          {'token': t['token'], 'batch': t['id']})
+        except Exception as e:
+            if getattr(e, 'code', None) == 409:
+                raise Busy('a camera is live on that angle — the clean copy '
+                           'takes over once it stops')
+            raise
+        secs = int((r or {}).get('seconds') or 0)
+        st = self._status()
+        self._write(state='done',
+                    note=(st.get('note') or '') + f' · replaced {secs // 60} min '
+                    'of the angle with the clean copy')
+        log.info('backfill %s committed: %d s replaced', t['id'], secs)
+
+    def _hw(self):
+        if self.hw is not None:
+            return self.hw
+        try:
+            if system.hw_encoder() != 'vaapi':
+                return None
+            return 'hevc' if system.hw_encoders().get('hevc') else 'h264'
+        except Exception:
+            return None
+
+    def send_piece(self, cfg, t, a, b, batch=''):
         data = fetch_piece(cfg, a, b - a, self.http_get)
         if len(data) < 1024:
             raise RuntimeError('the recording came back empty')
-        r = self.http(t['ingest'] + '/start',
-                      {'token': t['token'], 'capture_start': a,
-                       'tier_kbps': 0, 'codec': '', 'upload': True})
+        if batch:
+            data = self._clean_copy(data, b - a)
+        body = {'token': t['token'], 'capture_start': a,
+                'tier_kbps': REPLACE_KBPS if batch else 0, 'codec': '',
+                'upload': True}
+        if batch:
+            body['replace'] = batch
+        try:
+            r = self.http(t['ingest'] + '/start', body)
+        except Exception as e:
+            if getattr(e, 'code', None) == 409:
+                raise Busy('a camera is live on that angle — the recording '
+                           'goes up after it stops')
+            raise
         sid = (r or {}).get('session')
         if not sid:
             raise RuntimeError(f'stream server refused the upload: {r}')
@@ -319,6 +459,26 @@ class Backfill:
                 self.http(f'{t["ingest"]}/{sid}/stop', {})
             except Exception:
                 pass                      # a session the server already reaped
+
+    def _clean_copy(self, data, seconds):
+        """The replacement footage: re-encoded on the chip to REPLACE_KBPS
+        unless the recording is already that light, in which case it is
+        sent as it is. A transcode that fails is sent as it is too — a
+        heavy clean copy beats none — and the status says so."""
+        kbps = len(data) * 8 / max(1.0, seconds) / 1000
+        codec = self._hw()
+        if not codec or kbps <= REPLACE_KBPS * COPY_SLACK:
+            return data
+        try:
+            out = self.transcode(data, REPLACE_KBPS, codec)
+            if out and len(out) > 1024:
+                return out
+            raise RuntimeError('the re-encode came back empty')
+        except Exception as e:
+            log.warning('backfill re-encode failed (%s) — sending the '
+                        'original for this piece', e)
+            self._write(error=f're-encode failed, sent full quality: {str(e)[:120]}')
+            return data
 
     # ── forever ─────────────────────────────────────────────────────
     def loop(self):

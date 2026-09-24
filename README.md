@@ -298,6 +298,18 @@ recording on the box is the game: on the site's **Stream Status** page,
   backfill` has the detail. The recording must still be on the box
   (the rolling window set by *record hours*).
 
+**✨ Replace with a clean copy** is the other button, for a live copy that
+was there but dropped packets or ran thin. The box sends the *whole* game
+window again, re-encoded on its QuickSync chip to 5 Mb/s (a recording
+already lighter than that is sent as it is), as a replacement batch the
+stream server keeps hidden until every piece has landed. Then the new
+footage takes over exactly the time it covers; the old copy stays on the
+server, left out of the playlist (`replaced.json` in the angle's folder
+is the record — empty it to restore). Clips are never touched: they are
+cut from the box's own recording at full quality. Both buttons wait
+while a camera is live on the angle — the server refuses an upload there
+(409), because starting a session on an angle ends the one already on it.
+
 ## FAQ
 
 **Do I need the PlayCall cloud?** No. Standalone, the encoder is a

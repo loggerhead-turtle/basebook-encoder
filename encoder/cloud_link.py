@@ -454,6 +454,7 @@ class CloudLink:
         if not st or not st.get('id'):
             return None
         return {'id': str(st.get('id') or ''), 'state': st.get('state') or '',
+                'mode': st.get('mode') or 'fill',
                 'game': st.get('game') or '', 'angle': st.get('angle') or '',
                 'sent_s': int(st.get('sent_s') or 0),
                 'total_s': int(st.get('total_s') or 0),
