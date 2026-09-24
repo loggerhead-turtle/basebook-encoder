@@ -79,6 +79,14 @@ HTTP_TIMEOUT = 20
 # stop asking for a while, because HTTPS works and video matters more than
 # being right about the transport.
 SRT_MIN_ALIVE = 20
+# An SRT push carrying audio that dies inside this is, far more often than
+# not, the stream server refusing a track with no samples in it: its
+# listener waits 20 s to describe the audio, cannot, and hangs up. The
+# next pushes go without audio for SRT_AUDIO_OFF_S (21 Sep 2026, Maeser:
+# three hours of that loop, every session ending after 0 bytes, while the
+# box's YouTube push was fine).
+SRT_AUDIO_DEATH_S = 60
+SRT_AUDIO_OFF_S = 600
 SRT_STRIKES = 3
 SRT_COOLDOWN_S = 600
 
@@ -344,6 +352,36 @@ def ingest_kbps(cfg, http, wait_s=2.0, sleep=time.sleep):
     return int((b - a) * 8 / wait_s / 1000)
 
 
+# The camera's audio is DECODED AND RE-ENCODED on this box, never copied.
+#
+# Copying was the design for a month, on the reasoning that a re-encode
+# of a good AAC track buys nothing. What it lost, three games running,
+# was the audio: YouTube reported "audio bitrate (0)" for half-hour
+# stretches while the camera app was sending sound (21 Sep 2026), and
+# the same evening every SRT session to BaseStream died at 0 bytes with
+# the server's ffmpeg unable to read the copied track — "Audio: aac, 0
+# channels: unspecified sample format". Sound was there the whole time:
+# the clips cut from the box's own recording of the same feed have it.
+# A copy carries the camera's audio HEADER along with its frames, and a
+# header a decoder cannot read (a channel configuration of 0, a
+# configuration the SDP describes one way and the frames another) is a
+# track nobody downstream can describe, however much sound is in it.
+# The clip path never has to parse that header; the two live pushes do,
+# at every hop. A decode reads the frames themselves and the encoder
+# writes a header of its own: AAC-LC, 48 kHz, stereo, on a steady clock.
+# On an N150 that costs under a percent of a core.
+AUDIO_OUT = ['-c:a', 'aac', '-b:a', '128k', '-ar', '48000', '-ac', '2',
+             '-af', 'aresample=async=1:first_pts=0']
+
+
+def audio_out(acodec):
+    """The audio half of a push command: nothing when the camera sends
+    nothing usable, a re-encode of whatever it sends otherwise."""
+    if not acodec:
+        return ['-an']
+    return ['-map', '0:a:0?'] + AUDIO_OUT
+
+
 def build_ffmpeg_cmd(cfg, vcodec='', acodec='', video=None, hw_decode=True):
     """Read the published feed, write fragmented MP4 on stdout.
 
@@ -375,10 +413,7 @@ def build_ffmpeg_cmd(cfg, vcodec='', acodec='', video=None, hw_decode=True):
     # where SRT delivers it; pointed at this road it is worse than
     # useless, because it rejects any frame shorter than the seven-byte
     # ADTS header it expects to find and a silence frame is six.
-    if not acodec:
-        audio = ['-an']
-    else:
-        audio = ['-map', '0:a:0?', '-c:a', 'copy']
+    audio = audio_out(acodec)
     pre, vid = video_args(video, hw_decode)
     if video:
         fix = []                 # a fresh encode declares its own level
@@ -417,13 +452,7 @@ def build_srt_cmd(cfg, vcodec, url, acodec='', video=None, hw_decode=True):
     end that KNOWS the codec is the one that guarantees it.
     """
     fix = ['-bsf:v', 'h264_metadata=level=auto'] if vcodec == 'h264' else []
-    if not acodec:
-        audio = ['-an']
-    elif acodec == 'aac':
-        audio = ['-map', '0:a:0?', '-c:a', 'copy']
-    else:
-        audio = ['-map', '0:a:0?', '-c:a', 'aac', '-b:a', '128k',
-                 '-ar', '48000']
+    audio = audio_out(acodec)
     pre, vid = video_args(video, hw_decode)
     if video:
         fix = []                 # a fresh encode declares its own level
@@ -596,7 +625,19 @@ class LivePusher:
         if mode != 'https':
             ticket = self.request_srt(target, vcodec)
             if ticket:
-                return self.push_srt(cfg, target, ticket, vcodec, acodec)
+                if acodec and self._audio_is_off():
+                    acodec = ''
+                    self.audio_verdict = 'silent'
+                alive = self.push_srt(cfg, target, ticket, vcodec, acodec)
+                if acodec and alive < SRT_AUDIO_DEATH_S:
+                    self._audio_off_until = time.monotonic() + SRT_AUDIO_OFF_S
+                    log.warning('SRT push with audio ended after %.0f s — the '
+                                'stream server could not read the camera\'s '
+                                'audio (a track announced and not filled). '
+                                'The next pushes go without audio for %d '
+                                'minutes, then ask again.',
+                                alive, SRT_AUDIO_OFF_S // 60)
+                return alive
             if mode == 'srt':
                 # Asked for explicitly, so do not quietly do something
                 # else — say why nothing is going out.
@@ -604,6 +645,9 @@ class LivePusher:
                                   reason='SRT unavailable on the server')
                 return 0
         return self.push_https(cfg, target, vcodec, acodec)
+
+    def _audio_is_off(self):
+        return time.monotonic() < getattr(self, '_audio_off_until', 0.0)
 
     # ── SRT: ffmpeg holds the socket, we watch ──────────────────────────
     def push_srt(self, cfg, target, ticket, vcodec, acodec=''):
@@ -775,6 +819,8 @@ class LivePusher:
         not a reason to drop sound."""
         if getattr(self, 'audio_verdict', '') != 'silent':
             return
+        if self._audio_is_off():
+            return                       # the cool-down decides, not the probe
         now = time.monotonic()
         if now < getattr(self, '_audio_next_t', 0):
             return

@@ -1509,9 +1509,9 @@ def test_a_bitrate_on_capable_hardware_transcodes():
     assert cmd[cmd.index('-maxrate') + 1] == '3000k'
     assert cmd[cmd.index('-bufsize') + 1] == '6000k'
     assert '-vaapi_device' in cmd
-    # audio path untouched by the video ladder: confirmed AAC copies,
+    # audio path untouched by the video ladder: re-encoded either way,
     # and it is mapped explicitly
-    assert ['-c:a', 'copy'] == cmd[cmd.index('-c:a'):cmd.index('-c:a') + 2]
+    assert ['-c:a', 'aac'] == cmd[cmd.index('-c:a'):cmd.index('-c:a') + 2]
     assert '-map' in cmd and '0:a:0?' in cmd
 
 
@@ -2353,11 +2353,10 @@ def test_an_hevc_camera_is_read_over_rtsp():
     assert '-rtsp_transport' in cmd            # video survives the read
     assert 'rtsp://127.0.0.1:8554/live/k' in cmd
     assert 'hevc_vaapi' in cmd                 # …and transcodes to HEVC
-    # AAC audio still copies — the RTSP hop and the HEVC transcode do
-    # not force a re-encode of a track the probe named (the everyday
-    # HEVC-camera-into-N150 case; 16 Sep 2026: "I use hevc as well")
-    assert ['-c:a', 'copy'] == cmd[cmd.index('-c:a'):cmd.index('-c:a') + 2]
-    assert 'aresample' not in ' '.join(cmd)
+    # the audio is re-encoded whatever the video does (21 Sep 2026: a
+    # copied AAC track is what kept losing the sound)
+    assert ['-c:a', 'aac'] == cmd[cmd.index('-c:a'):cmd.index('-c:a') + 2]
+    assert 'aresample=async=1:first_pts=0' in cmd
 
 
 def test_an_h264_camera_keeps_the_rtmp_copy_path():
@@ -2371,7 +2370,7 @@ def test_an_h264_camera_keeps_the_rtmp_copy_path():
     assert 'rtmp://127.0.0.1:1935/live/k' in cmd
     assert '-rtsp_transport' not in cmd
     assert cmd[cmd.index('-c:v') + 1] == 'copy'
-    assert ['-c:a', 'copy'] == cmd[cmd.index('-c:a'):cmd.index('-c:a') + 2]
+    assert ['-c:a', 'aac'] == cmd[cmd.index('-c:a'):cmd.index('-c:a') + 2]
 
 
 # Field report (Provo Bulldogs, N150 v1.2.73, 9/8): 'in=unknown/assume-aac
@@ -2533,8 +2532,7 @@ def test_an_unreadable_probe_falls_back_to_rtsp_not_rtmp():
         # flv is certain to carry, while confirmed AAC still rides across
         # untouched — and either way it is mapped explicitly
         assert cmd[cmd.index('-c:v') + 1] == 'copy', (vcodec, acodec)
-        want = 'copy' if acodec == 'aac' else 'aac'
-        assert cmd[cmd.index('-c:a') + 1] == want, (vcodec, acodec)
+        assert cmd[cmd.index('-c:a') + 1] == 'aac', (vcodec, acodec)   # always re-encoded
         # …unless the probe NAMED the video and found no audio: then the
         # box's own silent track is mapped in its place (1.2.78)
         if vcodec and not acodec:
@@ -2839,19 +2837,23 @@ def test_the_push_maps_audio_explicitly_and_tolerates_none():
     assert cmd.index('-i') < i < cmd.index('-c:a')
 
 
-def test_named_aac_is_copied_whatever_the_video_and_unnamed_audio_is_not():
-    """The audio rule, in both halves. A probe that NAMED the track as
-    AAC → copied, over RTMP (H.264) and over RTSP (HEVC into an N150 —
-    the everyday case; 16 Sep 2026: "I use hevc as well from the
-    encoder"). A probe that could not name it, or named something else
-    → re-encoded to AAC 48 kHz stereo and re-clocked, never copied
-    blind."""
+def test_every_audio_track_is_re_encoded_never_copied():
+    """The audio rule: whatever the probe named — AAC, Opus, mu-law,
+    nothing it could name — the track is decoded here and re-encoded to
+    AAC 48 kHz stereo on a steady clock. AAC used to be copied (16 Sep
+    2026: "I use hevc as well" — the audio rode across untouched), and
+    the copied track is what YouTube read as audio bitrate (0) and the
+    stream server could not describe, on 21 Sep 2026, with sound in the
+    clips from the same feed the whole time. A copy carries the
+    camera's header; a re-encode writes its own."""
     from encoder import youtube_push as yp
     for vcodec in ('h264', 'hevc', ''):
         cmd = yp.build_ffmpeg_cmd(_acfg(), 'aac', 'rtmps://y/k', vcodec=vcodec,
                                   hw_decode=False, caps={})
-        assert cmd[cmd.index('-c:a') + 1] == 'copy', vcodec
-        assert 'aresample=async=1:first_pts=0' not in cmd, vcodec
+        assert cmd[cmd.index('-c:a') + 1] == 'aac', vcodec
+        assert cmd[cmd.index('-ac') + 1] == '2' and cmd[cmd.index('-ar') + 1] == '48000'
+        assert 'aresample=async=1:first_pts=0' in cmd, vcodec
+        assert 'copy' not in cmd[cmd.index('-c:a'):], vcodec
     for acodec, vcodec in (('', ''), ('opus', 'hevc'), ('pcm_mulaw', 'hevc')):
         cmd = yp.build_ffmpeg_cmd(_acfg(), acodec, 'rtmps://y/k', vcodec=vcodec,
                                   hw_decode=False, caps={})
@@ -2894,9 +2896,9 @@ def test_the_status_says_what_happened_to_the_audio(monkeypatch):
         p.run_once()
     except RuntimeError:
         pass
-    # HEVC + named AAC: the track is copied, and the status says so
+    # HEVC + named AAC: the track is re-encoded, and the status says so
     assert st.audio == {'in': 'aac', 'sample_rate': 48000, 'channels': 2,
-                        'out': 'copy', 'mapped': True}
+                        'out': 'aac', 'mapped': True}
     # HEVC and no audio track: the box sends silence and says so
     monkeypatch.setattr(yp, 'probe_streams', lambda *a, **k: ('hevc', '', None))
     try:
@@ -3034,7 +3036,7 @@ def test_a_probe_that_cannot_answer_never_replaces_a_real_track(
                              sound=lambda: None, packets=lambda: None)
     assert 'anullsrc=channel_layout=stereo:sample_rate=48000' not in spawned[0]
     assert p.audio_verdict == 'camera'
-    assert '-c:a' in spawned[0] and spawned[0][spawned[0].index('-c:a') + 1] == 'copy'
+    assert '-c:a' in spawned[0] and spawned[0][spawned[0].index('-c:a') + 1] == 'aac'
 
 
 def test_a_copied_track_that_stops_carrying_packets_ends_the_push_for_silence(

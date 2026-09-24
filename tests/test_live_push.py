@@ -12,6 +12,7 @@ Run: python -m pytest tests/test_live_push.py
 """
 
 import json
+import logging
 import os
 import time
 from pathlib import Path
@@ -439,7 +440,7 @@ def test_srt_sends_mpegts_and_keeps_the_level_fix():
     assert cmd[cmd.index('-f') + 1] == 'mpegts'
     assert cmd[-1] == 'srt://s:8890?x=1'
     assert cmd[cmd.index('-c:v') + 1] == 'copy'
-    assert cmd[cmd.index('-c:a') + 1] == 'copy'      # already AAC
+    assert cmd[cmd.index('-c:a') + 1] == 'aac'       # re-encoded, never copied
     assert '-bsf:v' in cmd and 'h264_metadata=level=auto' in cmd
     assert cmd[cmd.index('-i') + 1].startswith('rtsp://127.0.0.1:8554/')
     # Counters for the settings card: with SRT the box is not the one
@@ -587,7 +588,7 @@ def test_audio_always_leaves_the_box_as_aac_over_srt():
         assert '-b:a' in cmd and '-ar' in cmd
     cmd = live_push.build_srt_cmd({'local_ingest_key': 'k'}, 'hevc',
                                   'srt://s', 'aac')
-    assert cmd[cmd.index('-c:a') + 1] == 'copy'      # already AAC
+    assert cmd[cmd.index('-c:a') + 1] == 'aac'       # AAC in, AAC out — re-encoded
     # No usable audio is not 'unknown audio': the track is dropped, never
     # carried empty.
     none = live_push.build_srt_cmd({'local_ingest_key': 'k'}, 'hevc',
@@ -831,7 +832,7 @@ def test_the_transcode_rides_the_chip_on_both_roads():
     assert cmd[cmd.index('-b:v') + 1] == '3000k' and cmd[cmd.index('-maxrate') + 1] == '3000k'
     assert cmd[cmd.index('-bufsize') + 1] == '6000k' and cmd[cmd.index('-g') + 1] == '60'
     assert 'scale_vaapi=format=nv12' in cmd
-    assert cmd[cmd.index('-c:a') + 1] == 'copy'                   # audio untouched
+    assert cmd[cmd.index('-c:a') + 1] == 'aac'                    # audio re-encoded, on its own clock
     assert '-c' not in cmd[cmd.index('-map'):]                    # no blanket copy
     assert 'h264_metadata=level=auto' not in cmd                  # a fresh encode sets its level
     assert cmd[-1] == 'pipe:1' and '-movflags' in cmd
@@ -894,3 +895,66 @@ def test_a_transcode_that_dies_fast_three_times_yields_to_copy(monkeypatch):
     for _ in range(5):
         p.note_transcode_run(1)
     assert p._decide_video(cfg) is not None
+
+
+# ── 21 Sep 2026: an SRT push with an unfilled audio track, round and round ───
+
+def _srt_pusher(monkeypatch, tmp_path, alive):
+    seen = []
+
+    def http(url, payload=None, headers=None, timeout=None):
+        return {'ok': True, 'session': 'ls_1',
+                'srt': {'url': 'srt://s:8890', 'port': 8890,
+                        'latency_ms': 2000, 'passphrase': 'p' * 32}}
+    p = _pusher_with(monkeypatch, tmp_path, http)
+    monkeypatch.setattr(live_push, 'read_target',
+                        lambda *a: {'ingest': 'https://s/ingest',
+                                    'token': 't', 'game': 'g',
+                                    'angle': 'main'})
+    monkeypatch.setattr(p, '_probe', lambda cfg: ('hevc', 'aac'))
+    monkeypatch.setattr(p, 'push_srt',
+                        lambda cfg, t, ticket, v, a='': seen.append(a) or alive)
+    return p, seen
+
+
+def test_an_srt_push_that_dies_fast_with_audio_goes_without_it_next(
+        monkeypatch, tmp_path, caplog):
+    """Maeser: the stream server waited 20 s for the camera's audio,
+    could not describe it, and hung up; the box dialled straight back
+    in with the same track. Three hours of 0-byte sessions. A fast death
+    with audio mapped now takes the audio off for ten minutes."""
+    p, seen = _srt_pusher(monkeypatch, tmp_path, alive=33)
+    with caplog.at_level(logging.WARNING, logger='live_push'):
+        p.run_once()
+    assert seen == ['aac']
+    assert any('without audio' in r.message for r in caplog.records)
+    p.run_once()
+    assert seen == ['aac', '']                   # the retry carries picture only
+    assert p.audio_verdict == 'silent'
+    # the probe does not bring it back early — the cool-down decides
+    monkeypatch.setattr(live_push, 'audio_has_sound', lambda *a, **k: True)
+    p._audio_next_t = 0
+    p._audio_recheck()                           # no restart raised
+    # after the cool-down, audio is asked for again
+    p._audio_off_until = 0
+    p.run_once()
+    assert seen[-1] == 'aac'
+
+
+def test_a_push_that_lasts_or_carries_no_audio_changes_nothing(
+        monkeypatch, tmp_path):
+    p, seen = _srt_pusher(monkeypatch, tmp_path,
+                          alive=live_push.SRT_AUDIO_DEATH_S + 5)
+    p.run_once()
+    p.run_once()
+    assert seen == ['aac', 'aac']
+    assert not p._audio_is_off()
+    p, seen = _srt_pusher(monkeypatch, tmp_path, alive=5)
+    monkeypatch.setattr(p, '_probe', lambda cfg: ('hevc', ''))
+    p.run_once()
+    assert not p._audio_is_off()
+
+
+def test_the_cool_down_is_ten_minutes_and_the_threshold_a_minute():
+    assert live_push.SRT_AUDIO_OFF_S == 600
+    assert live_push.SRT_AUDIO_DEATH_S == 60

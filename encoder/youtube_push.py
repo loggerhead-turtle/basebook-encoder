@@ -211,24 +211,27 @@ def build_ffmpeg_cmd(cfg, acodec, push_url, hw=None, caps=None, vcodec='',
     # unknown, not silent, and keeps the optional map — a real track
     # must never be talked over.
     silent = bool(vcodec) and not acodec
-    # Audio is COPIED when the probe NAMED it as AAC — whatever the
-    # video is. An HEVC camera into an N150 (the everyday case here) is
-    # read over RTSP and transcoded on the chip; its AAC still rides
-    # across untouched, because a re-encode of a good track buys nothing
-    # and a transcode is not a reason to touch the audio. Audio we could
-    # not name, or that is not AAC, is re-encoded to AAC 48 kHz stereo
-    # with aresample=async so FLV is certain to carry it on a steady
-    # clock. What changed on 15 Sep 2026 is the explicit map above and
-    # the status block below — the box now SAYS what audio it sends.
+    # Audio with a track behind it is DECODED AND RE-ENCODED here, AAC
+    # included — see live_push.AUDIO_OUT. It was copied for a month on
+    # the reasoning that a re-encode of a good track buys nothing; what
+    # the copy bought was three games of "audio bitrate (0)" at YouTube
+    # and, on 21 Sep 2026, a track the stream server's ffmpeg could not
+    # describe, while the clips cut from the same feed had sound. A copy
+    # carries the camera's audio header; a re-encode writes a standard
+    # one (AAC-LC, 48 kHz, stereo) on a steady clock, and the status
+    # block below says which the box sent.
     if silent:
         input_args = input_args + ['-f', 'lavfi', '-i',
                                    'anullsrc=channel_layout=stereo:sample_rate=48000']
         map_args = ['-map', '0:v:0', '-map', '1:a:0']
         audio_args = ['-c:a', 'aac', '-b:a', '128k', '-ar', '48000',
                       '-ac', '2', '-shortest']    # ends with the picture
-    elif acodec == 'aac':
-        audio_args = ['-c:a', 'copy']
     else:
+        # Decoded and re-encoded, AAC or not — see live_push.AUDIO_OUT for
+        # why a copy of a named AAC track is the thing that kept losing
+        # the sound (21 Sep 2026: "audio bitrate (0)" at YouTube and a
+        # track the stream server could not describe, in the same game,
+        # with sound in the clips the whole time).
         audio_args = ['-c:a', 'aac', '-b:a', '128k', '-ar', '48000',
                       '-ac', '2', '-af', 'aresample=async=1:first_pts=0']
     kbps, codec = effective_video(cfg, vcodec=vcodec, hw=hw, caps=caps)
@@ -439,14 +442,12 @@ class YouTubePusher:
             'in': acodec or '',
             'sample_rate': (adetail or {}).get('sample_rate') or 0,
             'channels': (adetail or {}).get('channels') or 0,
-            # 'copy' rides the camera's own frames; 'aac' is re-encoded
-            # and re-clocked; '' means the probe saw no audio track at
-            # all, which is the one case that IS the camera's fault.
-            # 'silence' is the box's own track, generated because the
-            # camera has none (video named, audio absent); '' means the
-            # probe could not read the camera at all.
-            'out': (('copy' if acodec == 'aac' else 'aac') if acodec
-                    else ('silence' if vcodec else '')),
+            # 'aac': the camera's sound, decoded and re-encoded here (a
+            # copy was never safe — see live_push.AUDIO_OUT); 'silence'
+            # is the box's own track, generated because the camera has
+            # none (video named, audio absent); '' means the probe could
+            # not read the camera at all.
+            'out': ('aac' if acodec else ('silence' if vcodec else '')),
             'mapped': bool(acodec or vcodec),
         }
         if cam_acodec and not acodec:

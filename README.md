@@ -317,11 +317,16 @@ rock-solid RTMP→YouTube relay with a local recording. Pairing to the
 cloud adds automatic play clips, remote status, radar capture, and
 multi-team assignment hopping.
 
-**Does it transcode?** No — video is pushed to YouTube byte-for-byte
-(`-c:v copy`). What your camera sends is what YouTube gets, so set the
-camera bitrate for your *uplink*, not your LAN. (Opus audio from
-WebRTC-ish sources is the one exception — it's transcoded to AAC because
-RTMP can't carry Opus.)
+**Does it transcode?** Video: only when you ask (the *picture YouTube
+gets* and *picture the site gets* settings); otherwise it is pushed
+byte-for-byte (`-c:v copy`), so set the camera bitrate for your *uplink*,
+not your LAN. Audio: **always** decoded and re-encoded on the box to
+AAC-LC 48 kHz stereo (128 kb/s), since 1.2.97. A copy of the camera's
+AAC carried the camera's audio header with it, and a header a decoder
+downstream cannot read is a track it cannot use, however much sound is
+in it — that is how a camera with sound produced "audio bitrate (0)" at
+YouTube and 0-byte sessions at BaseStream on the same evening. The
+re-encode costs under a percent of an N150 core.
 
 **Where does the score bug come from?** From the PlayCall site, not the
 box: Score Bug Studio gives you a transparent browser-overlay URL. Add
