@@ -345,9 +345,17 @@ class Backfill:
             raise Busy('this box is still live on that game — the recording '
                        'goes up after the live push stops')
         frm, to = float(t.get('from') or 0), float(t.get('to') or 0)
+        # A restart mid-job (an Update pressed while a piece was going)
+        # must not send the same minutes twice: two runs of one batch
+        # covering the same time would both play. What already landed is
+        # kept in the status file and skipped here.
+        prior = self._status()
+        done_spans = [tuple(x) for x in (prior.get('sent_spans') or [])] \
+            if prior.get('id') == t['id'] and prior.get('mode') == mode else []
         self._write(id=t['id'], game=t.get('game'), angle=t.get('angle'),
                     mode=mode, state='planning', sent_s=0, total_s=0, pieces=0,
-                    done_pieces=0, error='', note='')
+                    done_pieces=0, error='', note='', phase='', piece=0,
+                    sent_spans=[list(x) for x in done_spans])
         segs = record_segments(cfg, self.http_get)
         if mode == 'replace':
             plan = pieces([(frm, to)], segs)
@@ -370,8 +378,13 @@ class Backfill:
         sent, strikes, ok = 0.0, 0, 0
         batch = t['id'] if mode == 'replace' else ''
         for i, (a, b) in enumerate(plan):
+            if (a, b) in done_spans:
+                sent += b - a
+                ok += 1
+                self._write(sent_s=round(sent), done_pieces=ok)
+                continue
             try:
-                self.send_piece(cfg, t, a, b, batch=batch)
+                self.send_piece(cfg, t, a, b, i + 1, batch=batch)
                 strikes = 0
             except Busy:
                 raise                     # a camera came on: wait, resend later
@@ -386,7 +399,9 @@ class Backfill:
                 continue
             sent += b - a
             ok += 1
-            self._write(sent_s=round(sent), done_pieces=ok)
+            done_spans.append((a, b))
+            self._write(sent_s=round(sent), done_pieces=ok, phase='', piece=0,
+                        sent_spans=[list(x) for x in done_spans])
         note = (f'{ok} piece(s) sent' if ok == len(plan) else
                 f'{ok} of {len(plan)} piece(s) sent — '
                 f'{len(plan) - ok} could not be')
@@ -426,12 +441,15 @@ class Backfill:
         except Exception:
             return None
 
-    def send_piece(self, cfg, t, a, b, batch=''):
+    def send_piece(self, cfg, t, a, b, n=0, batch=''):
+        self._write(phase='fetching', piece=n, piece_pct=0)
         data = fetch_piece(cfg, a, b - a, self.http_get)
         if len(data) < 1024:
             raise RuntimeError('the recording came back empty')
         if batch:
+            self._write(phase='re-encoding', piece=n, piece_pct=0)
             data = self._clean_copy(data, b - a)
+        self._write(phase='uploading', piece=n, piece_pct=0)
         body = {'token': t['token'], 'capture_start': a,
                 'tier_kbps': REPLACE_KBPS if batch else 0, 'codec': '',
                 'upload': True}
@@ -449,11 +467,16 @@ class Backfill:
             raise RuntimeError(f'stream server refused the upload: {r}')
         try:
             bps = UPLOAD_BPS_LIVE if camera_live(self.http_get) else UPLOAD_BPS_IDLE
+            last_pct = -1
             for i in range(0, len(data), CHUNK):
                 chunk = data[i:i + CHUNK]
                 self.http(f'{t["ingest"]}/{sid}/feed', chunk,
                           {'X-Backlog-Ms': '0'})
                 self.sleep(len(chunk) / bps)
+                pct = int(100 * (i + len(chunk)) / len(data))
+                if pct // 5 != last_pct // 5:          # a write every 5 %
+                    last_pct = pct
+                    self._write(piece_pct=pct)
         finally:
             try:
                 self.http(f'{t["ingest"]}/{sid}/stop', {})

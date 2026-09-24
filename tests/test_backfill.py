@@ -418,3 +418,71 @@ def test_the_transcode_runs_on_the_chip_with_a_cpu_fallback(tmp_path, monkeypatc
         assert '+frag_keyframe+empty_moov+default_base_moof' in argv
         assert argv[argv.index('-c:a') + 1] == 'aac'
     assert list(tmp_path.iterdir()) == []            # temp files cleaned up
+
+
+# ── the phase inside a piece, and a restart that does not resend ─────────────
+
+def test_the_status_names_the_phase_inside_a_piece(tmp_path, monkeypatch):
+    """0 of 20 pieces for five minutes told a coach nothing (24 Sep 2026).
+    Each piece is fetched, re-encoded on the chip (minutes), then
+    uploaded; the status says which, and how far the upload is."""
+    monkeypatch.setattr(backfill, 'REPLACE_KBPS', 1)
+    srv = _Server({'runs': 0}, segments=[(1000.0, 1200.0)])
+    _replace_target(tmp_path)
+    phases = []
+    w, _ = _worker(tmp_path, srv)
+    w.hw = 'hevc'
+    real_write = w._write
+
+    def spy(**fields):
+        st = real_write(**fields)
+        phases.append((st.get('phase'), st.get('piece'), st.get('piece_pct')))
+        return st
+    w._write = spy
+    w.transcode = lambda data, kbps, codec: b'\x01' * (CHUNK_BYTES * 4)
+    w.tick()
+    seen = [p for p in phases if p[0]]
+    assert ('fetching', 1, 0) in seen
+    assert ('re-encoding', 1, 0) in seen
+    assert ('uploading', 1, 0) in seen
+    assert ('uploading', 1, 100) in seen
+    # a finished piece clears the phase; the file says which pieces landed
+    st = json.loads((tmp_path / 'status.json').read_text())
+    assert st['phase'] == '' and st['piece'] == 0
+    assert st['sent_spans'] == [[1000.0, 1600.0], [1600.0, 2200.0]]
+
+
+CHUNK_BYTES = backfill.CHUNK
+
+
+def test_a_restart_mid_job_skips_the_pieces_already_sent(tmp_path):
+    """An Update pressed while a piece was going restarts the service. The
+    same minutes sent twice under one batch would play twice, so what
+    already landed is skipped, and counted."""
+    srv = _Server({'runs': 0}, segments=[(1000.0, 1200.0)])
+    t = _replace_target(tmp_path)
+    backfill._atomic_json(tmp_path / 'status.json',
+                          {'id': t['id'], 'mode': 'replace', 'state': 'sending',
+                           'sent_spans': [[1000.0, 1600.0]]})
+    w, _ = _worker(tmp_path, srv)
+    w.tick()
+    starts = [p['capture_start'] for u, p, _ in srv.posts if u.endswith('/start')]
+    assert starts == [1600.0]                     # only the second piece went
+    st = json.loads((tmp_path / 'status.json').read_text())
+    assert st['state'] == 'done' and st['done_pieces'] == 2 and st['sent_s'] == 1200
+    # a different request id starts clean
+    t['id'] = 'bfbb02'
+    (tmp_path / 'target.json').write_text(json.dumps(t))
+    w.tick()
+    starts = [p['capture_start'] for u, p, _ in srv.posts if u.endswith('/start')]
+    assert starts == [1600.0, 1000.0, 1600.0]
+
+
+def test_the_heartbeat_carries_the_phase(tmp_path, monkeypatch):
+    monkeypatch.setenv('PLAYCALL_ENCODER_STATE', str(tmp_path))
+    link = _link({'assigned': False}, tmp_path, monkeypatch)
+    backfill._atomic_json(tmp_path / 'backfill.json',
+                          {'id': 'bf9', 'state': 'sending', 'phase': 're-encoding',
+                           'piece': 3, 'piece_pct': 0})
+    st = link.backfill_status()
+    assert st['phase'] == 're-encoding' and st['piece'] == 3

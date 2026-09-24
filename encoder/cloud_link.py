@@ -460,6 +460,11 @@ class CloudLink:
                 'total_s': int(st.get('total_s') or 0),
                 'pieces': int(st.get('pieces') or 0),
                 'done_pieces': int(st.get('done_pieces') or 0),
+                # inside the current piece: fetching / re-encoding /
+                # uploading, and how far the upload is
+                'phase': str(st.get('phase') or '')[:16],
+                'piece': int(st.get('piece') or 0),
+                'piece_pct': int(st.get('piece_pct') or 0),
                 'note': str(st.get('note') or '')[:200],
                 'error': str(st.get('error') or '')[:200],
                 'updated': st.get('updated')}
