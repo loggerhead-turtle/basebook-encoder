@@ -917,20 +917,52 @@ def _srt_pusher(monkeypatch, tmp_path, alive):
     return p, seen
 
 
-def test_an_srt_push_that_dies_fast_with_audio_goes_without_it_next(
-        monkeypatch, tmp_path, caplog):
-    """Maeser: the stream server waited 20 s for the camera's audio,
-    could not describe it, and hung up; the box dialled straight back
-    in with the same track. Three hours of 0-byte sessions. A fast death
-    with audio mapped now takes the audio off for ten minutes."""
+def test_one_young_death_with_audio_changes_nothing(monkeypatch, tmp_path):
+    """25 Sep 2026: a reassignment during setup killed an SRT push with
+    audio inside a minute, and the old reflex silenced BaseStream for ten
+    minutes while YouTube, on the same track, had sound. One young death
+    is not evidence of anything about the audio."""
     p, seen = _srt_pusher(monkeypatch, tmp_path, alive=33)
-    with caplog.at_level(logging.WARNING, logger='live_push'):
-        p.run_once()
-    assert seen == ['aac']
-    assert any('without audio' in r.message for r in caplog.records)
     p.run_once()
-    assert seen == ['aac', '']                   # the retry carries picture only
-    assert p.audio_verdict == 'silent'
+    p.run_once()
+    assert seen == ['aac', 'aac']
+    assert not p._audio_is_off()
+
+
+def test_two_young_deaths_buy_one_push_without_audio_as_the_control(
+        monkeypatch, tmp_path, caplog):
+    """Maeser, 21 Sep 2026: the stream server could not describe the
+    camera's audio, hung up, and the box dialled straight back in with
+    the same track — three hours of 0-byte sessions. Two young deaths
+    with audio now buy ONE push without it. If that push lives where the
+    two with sound died, the track is blamed and rested for ten minutes;
+    if it dies young too, the link was the problem and audio comes back."""
+    outcomes = {'aac': 33, '': 33}
+    p, seen = _srt_pusher(monkeypatch, tmp_path, alive=0)
+    monkeypatch.setattr(p, 'push_srt',
+                        lambda cfg, t, ticket, v, a='': seen.append(a) or outcomes[a])
+    with caplog.at_level(logging.INFO, logger='live_push'):
+        p.run_once(); p.run_once()               # two young deaths with audio
+        assert seen == ['aac', 'aac']
+        assert any('goes without audio, once' in r.message for r in caplog.records)
+        p.run_once()                             # the control, picture only…
+        assert seen[-1] == ''
+        assert not p._audio_is_off()             # …died young too: the link
+        assert any('the link, not the track' in r.message for r in caplog.records)
+        p.run_once()
+        assert seen[-1] == 'aac'                 # audio is back at once
+
+    outcomes = {'aac': 33, '': live_push.SRT_AUDIO_DEATH_S + 5}
+    p, seen = _srt_pusher(monkeypatch, tmp_path, alive=0)
+    monkeypatch.setattr(p, 'push_srt',
+                        lambda cfg, t, ticket, v, a='': seen.append(a) or outcomes[a])
+    with caplog.at_level(logging.WARNING, logger='live_push'):
+        p.run_once(); p.run_once(); p.run_once()
+    assert seen == ['aac', 'aac', '']
+    assert p._audio_is_off()                     # picture-only lived: the track
+    assert any('without audio for 10 minutes' in r.message for r in caplog.records)
+    p.run_once()
+    assert seen[-1] == '' and p.audio_verdict == 'silent'
     # the probe does not bring it back early — the cool-down decides
     monkeypatch.setattr(live_push, 'audio_has_sound', lambda *a, **k: True)
     p._audio_next_t = 0
@@ -948,13 +980,15 @@ def test_a_push_that_lasts_or_carries_no_audio_changes_nothing(
     p.run_once()
     p.run_once()
     assert seen == ['aac', 'aac']
-    assert not p._audio_is_off()
+    assert not p._audio_is_off() and p._audio_deaths == 0
     p, seen = _srt_pusher(monkeypatch, tmp_path, alive=5)
     monkeypatch.setattr(p, '_probe', lambda cfg: ('hevc', ''))
     p.run_once()
-    assert not p._audio_is_off()
+    p.run_once()
+    assert not p._audio_is_off() and not p._audio_trial
 
 
 def test_the_cool_down_is_ten_minutes_and_the_threshold_a_minute():
     assert live_push.SRT_AUDIO_OFF_S == 600
     assert live_push.SRT_AUDIO_DEATH_S == 60
+    assert live_push.SRT_AUDIO_DEATHS == 2

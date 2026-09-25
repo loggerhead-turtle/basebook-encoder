@@ -2356,7 +2356,7 @@ def test_an_hevc_camera_is_read_over_rtsp():
     # the audio is re-encoded whatever the video does (21 Sep 2026: a
     # copied AAC track is what kept losing the sound)
     assert ['-c:a', 'aac'] == cmd[cmd.index('-c:a'):cmd.index('-c:a') + 2]
-    assert 'aresample=async=1:first_pts=0' in cmd
+    assert 'aresample=async=1000:min_hard_comp=0.100:first_pts=0' in cmd
 
 
 def test_an_h264_camera_keeps_the_rtmp_copy_path():
@@ -2852,7 +2852,7 @@ def test_every_audio_track_is_re_encoded_never_copied():
                                   hw_decode=False, caps={})
         assert cmd[cmd.index('-c:a') + 1] == 'aac', vcodec
         assert cmd[cmd.index('-ac') + 1] == '2' and cmd[cmd.index('-ar') + 1] == '48000'
-        assert 'aresample=async=1:first_pts=0' in cmd, vcodec
+        assert 'aresample=async=1000:min_hard_comp=0.100:first_pts=0' in cmd, vcodec
         assert 'copy' not in cmd[cmd.index('-c:a'):], vcodec
     for acodec, vcodec in (('', ''), ('opus', 'hevc'), ('pcm_mulaw', 'hevc')):
         cmd = yp.build_ffmpeg_cmd(_acfg(), acodec, 'rtmps://y/k', vcodec=vcodec,
@@ -2860,7 +2860,7 @@ def test_every_audio_track_is_re_encoded_never_copied():
         assert cmd[cmd.index('-c:a') + 1] == 'aac', acodec
         assert cmd[cmd.index('-ar') + 1] == '48000'
         assert cmd[cmd.index('-ac') + 1] == '2'
-        assert cmd[cmd.index('-af') + 1] == 'aresample=async=1:first_pts=0'
+        assert cmd[cmd.index('-af') + 1] == 'aresample=async=1000:min_hard_comp=0.100:first_pts=0'
 
 
 def test_probe_streams_reports_the_audio_the_camera_sends():
@@ -2931,7 +2931,7 @@ def test_a_camera_with_no_audio_track_gets_silence_so_youtube_starts():
     m = cmd.index('-map')
     assert cmd[m:m + 4] == ['-map', '0:v:0', '-map', '1:a:0'], cmd
     assert cmd[cmd.index('-c:a') + 1] == 'aac' and '-shortest' in cmd
-    assert 'aresample=async=1:first_pts=0' not in cmd
+    assert 'aresample=async=1000:min_hard_comp=0.100:first_pts=0' not in cmd
     cmd = yp.build_ffmpeg_cmd(_acfg(), '', 'rtmps://y/k', vcodec='',
                               hw_decode=False, caps={})
     assert 'lavfi' not in cmd and cmd[cmd.index('-map') + 3] == '0:a:0?'

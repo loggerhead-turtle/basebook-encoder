@@ -79,14 +79,20 @@ HTTP_TIMEOUT = 20
 # stop asking for a while, because HTTPS works and video matters more than
 # being right about the transport.
 SRT_MIN_ALIVE = 20
-# An SRT push carrying audio that dies inside this is, far more often than
-# not, the stream server refusing a track with no samples in it: its
-# listener waits 20 s to describe the audio, cannot, and hangs up. The
-# next pushes go without audio for SRT_AUDIO_OFF_S (21 Sep 2026, Maeser:
-# three hours of that loop, every session ending after 0 bytes, while the
-# box's YouTube push was fine).
+# An SRT push carrying audio that dies inside this USED to take the audio
+# off the next pushes for SRT_AUDIO_OFF_S on its own (21 Sep 2026, Maeser:
+# the stream server could not describe a copied track, hung up, and the
+# box dialled straight back in — three hours of 0-byte sessions). The
+# track is re-encoded now (AUDIO_OUT), so that cause is gone, and the
+# reflex had a cost: ANY young death — a ticket that never connected, a
+# reassignment, a restart during setup — silenced BaseStream for ten
+# minutes while YouTube, on the same track, had sound (25 Sep 2026). So
+# it takes evidence now: two young deaths WITH audio, then one push
+# without it; only if the picture-only push lives where the two with
+# sound died is the track blamed and rested for SRT_AUDIO_OFF_S.
 SRT_AUDIO_DEATH_S = 60
 SRT_AUDIO_OFF_S = 600
+SRT_AUDIO_DEATHS = 2
 SRT_STRIKES = 3
 SRT_COOLDOWN_S = 600
 
@@ -370,8 +376,19 @@ def ingest_kbps(cfg, http, wait_s=2.0, sleep=time.sleep):
 # at every hop. A decode reads the frames themselves and the encoder
 # writes a header of its own: AAC-LC, 48 kHz, stereo, on a steady clock.
 # On an N150 that costs under a percent of a core.
+#
+# The resampler's clock matching is SOFT. async=1 was "fill and trim":
+# every timestamp wobble on the way in (a phone stamps each AAC frame
+# from its own clock; MediaMTX's RTSP read adds jitter of its own) was
+# corrected by dropping or inserting samples — a hard edge in the
+# waveform, ~47 times a second, one per frame. On YouTube that played as
+# a steady hum, the shape of a ground loop, on 25 Sep 2026 — with no
+# loop anywhere, and the clips cut from the same feed clean. async=1000
+# stretches by up to 1000 samples a second (two percent, inaudible)
+# instead, and only a jump past min_hard_comp (100 ms — a real gap) is
+# cut hard.
 AUDIO_OUT = ['-c:a', 'aac', '-b:a', '128k', '-ar', '48000', '-ac', '2',
-             '-af', 'aresample=async=1:first_pts=0']
+             '-af', 'aresample=async=1000:min_hard_comp=0.100:first_pts=0']
 
 
 def audio_out(acodec):
@@ -529,6 +546,10 @@ class LivePusher:
         # SRT is asked for again after this; see _note_srt_attempt.
         self._srt_off_until = 0.0
         self._srt_strikes = 0
+        # the audio breaker's evidence; see SRT_AUDIO_DEATHS
+        self._audio_deaths = 0
+        self._audio_trial = False
+        self._audio_off_until = 0.0
 
     # ── the stream server ───────────────────────────────────────────────
     @staticmethod
@@ -625,18 +646,19 @@ class LivePusher:
         if mode != 'https':
             ticket = self.request_srt(target, vcodec)
             if ticket:
+                trial = False
                 if acodec and self._audio_is_off():
                     acodec = ''
                     self.audio_verdict = 'silent'
+                elif acodec and self._audio_trial:
+                    # the control: picture only, once, to tell the track
+                    # from the link
+                    self._audio_trial = False
+                    acodec = ''
+                    self.audio_verdict = 'silent'
+                    trial = True
                 alive = self.push_srt(cfg, target, ticket, vcodec, acodec)
-                if acodec and alive < SRT_AUDIO_DEATH_S:
-                    self._audio_off_until = time.monotonic() + SRT_AUDIO_OFF_S
-                    log.warning('SRT push with audio ended after %.0f s — the '
-                                'stream server could not read the camera\'s '
-                                'audio (a track announced and not filled). '
-                                'The next pushes go without audio for %d '
-                                'minutes, then ask again.',
-                                alive, SRT_AUDIO_OFF_S // 60)
+                self._judge_audio(acodec, alive, trial)
                 return alive
             if mode == 'srt':
                 # Asked for explicitly, so do not quietly do something
@@ -648,6 +670,38 @@ class LivePusher:
 
     def _audio_is_off(self):
         return time.monotonic() < getattr(self, '_audio_off_until', 0.0)
+
+    def _judge_audio(self, acodec, alive, trial):
+        """What a push's lifetime says about the camera's audio track.
+        Nothing, from one young death: links drop, tickets expire, games
+        get reassigned. Two in a row with audio buy one push without it;
+        that push living is the only evidence that blames the track."""
+        if trial:
+            if alive >= SRT_AUDIO_DEATH_S:
+                self._audio_off_until = time.monotonic() + SRT_AUDIO_OFF_S
+                self._audio_deaths = 0
+                log.warning('SRT push without audio lived %.0f s where two '
+                            'with it died young — the stream server cannot '
+                            'read the camera\'s audio. The next pushes go '
+                            'without audio for %d minutes, then ask again.',
+                            alive, SRT_AUDIO_OFF_S // 60)
+            else:
+                self._audio_deaths = 0
+                log.info('SRT push without audio died young too (%.0f s) — '
+                         'the link, not the track; audio comes back on the '
+                         'next push', alive)
+            return
+        if not acodec:
+            return
+        if alive >= SRT_AUDIO_DEATH_S:
+            self._audio_deaths = 0
+            return
+        self._audio_deaths += 1
+        if self._audio_deaths >= SRT_AUDIO_DEATHS:
+            self._audio_trial = True
+            log.warning('%d SRT pushes with audio ended young (last %.0f s) — '
+                        'the next one goes without audio, once, to tell the '
+                        'track from the link', self._audio_deaths, alive)
 
     # ── SRT: ffmpeg holds the socket, we watch ──────────────────────────
     def push_srt(self, cfg, target, ticket, vcodec, acodec=''):

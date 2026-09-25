@@ -232,8 +232,10 @@ def build_ffmpeg_cmd(cfg, acodec, push_url, hw=None, caps=None, vcodec='',
         # the sound (21 Sep 2026: "audio bitrate (0)" at YouTube and a
         # track the stream server could not describe, in the same game,
         # with sound in the clips the whole time).
+        # soft clock matching — see live_push.AUDIO_OUT for the hum that
+        # fill-and-trim (async=1) put on YouTube on 25 Sep 2026
         audio_args = ['-c:a', 'aac', '-b:a', '128k', '-ar', '48000',
-                      '-ac', '2', '-af', 'aresample=async=1:first_pts=0']
+                      '-ac', '2', '-af', 'aresample=async=1000:min_hard_comp=0.100:first_pts=0']
     kbps, codec = effective_video(cfg, vcodec=vcodec, hw=hw, caps=caps)
     if kbps:
         # QuickSync via VA-API, both halves on the chip. The decode used
