@@ -222,13 +222,20 @@ def probe_codecs(cfg, runner=None, verdict=None):
             if isinstance(verdict, dict):
                 verdict['audio'] = 'empty'
         elif _median(sizes) < SILENT_FRAME_BYTES:
-            log.info('audio track carries only silence frames (median '
-                     f'{_median(sizes)} bytes) — dropping it rather than '
-                     'shipping a track that can never fill; asking again '
-                     f'every {AUDIO_RECHECK_S} s')
-            acodec = ''
+            # KEPT. Until 1.2.99 a quiet track was dropped like an empty
+            # one, on the 6 Sep finding that a browser's audio buffer
+            # never filled from mimoLive's six-byte frames — a COPIED
+            # track. The track is decoded and re-encoded here now, so a
+            # quiet inning becomes a clean, fillable AAC track of quiet,
+            # and the alternative was worse: three seconds of a quiet
+            # field before the first pitch read as "no audio", YouTube
+            # got generated silence in place of the crowd, BaseStream got
+            # nothing, and the status page said the mic was off while it
+            # was on (25 Sep 2026). A quiet mic is not a missing one.
+            log.info('audio track is quiet (median %d bytes a frame) — '
+                     'kept; it is re-encoded here', _median(sizes))
             if isinstance(verdict, dict):
-                verdict['audio'] = 'silent'
+                verdict['audio'] = 'quiet'
     return vcodec, acodec
 
 
@@ -240,6 +247,16 @@ def audio_has_sound(cfg, runner=None):
     if sizes is None:
         return None
     return bool(sizes) and _median(sizes) >= SILENT_FRAME_BYTES
+
+
+def audio_has_packets(cfg, runner=None):
+    """True when the camera's audio track carries packets at all — quiet
+    ones count; a re-encode makes sound of whatever they hold. False when
+    the track is empty, None when the question could not be asked."""
+    sizes = _audio_frame_sizes(cfg, runner or system.run)
+    if sizes is None:
+        return None
+    return bool(sizes)
 
 
 def _median(sizes):
@@ -866,12 +883,13 @@ class LivePusher:
         return out
 
     def _audio_recheck(self):
-        """While a push runs video-only because the track was silent at
-        the start, ask the camera again every AUDIO_RECHECK_S; sound is a
-        reason to end this push so the next one carries the track. A
-        track kept at the start is never re-judged — a quiet inning is
-        not a reason to drop sound."""
-        if getattr(self, 'audio_verdict', '') != 'silent':
+        """While a push runs video-only because the track carried no
+        packets at the start (or the breaker rested it), ask the camera
+        again every AUDIO_RECHECK_S; packets arriving are a reason to end
+        this push so the next one carries the track. A track kept at the
+        start is never re-judged — a quiet inning is not a reason to drop
+        sound."""
+        if getattr(self, 'audio_verdict', '') not in ('silent', 'empty'):
             return
         if self._audio_is_off():
             return                       # the cool-down decides, not the probe
@@ -879,10 +897,10 @@ class LivePusher:
         if now < getattr(self, '_audio_next_t', 0):
             return
         self._audio_next_t = now + AUDIO_RECHECK_S
-        if audio_has_sound(self._cfg, self.runner):
-            log.info('sound has arrived on the camera\'s audio track — '
+        if audio_has_packets(self._cfg, self.runner):
+            log.info('the camera\'s audio track is carrying packets — '
                      'restarting the push with it')
-            raise RuntimeError('sound arrived — restarting with audio')
+            raise RuntimeError('audio arrived — restarting with audio')
 
     def _drain_stderr(self):
         for line in self.proc.stderr:

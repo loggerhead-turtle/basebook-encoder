@@ -429,13 +429,17 @@ class YouTubePusher:
         self.audio_restart = False
         cam_acodec = acodec
         if acodec:
-            sound = self._audio_sound(cfg)
-            if sound is False:
+            # Only a track with NO packets is replaced. A quiet one is
+            # kept and re-encoded: until 1.2.99 three seconds of a quiet
+            # field before the first pitch read as "no sound", the crowd
+            # was replaced with generated silence, and the status page
+            # said the mic was off while it was on (25 Sep 2026).
+            packets = self._audio_packets(cfg)
+            if packets is not None and not packets:
                 log.info(f'audio track ({acodec}) is declared but carries '
-                         'nothing YouTube can use — no packets, or only '
-                         'silence frames. Sending silence in its place so '
-                         'the broadcast starts; asking the camera again '
-                         f'every {AUDIO_RECHECK_S} s')
+                         'no packets — nothing YouTube can use. Sending '
+                         'silence in its place so the broadcast starts; '
+                         f'asking the camera again every {AUDIO_RECHECK_S} s')
                 acodec = ''
                 self.audio_verdict = 'silent'
             else:
@@ -455,7 +459,7 @@ class YouTubePusher:
         if cam_acodec and not acodec:
             # the camera HAS a track; it is the box's choice to replace it
             self.status.audio['in'] = cam_acodec
-            self.status.audio['why'] = 'camera track carries no sound'
+            self.status.audio['why'] = 'camera track carries no packets'
         log.info('audio: ' + (f"{acodec} {self.status.audio['sample_rate']} Hz "
                               f"{self.status.audio['channels']}ch → "
                               f"{self.status.audio['out']}" if acodec
@@ -589,8 +593,8 @@ class YouTubePusher:
         self._audio_next_t = now + AUDIO_RECHECK_S
         verdict = getattr(self, 'audio_verdict', 'unknown')
         if verdict == 'silent':
-            if self._audio_sound(cfg):
-                log.info('sound has arrived on the camera\'s audio track — '
+            if self._audio_packets(cfg):
+                log.info('the camera\'s audio track is carrying packets — '
                          'restarting the push with it')
                 self.audio_restart = True
                 return True

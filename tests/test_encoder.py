@@ -3027,7 +3027,22 @@ def test_a_named_track_with_no_sound_is_replaced_by_silence_at_the_start(
     assert p.audio_verdict == 'silent'
     st = json.loads((tmp_path / 'push.json').read_text())
     assert st['audio']['out'] == 'silence' and st['audio']['in'] == 'aac'
-    assert st['audio']['why'] == 'camera track carries no sound'
+    assert st['audio']['why'] == 'camera track carries no packets'
+
+
+def test_a_quiet_track_is_kept_not_replaced_by_silence(monkeypatch, tmp_path):
+    """25 Sep 2026: three seconds of a quiet field before the first pitch
+    read as "no audio"; the crowd was replaced with generated silence and
+    the status page said the mic was off while it was on. Quiet frames
+    are packets; the re-encode makes a clean track of them. Only a track
+    with NO packets is replaced."""
+    p, spawned, _ = _run_gap(monkeypatch, tmp_path,
+                             sound=lambda: False, packets=lambda: [6] * 100)
+    cmd = spawned[0]
+    assert 'anullsrc' not in ' '.join(cmd)
+    assert p.audio_verdict == 'camera'
+    st = json.loads((tmp_path / 'push.json').read_text())
+    assert st['audio']['out'] == 'aac' and 'why' not in st['audio']
 
 
 def test_a_probe_that_cannot_answer_never_replaces_a_real_track(
@@ -3045,7 +3060,8 @@ def test_a_copied_track_that_stops_carrying_packets_ends_the_push_for_silence(
     camera's AAC copied across, and a broadcast held at liveStarting for
     three hours. The box now notices the gap and generates the audio
     YouTube is waiting for."""
-    answers = iter([[], []])
+    # packets at the start (the track is real), then none: the gap
+    answers = iter([[340] * 10, [], []])
     with caplog.at_level(logging.WARNING, logger='youtube_push'):
         p, spawned, alive = _run_gap(monkeypatch, tmp_path,
                                      sound=lambda: True,
@@ -3087,10 +3103,12 @@ def test_a_quiet_or_unreadable_track_is_left_alone_mid_push(
 
 def test_generated_silence_gives_way_when_the_sound_returns(
         monkeypatch, tmp_path):
-    answers = iter([False, True])
+    # no packets at the start (silence generated), then packets: the
+    # camera's track is back, quiet or loud
+    answers = iter([[], [6] * 50])
     p, spawned, alive = _run_gap(monkeypatch, tmp_path,
-                                 sound=lambda: next(answers, True),
-                                 packets=lambda: [])
+                                 sound=lambda: False,
+                                 packets=lambda: next(answers, [6] * 50))
     assert 'anullsrc=channel_layout=stereo:sample_rate=48000' in spawned[0]
     assert p.audio_restart is True and alive < 5
 

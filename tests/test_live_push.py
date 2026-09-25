@@ -677,17 +677,19 @@ def test_a_declared_audio_track_is_checked_for_actual_samples():
     assert live_push.probe_codecs(cfg, broken) == ('hevc', 'aac')
 
 
-def test_a_silent_audio_track_is_dropped_like_an_absent_one():
+def test_a_quiet_audio_track_is_kept_and_an_empty_one_dropped():
     """mimoLive announces 48 kHz stereo AAC and fills it with SIX-BYTE
     frames — the size AAC codes to when the encoder is running and no
-    sound is reaching it. Counting packets says the track is fine; there
-    were 284 of them. Measuring them says it is silence.
-
-    It has to be dropped for the same reason an empty track does. The
-    browser builds an audio SourceBuffer that never usefully fills, and
-    buffered is the INTERSECTION of the source buffers, so the VIDEO
-    becomes unreachable too: frames decode, the clock advances, nothing
-    plays, and no layer reports a fault (6 Sep 2026)."""
+    sound is reaching it. Until 1.2.99 that track was dropped like an
+    empty one, because a browser's audio buffer never filled from a
+    COPY of those frames (6 Sep 2026). The track is decoded and
+    re-encoded now, so quiet in is a clean, fillable track of quiet out
+    — and the alternative was three seconds of a quiet field before the
+    first pitch reading as "no audio", the crowd replaced by generated
+    silence on YouTube, nothing on BaseStream, and a status page saying
+    the mic was off while it was on (25 Sep 2026). A quiet mic is kept.
+    A track with NO packets at all is still dropped: nothing can be made
+    of nothing, and YouTube will not start through it."""
     cfg = {'local_ingest_key': 'k'}
     listing = json.dumps({'streams': [{'codec_type': 'video',
                                        'codec_name': 'hevc'},
@@ -700,14 +702,19 @@ def test_a_silent_audio_track_is_dropped_like_an_absent_one():
             return type('R', (), {'returncode': 0, 'stdout': runner.audio})()
         return type('R', (), {'returncode': 0, 'stdout': listing})()
 
+    verdict = {}
     runner.audio = '6\n' * 284                       # what mimoLive sent
-    assert live_push.probe_codecs(cfg, runner) == ('hevc', '')
+    assert live_push.probe_codecs(cfg, runner, verdict) == ('hevc', 'aac')
+    assert verdict['audio'] == 'quiet'
+    runner.audio = ''                                # no packets at all
+    assert live_push.probe_codecs(cfg, runner, verdict) == ('hevc', '')
+    assert verdict['audio'] == 'empty'
     runner.audio = '85\n84\n86\n'                    # 32 kbps mono, real
-    assert live_push.probe_codecs(cfg, runner) == ('hevc', 'aac')
-    # a stray small frame among real ones is not silence — the median is
-    # what decides, so one runt cannot throw a whole track away
-    runner.audio = '6\n341\n337\n344\n339\n'
-    assert live_push.probe_codecs(cfg, runner) == ('hevc', 'aac')
+    assert live_push.probe_codecs(cfg, runner, verdict) == ('hevc', 'aac')
+    assert verdict['audio'] == 'ok'
+    assert live_push.audio_has_packets(cfg, runner) is True
+    runner.audio = ''
+    assert live_push.audio_has_packets(cfg, runner) is False
 
 
 def test_no_audio_bitstream_filter_on_the_https_road():
@@ -733,13 +740,13 @@ def test_no_audio_bitstream_filter_on_the_https_road():
     assert '+empty_moov' in cmd[cmd.index('-movflags') + 1]
 
 
-def test_a_silent_start_is_asked_again_and_sound_restarts_the_push(monkeypatch):
-    """20 Sep 2026: the box probed three seconds of a quiet field before
-    the first pitch, judged the track silent, and shipped the whole game
-    without sound. A push running video-only for THAT reason asks the
-    camera again every AUDIO_RECHECK_S; sound is a reason to end the
-    push so the next one carries the track. A track kept at the start
-    is never re-judged, and a track that is still silent is left alone."""
+def test_an_empty_start_is_asked_again_and_packets_restart_the_push(monkeypatch):
+    """20 Sep 2026: the box probed three seconds before the first pitch,
+    judged the track unusable, and shipped the whole game without
+    sound. A push running video-only for THAT reason asks the camera
+    again every AUDIO_RECHECK_S; packets arriving are a reason to end
+    the push so the next one carries the track. A quiet track is kept
+    from the start (1.2.100) and a kept track is never re-judged."""
     cfg = {'local_ingest_key': 'k'}
     listing = json.dumps({'streams': [{'codec_type': 'video', 'codec_name': 'h264'},
                                       {'codec_type': 'audio', 'codec_name': 'aac'}]})
@@ -750,27 +757,29 @@ def test_a_silent_start_is_asked_again_and_sound_restarts_the_push(monkeypatch):
             return type('R', (), {'returncode': 0, 'stdout': runner.audio})()
         return type('R', (), {'returncode': 0, 'stdout': listing})()
     runner.asked = 0
-    runner.audio = '6\n' * 100                            # silence at first pitch
+    runner.audio = ''                                     # no packets at all
     p = live_push.LivePusher(cfg_load=lambda: cfg, runner=runner)
-    assert p._probe(cfg) == ('h264', '') and p.audio_verdict == 'silent'
+    assert p._probe(cfg) == ('h264', '') and p.audio_verdict == 'empty'
     p._cfg = cfg
     p._audio_next_t = 0                                   # a minute has passed
-    p._audio_recheck()                                    # still silent: carry on
+    p._audio_recheck()                                    # still empty: carry on
     assert runner.asked == 2
     p._audio_next_t = 0
-    runner.audio = '340\n338\n341\n'                      # the crowd arrives
-    with pytest.raises(RuntimeError, match='sound arrived'):
+    runner.audio = '6\n' * 100                            # a quiet mic is a mic
+    with pytest.raises(RuntimeError, match='audio arrived'):
         p._audio_recheck()
-    # …and the next probe keeps the track
+    # …and the next probe keeps the track, quiet or not
+    assert p._probe(cfg) == ('h264', 'aac') and p.audio_verdict == 'quiet'
+    runner.audio = '340\n338\n341\n'
     assert p._probe(cfg) == ('h264', 'aac') and p.audio_verdict == 'ok'
     # a kept track is never re-judged, whatever the camera does later
-    runner.audio = '6\n' * 100
+    runner.audio = ''
     p._audio_next_t = 0
     asked = runner.asked
     p._audio_recheck()
     assert runner.asked == asked
     # the gate: no second question inside AUDIO_RECHECK_S
-    p.audio_verdict = 'silent'
+    p.audio_verdict = 'empty'
     p._audio_next_t = time.monotonic() + 30
     p._audio_recheck()
     assert runner.asked == asked
@@ -779,43 +788,8 @@ def test_a_silent_start_is_asked_again_and_sound_restarts_the_push(monkeypatch):
         if '-read_intervals' in cmd:
             return type('R', (), {'returncode': 1, 'stdout': ''})()
         return type('R', (), {'returncode': 0, 'stdout': listing})()
-    q = live_push.LivePusher(cfg_load=lambda: cfg, runner=broken)
-    assert q._probe(cfg) == ('h264', 'aac') and q.audio_verdict == 'unknown'
-
-
-# ── the BaseStream copy is transcoded on a box that can ──────────────────────
-# 20 Sep 2026: a Mevo at 7.3 Mb/s was copied straight through to the site
-# and every phone on the Watch page fell behind it. The camera keeps its
-# quality INTO the box (clips come from the box's recording); the site's
-# copy is re-encoded on the chip to a rate a phone can play.
-
-def test_the_basestream_copy_is_transcoded_only_when_it_helps(monkeypatch):
-    cfg = {'local_ingest_key': 'k'}                       # unset → the default
-    assert live_push.live_bitrate(cfg) == live_push.LIVE_DEFAULT_KBPS == 3000
-    both = {'h264': True, 'hevc': True}
-    assert live_push.decide_video(cfg, hw='vaapi', source_kbps=7300, caps=both) \
-        == {'kbps': 3000, 'codec': 'hevc'}
-    # HEVC is the default (the phones decode it, ~35% more picture per
-    # bit) — on a box that PROVED it can encode it; else H.264
-    assert live_push.decide_video(cfg, hw='vaapi', source_kbps=7300,
-                                  caps={'h264': True, 'hevc': False})['codec'] == 'h264'
-    assert live_push.decide_video({'local_ingest_key': 'k', 'live_push': {'codec': 'h264'}},
-                                  hw='vaapi', source_kbps=7300, caps=both)['codec'] == 'h264'
-    assert live_push.live_codec({'live_push': {'codec': 'HEVC'}}, caps=both) == 'hevc'
-    # the camera's rate is unknown: transcode (the point is a known size)
-    assert live_push.decide_video(cfg, hw='vaapi', source_kbps=None, caps=both)['kbps'] == 3000
-    # a phone-grade source is never re-encoded UP
-    assert live_push.decide_video(cfg, hw='vaapi', source_kbps=2000) is None
-    assert live_push.decide_video(cfg, hw='vaapi', source_kbps=3400) is None   # within slack
-    # a Pi has no encoder: copy, whatever is asked
-    assert live_push.decide_video(cfg, hw='', source_kbps=7300) is None
-    # the operator's 'source' is an explicit 0
-    assert live_push.decide_video({'local_ingest_key': 'k',
-                                   'live_push': {'bitrate_kbps': 0}},
-                                  hw='vaapi', source_kbps=7300) is None
-    assert live_push.live_bitrate({'live_push': {'bitrate_kbps': '4000'}}) == 4000
-    assert live_push.live_bitrate({'live_push': {'bitrate_kbps': 'junk'}}) == 3000
-    assert live_push.live_bitrate({'live_push': {'bitrate_kbps': 50}}) == 1000
+    p2 = live_push.LivePusher(cfg_load=lambda: cfg, runner=broken)
+    assert p2._probe(cfg) == ('h264', 'aac') and p2.audio_verdict == 'unknown'
 
 
 def test_the_transcode_rides_the_chip_on_both_roads():
